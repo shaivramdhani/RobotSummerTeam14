@@ -1,0 +1,75 @@
+#pragma once
+
+#include <cstdint>
+
+namespace robot::esp1 {
+
+constexpr int kUnassignedGpio = -1;
+constexpr int kUnassignedPwmChannel = -1;
+constexpr std::uint32_t kUnassignedFrequencyHz = 0U;
+constexpr std::uint8_t kUnassignedPwmResolutionBits = 0U;
+constexpr std::uint32_t kUnassignedBaudRate = 0U;
+
+enum class DualPwmHBridgeMode : std::uint8_t {
+  Unconfigured = 0,
+  Pwm0ForwardPwm1Reverse = 1,
+  Pwm1ForwardPwm0Reverse = 2,
+};
+
+struct DualPwmMotorOutputConfig {
+  int pwm0_gpio{kUnassignedGpio};
+  int pwm1_gpio{kUnassignedGpio};
+  int pwm0_channel{kUnassignedPwmChannel};
+  int pwm1_channel{kUnassignedPwmChannel};
+  std::uint32_t pwm_frequency_hz{kUnassignedFrequencyHz};
+  std::uint8_t pwm_resolution_bits{kUnassignedPwmResolutionBits};
+  int forward_sign{0};  // TODO: set to +1 or -1 after wheel direction test.
+  DualPwmHBridgeMode h_bridge_mode{DualPwmHBridgeMode::Unconfigured};
+};
+
+struct UartConfig {
+  int tx_gpio{kUnassignedGpio};
+  int rx_gpio{kUnassignedGpio};
+  std::uint32_t baud_rate{kUnassignedBaudRate};
+};
+
+struct Esp1Pins {
+  int left_ir_filtered{kUnassignedGpio};           // TODO: GPIO, active level
+  int right_ir_filtered{kUnassignedGpio};          // TODO: GPIO, active level
+  int freq{kUnassignedGpio};                       // TODO: GPIO, signal type
+  int ultrasonic_trigger_1{kUnassignedGpio};       // TODO: GPIO, timing
+  int ultrasonic_echo_1{kUnassignedGpio};          // TODO: GPIO, voltage level
+  int ultrasonic_trigger_2{kUnassignedGpio};       // TODO: GPIO, timing
+  int ultrasonic_echo_2{kUnassignedGpio};          // TODO: GPIO, voltage level
+  int line_sensor_side{kUnassignedGpio};           // TODO: GPIO/ADC, active level
+  int line_sensor_back_left{kUnassignedGpio};      // TODO: GPIO/ADC, active level
+  int line_sensor_back_right{kUnassignedGpio};     // TODO: GPIO/ADC, active level
+  int pwm_back_left_0{kUnassignedGpio};            // TODO: GPIO, PWM resource
+  int pwm_back_left_1{kUnassignedGpio};            // TODO: GPIO, PWM resource
+  int pwm_back_right_0{kUnassignedGpio};           // TODO: GPIO, PWM resource
+  int pwm_back_right_1{kUnassignedGpio};           // TODO: GPIO, PWM resource
+  int pwm_funnel_0{kUnassignedGpio};               // TODO: GPIO, PWM resource
+  int pwm_funnel_1{kUnassignedGpio};               // TODO: GPIO, PWM resource
+  int limit_switch_back_right_side{kUnassignedGpio};   // TODO: GPIO, active level
+  int limit_switch_front_right_side{kUnassignedGpio};  // TODO: GPIO, active level
+  int uart_tx_to_esp2{kUnassignedGpio};            // TODO: GPIO, UART port
+  int uart_rx_from_esp2{kUnassignedGpio};          // TODO: GPIO, UART port
+};
+
+struct Esp1HardwareConfig {
+  Esp1Pins pins{};
+  DualPwmMotorOutputConfig back_left_motor{};   // TODO: fill from schematic
+  DualPwmMotorOutputConfig back_right_motor{};  // TODO: fill from schematic
+  UartConfig uart_to_esp2{};                    // TODO: fill TX/RX/baud
+  float maximum_safe_test_duty{0.0F};           // TODO: verified safe duty
+};
+
+inline constexpr Esp1Pins kPins{};
+inline constexpr Esp1HardwareConfig kHardwareConfig{
+    kPins,
+    {kPins.pwm_back_left_0, kPins.pwm_back_left_1},
+    {kPins.pwm_back_right_0, kPins.pwm_back_right_1},
+    {kPins.uart_tx_to_esp2, kPins.uart_rx_from_esp2},
+    0.0F};
+
+}  // namespace robot::esp1
