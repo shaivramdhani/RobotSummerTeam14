@@ -9,6 +9,9 @@ constexpr int kUnassignedPwmChannel = -1;
 constexpr std::uint32_t kUnassignedFrequencyHz = 0U;
 constexpr std::uint8_t kUnassignedPwmResolutionBits = 0U;
 constexpr std::uint32_t kUnassignedBaudRate = 0U;
+constexpr std::uint32_t kDriveTestPwmFrequencyHz = 1000U;
+constexpr std::uint8_t kDriveTestPwmResolutionBits = 10U;
+constexpr std::uint32_t kDriveTestUartBaudRate = 115200U;
 
 enum class DualPwmHBridgeMode : std::uint8_t {
   Unconfigured = 0,
@@ -44,16 +47,16 @@ struct Esp1Pins {
   int line_sensor_side{kUnassignedGpio};           // TODO: GPIO/ADC, active level
   int line_sensor_back_left{kUnassignedGpio};      // TODO: GPIO/ADC, active level
   int line_sensor_back_right{kUnassignedGpio};     // TODO: GPIO/ADC, active level
-  int pwm_back_left_0{kUnassignedGpio};            // TODO: GPIO, PWM resource
-  int pwm_back_left_1{kUnassignedGpio};            // TODO: GPIO, PWM resource
-  int pwm_back_right_0{kUnassignedGpio};           // TODO: GPIO, PWM resource
-  int pwm_back_right_1{kUnassignedGpio};           // TODO: GPIO, PWM resource
+  int pwm_back_left_0{42};            // TODO: GPIO, PWM resource
+  int pwm_back_left_1{41};            // TODO: GPIO, PWM resource
+  int pwm_back_right_0{15};           // TODO: GPIO, PWM resource
+  int pwm_back_right_1{16};           // TODO: GPIO, PWM resource
   int pwm_funnel_0{kUnassignedGpio};               // TODO: GPIO, PWM resource
   int pwm_funnel_1{kUnassignedGpio};               // TODO: GPIO, PWM resource
   int limit_switch_back_right_side{kUnassignedGpio};   // TODO: GPIO, active level
   int limit_switch_front_right_side{kUnassignedGpio};  // TODO: GPIO, active level
-  int uart_tx_to_esp2{kUnassignedGpio};            // TODO: GPIO, UART port
-  int uart_rx_from_esp2{kUnassignedGpio};          // TODO: GPIO, UART port
+  int uart_tx_to_esp2{21};                         // UART TX to ESP2 GPIO40
+  int uart_rx_from_esp2{40};                       // UART RX from ESP2 GPIO21
 };
 
 struct Esp1HardwareConfig {
@@ -67,9 +70,14 @@ struct Esp1HardwareConfig {
 inline constexpr Esp1Pins kPins{};
 inline constexpr Esp1HardwareConfig kHardwareConfig{
     kPins,
-    {kPins.pwm_back_left_0, kPins.pwm_back_left_1},
-    {kPins.pwm_back_right_0, kPins.pwm_back_right_1},
-    {kPins.uart_tx_to_esp2, kPins.uart_rx_from_esp2},
-    0.0F};
+    {kPins.pwm_back_left_0, kPins.pwm_back_left_1, 0, 1,
+     kDriveTestPwmFrequencyHz, kDriveTestPwmResolutionBits, 1,
+     DualPwmHBridgeMode::Pwm0ForwardPwm1Reverse},
+    {kPins.pwm_back_right_0, kPins.pwm_back_right_1, 2, 3,
+     kDriveTestPwmFrequencyHz, kDriveTestPwmResolutionBits, 1,
+     DualPwmHBridgeMode::Pwm0ForwardPwm1Reverse},
+    {kPins.uart_tx_to_esp2, kPins.uart_rx_from_esp2,
+     kDriveTestUartBaudRate},
+    1.0F};
 
 }  // namespace robot::esp1

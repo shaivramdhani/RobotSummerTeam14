@@ -35,29 +35,67 @@ pio test -e native
 Native tests are for hardware-independent logic only. Hardware drivers and GPIO
 access do not belong in the native test target.
 
+## Telemetry Dashboard
+
+ESP2 starts a test-only WiFi softAP:
+
+```text
+SSID: Team14Robot
+Password: robotdebug
+Dashboard: http://192.168.4.1/
+```
+
+The dashboard boots in `DISABLED`, exposes `/api/telemetry`, `/api/stop`,
+mode-gated drive/motor/line-follow commands, and refuses motion while required
+hardware settings are TODO. See `docs/telemetry.md`.
+
+For the current two-ESP drive-test wiring, flash both ESPs and use the ESP2
+dashboard to test individual wheels and all drive directions. See
+`docs/drive-test.md`.
+
+## Quick Commands
+
+```sh
+pio run -e esp1
+pio run -e esp2
+pio run -e esp1 -t upload --upload-port /dev/ttyUSB_TODO
+pio run -e esp2 -t upload --upload-port /dev/ttyUSB_TODO
+pio device monitor -e esp2 --port /dev/ttyUSB_TODO
+pio test -e native
+```
+
 ## ESP2 Line-Follower Commands
 
 Open the ESP2 serial monitor at 115200 baud and use:
 
 ```text
+help
+status
+stop
+mode disabled
+mode sensors
+mode single-motor
+mode manual-drive
+mode distributed-drive
+mode line-sensor
+mode line-follow
+sensor status
+line status
+motor test FL 0.10 1000
+drive fwd 0.10 1000
 lf start
 lf stop
 lf status
 lf kp <value>
 lf ki <value>
 lf kd <value>
+lf base <normalized-duty>
 lf speed <normalized-duty>
 lf max-duty <normalized-duty>
 lf max-correction <value>
 lf polarity <1|-1>
-lf period-ms <integer>
 lf telemetry on
 lf telemetry off
-lf reset
-lf test sensor
-lf test motor <fl|fr|bl|br> <duty>
-lf test drive <duty>
-lf test stop
 ```
 
 `lf start` and movement tests reject commands while required hardware facts are

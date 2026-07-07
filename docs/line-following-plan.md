@@ -112,9 +112,9 @@ lf test stop
 ```
 
 Malformed values are rejected. `lf max-duty` cannot exceed the verified
-`maximum_safe_test_duty` in `include/esp2/PinConfig.h`. Because that value is
-currently `0.0`, any movement command is rejected until the team verifies a safe
-maximum duty.
+`maximum_safe_test_duty` in `include/esp2/PinConfig.h`. For the current drive
+test profile that value is `1.0`, so use the dashboard/serial duty setting
+carefully and start below the desired test value.
 
 ## Telemetry
 

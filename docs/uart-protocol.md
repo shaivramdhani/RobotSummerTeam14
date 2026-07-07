@@ -71,6 +71,23 @@ Signed motor commands are normalized milli-units from `-1000` to `1000`.
 - ESP1 boots with both rear motors disabled.
 - ESP2 boots with both front motors disabled.
 
+## ESP1 Compact Status Payload
+
+ESP1 publishes a compact `HealthReport` frame periodically on the same UART
+link. ESP2 parses this frame and exposes the latest remote ESP1 status through
+the dashboard telemetry.
+
+Payload size is 11 bytes:
+
+| Byte(s) | Field |
+| --- | --- |
+| 0-3 | ESP1 uptime in ms |
+| 4 | `RobotTestMode` numeric value |
+| 5 | `FaultCode` numeric value |
+| 6-7 | back-left applied command milli-units |
+| 8-9 | back-right applied command milli-units |
+| 10 | flags: bit 0 fault active, bit 1 BL inverted, bit 2 BR inverted |
+
 ## TODO
 
 - Confirm UART port, pins, voltage levels, baud rate, framing, and grounding.

@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 
+#include "common/Esp1Status.h"
 #include "common/FaultHealth.h"
 #include "common/MotorOutput.h"
 #include "common/RearDriveCommand.h"
@@ -85,6 +86,7 @@ class DualPwmMotorOutput final : public robot::IMotorOutput {
     ledcWrite(config_.pwm0_channel, use_pwm0 ? pwm_duty : 0U);
     ledcWrite(config_.pwm1_channel, use_pwm0 ? 0U : pwm_duty);
     last_command_ = command;
+    last_command_.duty_command_milli = signed_milli;
   }
 
   void disable() override {
@@ -96,6 +98,9 @@ class DualPwmMotorOutput final : public robot::IMotorOutput {
   }
 
   bool configured() const { return configured_; }
+  const robot::MotorCommand& lastAppliedCommand() const {
+    return last_command_;
+  }
 
  private:
   const robot::esp1::DualPwmMotorOutputConfig& config_;
@@ -140,6 +145,20 @@ class RearCommandLink {
     return seen;
   }
 
+  bool send(const robot::UartPacket& packet) {
+    if (!configured_) {
+      return false;
+    }
+
+    std::uint8_t frame[robot::kUartFrameOverheadSize +
+                       robot::kUartMaxPayloadSize]{};
+    std::size_t frame_size = 0U;
+    if (!robot::encodeUartFrame(packet, frame, sizeof(frame), frame_size)) {
+      return false;
+    }
+    return Serial1.write(frame, frame_size) == frame_size;
+  }
+
   bool configured() const { return configured_; }
 
  private:
@@ -148,6 +167,35 @@ class RearCommandLink {
   bool configured_{false};
   bool invalid_frame_seen_{false};
 };
+
+void publishEsp1Status(RearCommandLink& link,
+                       const DualPwmMotorOutput& back_left,
+                       const DualPwmMotorOutput& back_right,
+                       const robot::RearDriveStatus& rear_status,
+                       const robot::Milliseconds now_ms) {
+  static robot::Milliseconds last_publish_ms = 0U;
+  static std::uint16_t sequence = 0U;
+  if (now_ms - last_publish_ms < kRearStatusPeriodMs) {
+    return;
+  }
+  last_publish_ms = now_ms;
+
+  robot::Esp1StatusReport report{};
+  report.uptime_ms = now_ms;
+  report.mode = robot::RobotTestMode::Disabled;
+  report.fault_active = !rear_status.link_healthy &&
+                        rear_status.has_valid_command &&
+                        rear_status.command_age_ms >
+                            robot::kDefaultCommunicationTimeoutMs;
+  report.fault_code = report.fault_active
+                          ? robot::FaultCode::CommunicationStale
+                          : robot::FaultCode::None;
+  report.back_left_applied_command_milli =
+      back_left.lastAppliedCommand().duty_command_milli;
+  report.back_right_applied_command_milli =
+      back_right.lastAppliedCommand().duty_command_milli;
+  link.send(robot::makeEsp1StatusPacket(report, sequence++));
+}
 
 void printRearStatus(const robot::RearDriveStatus& status,
                      const DualPwmMotorOutput& back_left,
@@ -210,8 +258,11 @@ void rearDriveTask(void* parameters) {
     back_left_motor.apply(receiver.backLeftCommand(now_ms));
     back_right_motor.apply(receiver.backRightCommand(now_ms));
 
-    printRearStatus(receiver.status(now_ms), back_left_motor,
-                    back_right_motor, link, now_ms);
+    const robot::RearDriveStatus rear_status = receiver.status(now_ms);
+    publishEsp1Status(link, back_left_motor, back_right_motor, rear_status,
+                      now_ms);
+    printRearStatus(rear_status, back_left_motor, back_right_motor, link,
+                    now_ms);
 
     vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(kRearDriveTaskPeriodMs));
   }

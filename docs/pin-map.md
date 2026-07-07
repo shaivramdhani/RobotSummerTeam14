@@ -39,7 +39,7 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | Back-left | TODO | TODO | TODO | TODO | TODO | TODO |
 | Back-right | TODO | TODO | TODO | TODO | TODO | TODO |
 
-ESP1 `maximum_safe_test_duty`: TODO.
+ESP1 `maximum_safe_test_duty`: `1.0` for drive testing.
 ESP1 UART baud rate: TODO.
 
 ## ESP2 Pin TODOs
@@ -75,5 +75,5 @@ ESP1 UART baud rate: TODO.
 | Front-left | TODO | TODO | TODO | TODO | TODO | TODO |
 | Front-right | TODO | TODO | TODO | TODO | TODO | TODO |
 
-ESP2 `maximum_safe_test_duty`: TODO.
+ESP2 `maximum_safe_test_duty`: `1.0` for drive testing.
 ESP2 UART baud rate: TODO.

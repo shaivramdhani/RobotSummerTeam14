@@ -1,11 +1,17 @@
 #include <cmath>
+#include <cstring>
 
 #include <unity.h>
 
 #include "common/ChassisMixer.h"
+#include "common/Esp1Status.h"
+#include "common/EventLog.h"
 #include "common/LineFollower.h"
 #include "common/LineObservation.h"
 #include "common/RearDriveCommand.h"
+#include "common/RobotCommandValidation.h"
+#include "common/RobotTestModeManager.h"
+#include "common/TelemetrySnapshot.h"
 
 namespace {
 
@@ -315,6 +321,155 @@ void test_explicit_stop_packet_stops_motors() {
   TEST_ASSERT_FALSE(receiver.backRightCommand(120U).enabled);
 }
 
+void test_mode_manager_starts_disabled() {
+  const robot::RobotTestModeManager manager{};
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::RobotTestMode::Disabled),
+      static_cast<std::uint8_t>(manager.currentMode()));
+  TEST_ASSERT_FALSE(manager.motorsMayBeCommanded());
+}
+
+void test_mode_manager_rejects_drive_while_disabled() {
+  const robot::CommandValidationLimits limits{0.5F, 0.25F, 1000U};
+  const robot::CommandValidationResult result = robot::validateDriveCommand(
+      robot::RobotTestMode::Disabled, 0.0F, 1.0F, 0.0F, 0.2F, limits);
+
+  TEST_ASSERT_FALSE(result.accepted);
+}
+
+void test_mode_manager_accepts_sensor_mode_without_motors() {
+  robot::RobotTestModeManager manager{};
+  manager.setMode(robot::RobotTestMode::SensorMonitor, 25U);
+
+  TEST_ASSERT_TRUE(
+      robot::robotTestModeIsSensorOnly(manager.currentMode()));
+  TEST_ASSERT_FALSE(manager.motorsMayBeCommanded());
+}
+
+void test_emergency_stop_works_from_any_mode() {
+  robot::RobotTestModeManager manager{};
+  manager.setMode(robot::RobotTestMode::ManualDriveTest, 25U);
+  TEST_ASSERT_TRUE(manager.motorsMayBeCommanded());
+
+  manager.emergencyStop(50U);
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::RobotTestMode::Disabled),
+      static_cast<std::uint8_t>(manager.currentMode()));
+  TEST_ASSERT_FALSE(manager.motorsMayBeCommanded());
+}
+
+void test_command_validation_rejects_out_of_range_duty() {
+  const robot::CommandValidationResult result =
+      robot::validateNormalizedDuty(0.4F, 0.25F);
+
+  TEST_ASSERT_FALSE(result.accepted);
+}
+
+void test_command_validation_accepts_drive_test_duty_0_7() {
+  const robot::CommandValidationLimits limits{1.0F, 1.0F, 1000U};
+
+  const robot::CommandValidationResult single_motor_result =
+      robot::validateSingleMotorCommand(robot::RobotTestMode::SingleMotorTest,
+                                        0.7F, 700U, limits);
+  const robot::CommandValidationResult drive_result =
+      robot::validateDriveCommand(robot::RobotTestMode::DistributedDriveTest,
+                                  0.0F, 1.0F, 0.0F, 0.7F, limits);
+
+  TEST_ASSERT_TRUE(single_motor_result.accepted);
+  TEST_ASSERT_TRUE(drive_result.accepted);
+}
+
+void test_command_validation_rejects_overlong_duration() {
+  const robot::CommandValidationResult result =
+      robot::validateTimedDuration(5001U, 5000U);
+
+  TEST_ASSERT_FALSE(result.accepted);
+}
+
+void test_command_validation_rejects_malformed_motor_id() {
+  robot::WheelId wheel{};
+
+  TEST_ASSERT_FALSE(robot::parseWheelId("bogus", wheel));
+}
+
+void test_command_validation_rejects_invalid_pid_value() {
+  robot::LineFollowerConfig config{};
+  config.maximumDuty = 0.3F;
+  config.maximumCorrection = 0.2F;
+  config.kp = -0.1F;
+
+  const robot::CommandValidationResult result =
+      robot::validateLineFollowerConfig(config, 0.4F);
+
+  TEST_ASSERT_FALSE(result.accepted);
+}
+
+void test_command_validation_rejects_mode_incompatible_motor_command() {
+  const robot::CommandValidationLimits limits{0.5F, 0.25F, 1000U};
+  const robot::CommandValidationResult result =
+      robot::validateSingleMotorCommand(robot::RobotTestMode::SensorMonitor,
+                                        0.1F, 500U, limits);
+
+  TEST_ASSERT_FALSE(result.accepted);
+}
+
+void test_event_log_stores_newest_events_and_wraps() {
+  robot::EventLog log{};
+  for (std::size_t index = 0; index < log.capacity() + 3U; ++index) {
+    log.add(static_cast<robot::Milliseconds>(index),
+            robot::EventSeverity::Info, robot::EventSource::System,
+            index == log.capacity() + 2U ? "newest" : "older");
+  }
+
+  robot::EventRecord newest{};
+  TEST_ASSERT_EQUAL_UINT(log.capacity(), log.size());
+  TEST_ASSERT_TRUE(log.newest(0U, newest));
+  TEST_ASSERT_EQUAL_STRING("newest", newest.message);
+}
+
+void test_telemetry_json_contains_required_fields_and_booleans() {
+  robot::TelemetrySnapshot snapshot{};
+  snapshot.uptime_ms = 123U;
+  snapshot.current_mode = robot::RobotTestMode::LineSensorTest;
+  snapshot.enabled = false;
+  snapshot.lsfl_black = true;
+  snapshot.lsfr_black = false;
+  snapshot.front_left.desired_command_milli = 100;
+  snapshot.front_right.desired_command_milli = -100;
+
+  char output[2048]{};
+  TEST_ASSERT_TRUE(
+      robot::writeTelemetryJson(snapshot, output, sizeof(output), false));
+
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"current_mode\":\"LINE_SENSOR_TEST\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"enabled\":false"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_black\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"front_left\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"line_error\""));
+}
+
+void test_esp1_status_packet_round_trips() {
+  const robot::Esp1StatusReport report{
+      1234U, robot::RobotTestMode::Disabled, true,
+      robot::FaultCode::CommunicationStale, 111, -222, true, false};
+
+  const robot::UartPacket packet = robot::makeEsp1StatusPacket(report, 42U);
+  robot::Esp1StatusReport decoded{};
+
+  TEST_ASSERT_TRUE(robot::decodeEsp1StatusPacket(packet, decoded));
+  TEST_ASSERT_EQUAL_UINT32(report.uptime_ms, decoded.uptime_ms);
+  TEST_ASSERT_TRUE(decoded.fault_active);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::FaultCode::CommunicationStale),
+      static_cast<std::uint8_t>(decoded.fault_code));
+  TEST_ASSERT_EQUAL_INT16(111, decoded.back_left_applied_command_milli);
+  TEST_ASSERT_EQUAL_INT16(-222, decoded.back_right_applied_command_milli);
+  TEST_ASSERT_TRUE(decoded.back_left_inverted);
+  TEST_ASSERT_FALSE(decoded.back_right_inverted);
+}
+
 }  // namespace
 
 int main() {
@@ -342,5 +497,18 @@ int main() {
   RUN_TEST(test_corrupt_rear_packet_is_rejected);
   RUN_TEST(test_stale_rear_command_stops_motors);
   RUN_TEST(test_explicit_stop_packet_stops_motors);
+  RUN_TEST(test_mode_manager_starts_disabled);
+  RUN_TEST(test_mode_manager_rejects_drive_while_disabled);
+  RUN_TEST(test_mode_manager_accepts_sensor_mode_without_motors);
+  RUN_TEST(test_emergency_stop_works_from_any_mode);
+  RUN_TEST(test_command_validation_rejects_out_of_range_duty);
+  RUN_TEST(test_command_validation_accepts_drive_test_duty_0_7);
+  RUN_TEST(test_command_validation_rejects_overlong_duration);
+  RUN_TEST(test_command_validation_rejects_malformed_motor_id);
+  RUN_TEST(test_command_validation_rejects_invalid_pid_value);
+  RUN_TEST(test_command_validation_rejects_mode_incompatible_motor_command);
+  RUN_TEST(test_event_log_stores_newest_events_and_wraps);
+  RUN_TEST(test_telemetry_json_contains_required_fields_and_booleans);
+  RUN_TEST(test_esp1_status_packet_round_trips);
   return UNITY_END();
 }
