@@ -9,7 +9,7 @@ constexpr int kUnassignedPwmChannel = -1;
 constexpr std::uint32_t kUnassignedFrequencyHz = 0U;
 constexpr std::uint8_t kUnassignedPwmResolutionBits = 0U;
 constexpr std::uint32_t kUnassignedBaudRate = 0U;
-constexpr std::uint32_t kDriveTestPwmFrequencyHz = 1000U;
+constexpr std::uint32_t kDriveTestPwmFrequencyHz = 100U;
 constexpr std::uint8_t kDriveTestPwmResolutionBits = 10U;
 constexpr std::uint32_t kDriveTestUartBaudRate = 115200U;
 
@@ -64,7 +64,7 @@ struct Esp1HardwareConfig {
   DualPwmMotorOutputConfig back_left_motor{};   // TODO: fill from schematic
   DualPwmMotorOutputConfig back_right_motor{};  // TODO: fill from schematic
   UartConfig uart_to_esp2{};                    // TODO: fill TX/RX/baud
-  float maximum_safe_test_duty{0.0F};           // TODO: verified safe duty
+  float maximum_safe_test_duty{0.8F};           // TODO: verified safe duty
 };
 
 inline constexpr Esp1Pins kPins{};

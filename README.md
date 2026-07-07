@@ -53,6 +53,10 @@ For the current two-ESP drive-test wiring, flash both ESPs and use the ESP2
 dashboard to test individual wheels and all drive directions. See
 `docs/drive-test.md`.
 
+The dashboard is currently simplified for motor bring-up. See
+`docs/repopulate-later.md` for how to bring back line-following and expanded
+telemetry panels later.
+
 ## Quick Commands
 
 ```sh

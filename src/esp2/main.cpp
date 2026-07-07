@@ -740,13 +740,13 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Team14 Robot Test</title>
+  <title>Team14 Motor Test</title>
   <style>
     :root { color-scheme: dark; font-family: Arial, sans-serif; }
     body { margin: 0; background: #101316; color: #edf0f2; }
     header { position: sticky; top: 0; z-index: 2; display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 12px 16px; background: #181d21; border-bottom: 1px solid #303840; }
     h1 { font-size: 20px; margin: 0; }
-    main { padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    main { padding: 16px; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
     section { background: #1b2228; border: 1px solid #303a43; border-radius: 8px; padding: 12px; }
     h2 { margin: 0 0 10px; font-size: 16px; color: #dce7ee; }
     button, select, input { font: inherit; border-radius: 6px; border: 1px solid #53616d; background: #27313a; color: #fff; padding: 9px; }
@@ -763,13 +763,14 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     .good { color: #8de0b8; }
     pre { white-space: pre-wrap; max-height: 300px; overflow: auto; background: #0b0e10; padding: 10px; border-radius: 6px; }
     input[type=number] { width: 86px; }
+    .wide { grid-column: 1 / -1; }
   </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>Team14 Robot Test Interface</h1>
-    <div class="muted">TEST ONLY bench telemetry and tuning</div>
+    <h1>Team14 Motor Drive Test</h1>
+    <div class="muted">TEST ONLY - wheels up first</div>
   </div>
   <button class="stop" onclick="stopAll()">STOP</button>
 </header>
@@ -777,151 +778,72 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
   <section>
     <h2>Status</h2>
     <div class="kv">
-      <span>Mode</span><span id="mode" class="mono"></span>
       <span>Fault</span><span id="fault" class="mono"></span>
       <span>ESP1 link</span><span id="link" class="mono"></span>
       <span>Uptime</span><span id="uptime" class="mono"></span>
       <span>AP</span><span id="ap" class="mono"></span>
       <span>Command age</span><span id="deadman" class="mono"></span>
     </div>
-    <div class="row">
-      <select id="modePick">
-        <option value="disabled">DISABLED</option>
-        <option value="sensors">SENSOR_MONITOR</option>
-        <option value="single-motor">SINGLE_MOTOR_TEST</option>
-        <option value="manual-drive">MANUAL_DRIVE_TEST</option>
-        <option value="distributed-drive">DISTRIBUTED_DRIVE_TEST</option>
-        <option value="line-sensor">LINE_SENSOR_TEST</option>
-        <option value="line-follow">LINE_FOLLOW_TEST</option>
-        <option value="mechanism">MECHANISM_TEST</option>
-        <option value="autonomous-dry-run">AUTONOMOUS_DRY_RUN</option>
-      </select>
-      <button onclick="setMode()">Set Mode</button>
-    </div>
   </section>
 
   <section>
-    <h2>Manual Drive</h2>
-    <div class="row">Duty <input id="driveDuty" type="number" min="0" max="1" step="0.01" value="0.10"></div>
+    <h2>Drive</h2>
+    <div class="row">Duty <input id="driveDuty" type="number" min="0" max="1" step="0.01" value="0.30"></div>
     <div class="grid">
-      <span></span><button onpointerdown="drive(0,1,0)" onpointerup="stopAll()">FWD</button><span></span>
-      <button onpointerdown="drive(-1,0,0)" onpointerup="stopAll()">LEFT</button><button class="stop" onclick="stopAll()">STOP</button><button onpointerdown="drive(1,0,0)" onpointerup="stopAll()">RIGHT</button>
-      <button onpointerdown="drive(0,0,-1)" onpointerup="stopAll()">CCW</button><button onpointerdown="drive(0,-1,0)" onpointerup="stopAll()">BACK</button><button onpointerdown="drive(0,0,1)" onpointerup="stopAll()">CW</button>
+      <span></span><button onpointerdown="drive(0,1,0)" onpointerup="stopAll()" onpointerleave="stopAll()" onpointercancel="stopAll()">FWD</button><span></span>
+      <button onpointerdown="drive(-1,0,0)" onpointerup="stopAll()" onpointerleave="stopAll()" onpointercancel="stopAll()">LEFT</button><button class="stop" onclick="stopAll()">STOP</button><button onpointerdown="drive(1,0,0)" onpointerup="stopAll()" onpointerleave="stopAll()" onpointercancel="stopAll()">RIGHT</button>
+      <button onpointerdown="drive(0,0,-1)" onpointerup="stopAll()" onpointerleave="stopAll()" onpointercancel="stopAll()">CCW</button><button onpointerdown="drive(0,-1,0)" onpointerup="stopAll()" onpointerleave="stopAll()" onpointercancel="stopAll()">BACK</button><button onpointerdown="drive(0,0,1)" onpointerup="stopAll()" onpointerleave="stopAll()" onpointercancel="stopAll()">CW</button>
     </div>
   </section>
 
   <section>
-    <h2>Single Motor</h2>
+    <h2>Single Wheel</h2>
     <div class="row">
       Wheel <select id="motorId"><option>FL</option><option>FR</option><option>BL</option><option>BR</option></select>
-      Speed <input id="motorSpeed" type="number" step="0.01" value="0.10">
+      Duty <input id="motorSpeed" type="number" min="0" max="1" step="0.01" value="0.30">
     </div>
     <div class="row">
-      <button class="run" onpointerdown="motorHold()" onpointerup="motorRelease()" onpointerleave="motorRelease()" onpointercancel="motorRelease()">Hold To Spin</button>
+      <button class="run" onpointerdown="motorHold(1)" onpointerup="motorRelease()" onpointerleave="motorRelease()" onpointercancel="motorRelease()">Hold Forward</button>
+      <button class="run" onpointerdown="motorHold(-1)" onpointerup="motorRelease()" onpointerleave="motorRelease()" onpointercancel="motorRelease()">Hold Back</button>
       <button class="warn" onclick="invert()">Invert</button>
     </div>
     <pre id="motors"></pre>
   </section>
 
-  <section>
-    <h2>Line Sensors</h2>
-    <div class="kv">
-      <span>LSFL level</span><span id="lsfl" class="mono"></span>
-      <span>LSFR level</span><span id="lsfr" class="mono"></span>
-      <span>Left black</span><span id="lb" class="mono"></span>
-      <span>Right black</span><span id="rb" class="mono"></span>
-      <span>Error</span><span id="err" class="mono"></span>
-      <span>Visible</span><span id="vis" class="mono"></span>
-    </div>
-  </section>
-
-  <section>
-    <h2>Line Follow</h2>
-    <div class="row">
-      Kp <input id="kp" type="number" step="0.01">
-      Ki <input id="ki" type="number" step="0.01">
-      Kd <input id="kd" type="number" step="0.01">
-    </div>
-    <div class="row">
-      Base <input id="base" type="number" step="0.01">
-      Max <input id="maxDuty" type="number" step="0.01">
-      Corr <input id="maxCorr" type="number" step="0.01">
-      Pol <input id="pol" type="number" step="1">
-    </div>
-    <div class="row">
-      <button onclick="saveLf()">Apply PID</button>
-      <button class="run" onclick="lfStart()">Start 5s</button>
-      <button onclick="lfStop()">Stop LF</button>
-    </div>
-    <pre id="pid"></pre>
-  </section>
-
-  <section>
-    <h2>Sensors / Future Mechanisms</h2>
-    <pre id="future"></pre>
-  </section>
-
-  <section>
-    <h2>Events</h2>
+  <section class="wide">
+    <h2>Recent Events</h2>
     <pre id="events"></pre>
-  </section>
-
-  <section>
-    <h2>Raw Telemetry</h2>
-    <pre id="raw"></pre>
   </section>
 </main>
 <script>
 let holdTimer = null;
-let lastPidFill = false;
 function qs(id){ return document.getElementById(id); }
 function api(path){ return fetch(path).then(r => r.json().catch(() => ({})).then(j => ({ok:r.ok, status:r.status, json:j}))); }
 function stopAll(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; api('/api/stop'); }
-function setMode(){ api('/api/mode?mode=' + encodeURIComponent(qs('modePick').value)); }
 function drive(vx,vy,wz){
   const duty = Number(qs('driveDuty').value || 0);
   const send = () => api(`/api/drive?vx=${vx}&vy=${vy}&wz=${wz}&duty=${duty}`);
   send(); if (holdTimer) clearInterval(holdTimer); holdTimer=setInterval(send, 200);
 }
 function motorCommand(speed){ api(`/api/motor?id=${qs('motorId').value}&speed=${speed}`); }
-function motorHold(){
-  const send = () => motorCommand(qs('motorSpeed').value);
+function motorHold(sign){
+  const speed = Math.abs(Number(qs('motorSpeed').value || 0)) * sign;
+  const send = () => motorCommand(speed);
   send(); if (holdTimer) clearInterval(holdTimer); holdTimer=setInterval(send, 200);
 }
 function motorRelease(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; motorCommand(0); }
 function invert(){ api(`/api/invert?id=${qs('motorId').value}`); }
-function saveLf(){
-  api(`/api/line-follow/config?kp=${qs('kp').value}&ki=${qs('ki').value}&kd=${qs('kd').value}&base=${qs('base').value}&max=${qs('maxDuty').value}&max-correction=${qs('maxCorr').value}&polarity=${qs('pol').value}`);
-}
-function lfStart(){ api('/api/line-follow/start?ms=5000'); }
-function lfStop(){ api('/api/line-follow/stop'); }
 function yn(v){ return v ? 'yes' : 'no'; }
 function update(){
   fetch('/api/telemetry').then(r => r.json()).then(j => {
-    qs('mode').textContent = j.current_mode;
     qs('fault').textContent = j.fault_active ? `${j.fault_code}: ${j.fault_message}` : 'none';
     qs('fault').className = j.fault_active ? 'mono bad' : 'mono good';
     qs('link').textContent = `${yn(j.rear.esp1_link_healthy)} configured=${yn(j.rear.esp1_link_configured)}`;
     qs('uptime').textContent = `${j.uptime_ms} ms`;
     qs('ap').textContent = `${j.ip_address} clients=${j.wifi_clients}`;
     qs('deadman').textContent = `${j.last_command_age_ms} ms, ${j.deadman_remaining_ms} ms left`;
-    qs('lsfl').textContent = j.line.lsfl_raw_level;
-    qs('lsfr').textContent = j.line.lsfr_raw_level;
-    qs('lb').textContent = yn(j.line.lsfl_black);
-    qs('rb').textContent = yn(j.line.lsfr_black);
-    qs('err').textContent = j.line.line_error;
-    qs('vis').textContent = yn(j.line.line_visible);
     qs('motors').textContent = JSON.stringify({motors:j.motors, rear:j.rear}, null, 2);
-    qs('pid').textContent = JSON.stringify(j.pid, null, 2);
-    qs('future').textContent = JSON.stringify(j.future, null, 2);
-    qs('raw').textContent = JSON.stringify(j, null, 2);
-    if (!lastPidFill) {
-      qs('kp').value = j.pid.kp; qs('ki').value = j.pid.ki; qs('kd').value = j.pid.kd;
-      qs('base').value = j.pid.baseDuty; qs('maxDuty').value = j.pid.maximumDuty;
-      qs('maxCorr').value = j.pid.maximumCorrection; qs('pol').value = j.pid.steeringPolarity;
-      lastPidFill = true;
-    }
-  }).catch(() => { qs('raw').textContent = 'telemetry disconnected'; });
+  }).catch(() => { qs('fault').textContent = 'telemetry disconnected'; qs('fault').className = 'mono bad'; });
   fetch('/api/events').then(r => r.json()).then(j => { qs('events').textContent = JSON.stringify(j.events, null, 2); });
 }
 setInterval(update, 300); update();
@@ -1000,6 +922,8 @@ void handleDrive() {
     return;
   }
   RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
   float vx = 0.0F;
   float vy = 0.0F;
   float wz = 0.0F;
@@ -1012,17 +936,23 @@ void handleDrive() {
     return;
   }
 
+  if (context.modes.currentMode() !=
+      robot::RobotTestMode::DistributedDriveTest) {
+    disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
+                     *g_runtime.rear_link, now_ms);
+    context.modes.setMode(robot::RobotTestMode::DistributedDriveTest, now_ms);
+  }
+
   const robot::CommandValidationResult validation =
       robot::validateDriveCommand(context.modes.currentMode(), vx, vy, wz,
                                   duty, validationLimits(context));
   if (!validation.accepted) {
     disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
                      *g_runtime.rear_link,
-                     static_cast<robot::Milliseconds>(millis()));
+                     now_ms);
     setFault(context, robot::FaultCode::InvalidCommand, validation.reason);
-    logEvent(context, static_cast<robot::Milliseconds>(millis()),
-             robot::EventSeverity::Warn, robot::EventSource::Web,
-             validation.reason);
+    logEvent(context, now_ms, robot::EventSeverity::Warn,
+             robot::EventSource::Web, validation.reason);
     sendErrorJson(409, validation.reason);
     return;
   }
@@ -1042,8 +972,6 @@ void handleDrive() {
     return;
   }
 
-  const robot::Milliseconds now_ms =
-      static_cast<robot::Milliseconds>(millis());
   context.requested_command =
       makeManualDriveCommand(context, vx, vy, wz, duty, now_ms);
   context.last_command_ms = now_ms;
@@ -1063,6 +991,8 @@ void handleMotor() {
     return;
   }
   RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
   robot::WheelId wheel{};
   const String id_arg = g_server.arg("id");
   float speed = 0.0F;
@@ -1072,15 +1002,20 @@ void handleMotor() {
     return;
   }
 
+  if (context.modes.currentMode() != robot::RobotTestMode::SingleMotorTest) {
+    disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
+                     *g_runtime.rear_link, now_ms);
+    context.modes.setMode(robot::RobotTestMode::SingleMotorTest, now_ms);
+  }
+
   const robot::CommandValidationResult validation =
       robot::validateSingleMotorCommand(context.modes.currentMode(), speed,
                                         kCommandTimeoutMs,
                                         validationLimits(context));
   if (!validation.accepted) {
     setFault(context, robot::FaultCode::InvalidCommand, validation.reason);
-    logEvent(context, static_cast<robot::Milliseconds>(millis()),
-             robot::EventSeverity::Warn, robot::EventSource::Web,
-             validation.reason);
+    logEvent(context, now_ms, robot::EventSeverity::Warn,
+             robot::EventSource::Web, validation.reason);
     sendErrorJson(409, validation.reason);
     return;
   }
@@ -1105,8 +1040,6 @@ void handleMotor() {
     return;
   }
 
-  const robot::Milliseconds now_ms =
-      static_cast<robot::Milliseconds>(millis());
   context.requested_command = robot::disabledFourWheelCommand();
   if (wheel == robot::WheelId::FrontLeft) {
     context.requested_command.front_left =
@@ -1481,13 +1414,10 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
 void printCommands() {
   Serial.println("commands:");
   Serial.println("  help | status | stop");
-  Serial.println("  mode disabled|sensors|single-motor|manual-drive|distributed-drive|line-sensor|line-follow|mechanism|autonomous-dry-run");
-  Serial.println("  sensor status | line status");
   Serial.println("  motor test FL|FR|BL|BR <speed -1..1> <ms>");
-  Serial.println("  motor invert FL|FR|BL|BR");
   Serial.println("  drive fwd|back|left|right|cw|ccw <duty> <ms>");
-  Serial.println("  lf start [ms] | lf stop | lf status | lf kp|ki|kd <v>");
-  Serial.println("  lf base <v> | lf speed <v> | lf max-duty <v> | lf max-correction <v> | lf polarity <1|-1> | lf telemetry on|off");
+  Serial.println("  motor invert FL|FR|BL|BR");
+  Serial.println("  advanced: mode ..., sensor status, line status, lf ...");
 }
 
 bool serialSetMode(RuntimeContext& context, const char* mode_text,
@@ -1565,6 +1495,10 @@ bool requestSerialMotorTest(RuntimeContext& context, const char* wheel_text,
     printRejected("motor test syntax: motor test FL|FR|BL|BR <speed> <ms>");
     return false;
   }
+  if (context.modes.currentMode() != robot::RobotTestMode::SingleMotorTest) {
+    disableActuators(context, front_left, front_right, rear_link, now_ms);
+    context.modes.setMode(robot::RobotTestMode::SingleMotorTest, now_ms);
+  }
   const robot::CommandValidationResult validation =
       robot::validateSingleMotorCommand(context.modes.currentMode(), speed,
                                         duration_ms,
@@ -1625,6 +1559,11 @@ bool requestSerialDrive(RuntimeContext& context, const char* direction,
   } else {
     printRejected("unknown drive direction");
     return false;
+  }
+
+  if (context.modes.currentMode() !=
+      robot::RobotTestMode::DistributedDriveTest) {
+    context.modes.setMode(robot::RobotTestMode::DistributedDriveTest, now_ms);
   }
 
   robot::CommandValidationResult validation =

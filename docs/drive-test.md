@@ -52,7 +52,7 @@ the front wheels, but ESP1 is required for the back wheels.
 2. Connect to WiFi `Team14Robot`.
 3. Use password `robotdebug`.
 4. Open `http://192.168.4.1/`.
-5. Confirm the current mode is `DISABLED`.
+5. Confirm the page loads and the fault field says `none`.
 6. Confirm ESP1 link/status becomes available. If it does not, check the UART
    cross-wiring and common ground.
 
@@ -60,8 +60,8 @@ the front wheels, but ESP1 is required for the back wheels.
 
 Keep the robot lifted so wheels cannot move it.
 
-1. Set mode to `SINGLE_MOTOR_TEST`.
-2. Select `FL`, speed `0.10`, and hold `Hold To Spin`.
+1. Select `FL`, duty `0.10`, and hold `Hold Forward`.
+2. Hold `Hold Back` to spin the same wheel the other direction.
 3. Repeat for `FR`, `BL`, and `BR`.
 4. Press STOP between tests if anything looks wrong.
 
@@ -81,13 +81,9 @@ ESP2 front wheels; ESP1 back-wheel inversion should be changed in
 
 ## Driving In All Directions
 
-Use `DISTRIBUTED_DRIVE_TEST` for full four-wheel drive. `MANUAL_DRIVE_TEST`
-only drives the ESP2-local front wheels in this wiring profile.
-
-1. Set mode to `DISTRIBUTED_DRIVE_TEST`.
-2. Set duty to `0.10`.
-3. Briefly press each button: FWD, BACK, LEFT, RIGHT, CW, CCW.
-4. Increase duty only after all directions are correct at low duty.
+1. Set duty to `0.10`.
+2. Hold each direction button briefly: FWD, BACK, LEFT, RIGHT, CW, CCW.
+3. Increase duty only after all directions are correct at low duty.
 
 The browser refreshes commands while a direction button is held. If commands
 stop arriving, the deadman timeout stops the motors.
@@ -126,3 +122,9 @@ press-and-hold motor test path.
 
 Do not use `LINE_SENSOR_TEST` or `LINE_FOLLOW_TEST` for this drive test. The
 front line sensor pins remain unassigned, so line following will not start.
+
+## Hidden For Now
+
+The old line-following, raw telemetry, PID tuning, and mode-selection UI is
+hidden from the dashboard for motor bring-up. See `docs/repopulate-later.md`
+for how to add those panels back later.
