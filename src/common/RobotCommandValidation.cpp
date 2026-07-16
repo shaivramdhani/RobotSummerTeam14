@@ -164,22 +164,33 @@ CommandValidationResult validateLineFollowerConfig(
       !finiteInRange(config.kd, 0.0F, 20.0F)) {
     return rejected("PID gains must be in [0, 20]");
   }
-  if (!finiteInRange(config.maximumDuty, 0.0F, hardware_duty_cap)) {
-    return rejected("maximumDuty exceeds hardware cap");
+  if (!finiteInRange(config.maxDuty, 0.0F, hardware_duty_cap)) {
+    return rejected("maxDuty exceeds hardware cap");
   }
-  if (!finiteInRange(config.baseDuty, -config.maximumDuty,
-                     config.maximumDuty)) {
-    return rejected("baseDuty exceeds maximumDuty");
+  if (!finiteInRange(config.baseDuty, -config.maxDuty, config.maxDuty)) {
+    return rejected("baseDuty exceeds maxDuty");
   }
-  if (!finiteInRange(config.maximumCorrection, 0.0F,
-                     config.maximumDuty)) {
-    return rejected("maximumCorrection must be in [0, maximumDuty]");
+  if (!finiteInRange(config.maxCorrection, 0.0F, config.maxDuty)) {
+    return rejected("maxCorrection must be in [0, maxDuty]");
+  }
+  if (!finiteInRange(config.integralLimit, 0.0F, 100.0F)) {
+    return rejected("integralLimit must be in [0, 100]");
+  }
+  if (!finiteInRange(config.derivativeLimit, 0.0F, 1000.0F)) {
+    return rejected("derivativeLimit must be in [0, 1000]");
+  }
+  if (!finiteInRange(config.derivativeFilterAlpha, 0.0F, 0.95F)) {
+    return rejected("derivativeFilterAlpha must be in [0, 0.95]");
   }
   if (config.steeringPolarity != 1 && config.steeringPolarity != -1) {
     return rejected("steeringPolarity must be 1 or -1");
   }
   if (config.controlPeriodMs < 5U || config.controlPeriodMs > 100U) {
     return rejected("controlPeriodMs must be in [5, 100]");
+  }
+  if (config.remoteCommandTimeoutMs == 0U ||
+      config.remoteCommandTimeoutMs > 1000U) {
+    return rejected("remoteCommandTimeoutMs must be in [1, 1000]");
   }
   return accepted();
 }

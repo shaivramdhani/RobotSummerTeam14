@@ -12,15 +12,14 @@ struct LineFollowerConfig {
   float ki{0.0F};
   float kd{0.0F};
   float baseDuty{0.0F};
-  float maximumDuty{0.0F};
-  float maximumCorrection{0.25F};
+  float maxDuty{0.0F};
+  float maxCorrection{0.25F};
   float integralLimit{2.0F};
   float derivativeLimit{20.0F};
-  float derivativeFilterCoefficient{0.0F};
+  float derivativeFilterAlpha{0.0F};
   int steeringPolarity{1};
   Milliseconds controlPeriodMs{10U};
-  Milliseconds rearCommandTimeoutMs{kDefaultCommunicationTimeoutMs};
-  Milliseconds initialLineSearchTimeoutMs{1000U};
+  Milliseconds remoteCommandTimeoutMs{kDefaultCommunicationTimeoutMs};
   bool telemetryEnabled{true};
 };
 

@@ -21,6 +21,10 @@ frequency requirements, and any library constraints.
 Firmware now provides dual-PWM motor adapters, but they refuse to initialize
 unless each motor has GPIOs, LEDC channels, PWM frequency, PWM resolution,
 H-bridge mode, and `forward_sign` configured in the owning ESP's `PinConfig.h`.
+The ESP2 claw servo adapter also refuses movement until each claw has GPIO,
+LEDC channel, PWM frequency, resolution, and safe pulse range configured. Claw
+GPIOs are known (`MSCLAW1` GPIO14, `MSCLAW2` GPIO13, `MSCLAW3` GPIO12), but PWM
+resource allocation and pulse ranges remain TODO.
 
 ## Review Questions
 

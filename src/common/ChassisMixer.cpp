@@ -35,7 +35,7 @@ FourWheelCommand calculateDisabledFourWheelCommand(
 FourWheelCommand mixDifferentialLineFollow(const float correction,
                                            const LineFollowerConfig& config,
                                            const Milliseconds now_ms) {
-  const float maximum_duty = clampFloat(config.maximumDuty, 0.0F, 1.0F);
+  const float maximum_duty = clampFloat(config.maxDuty, 0.0F, 1.0F);
   if (maximum_duty <= 0.0F) {
     return disabledFourWheelCommand();
   }
@@ -43,7 +43,7 @@ FourWheelCommand mixDifferentialLineFollow(const float correction,
   const float base_duty =
       clampFloat(config.baseDuty, -maximum_duty, maximum_duty);
   const float maximum_correction =
-      clampFloat(config.maximumCorrection, 0.0F, maximum_duty);
+      clampFloat(config.maxCorrection, 0.0F, maximum_duty);
   const float limited_correction =
       clampFloat(correction, -maximum_correction, maximum_correction);
   const float polarity =
@@ -64,13 +64,13 @@ FourWheelCommand mixDifferentialLineFollow(const float correction,
 
   FourWheelCommand command{};
   command.front_left =
-      makeMotorCommand(left_duty, now_ms, config.rearCommandTimeoutMs);
+      makeMotorCommand(left_duty, now_ms, config.remoteCommandTimeoutMs);
   command.back_left =
-      makeMotorCommand(left_duty, now_ms, config.rearCommandTimeoutMs);
+      makeMotorCommand(left_duty, now_ms, config.remoteCommandTimeoutMs);
   command.front_right =
-      makeMotorCommand(right_duty, now_ms, config.rearCommandTimeoutMs);
+      makeMotorCommand(right_duty, now_ms, config.remoteCommandTimeoutMs);
   command.back_right =
-      makeMotorCommand(right_duty, now_ms, config.rearCommandTimeoutMs);
+      makeMotorCommand(right_duty, now_ms, config.remoteCommandTimeoutMs);
   return command;
 }
 

@@ -1,16 +1,17 @@
-# Re-Enabling Removed Dashboard Features Later
+# Dashboard Feature Notes
 
-The current dashboard is intentionally motor-only for bring-up:
+The dashboard now exposes the motor bring-up and line-following controls:
 
 - STOP
 - ESP1 UART status
 - all-direction drive
 - single-wheel forward/back testing
+- front line-sensor status
+- line-follow start/stop and PID/PD runtime tuning
 - recent events
 
-The underlying code for line following, sensor telemetry, modes, PID tuning,
-and JSON endpoints is still in the repository. It is hidden from the first page
-so motor bring-up is less cluttered.
+The sections below are retained as implementation notes for future dashboard
+expansion.
 
 ## Re-Expose Modes
 
@@ -54,19 +55,18 @@ To bring the panel back, add HTML fields for:
 
 Then poll `/api/line` or use the existing `/api/telemetry` line object.
 
-## Re-Expose Line Following
+## Line-Following Endpoints
 
 The endpoints still exist:
 
 ```text
 /api/line-follow/start?ms=5000
 /api/line-follow/stop
-/api/line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max=<>&max-correction=<>&polarity=<>
+/api/line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>
 ```
 
-Before re-enabling this in the UI, verify the line sensor GPIOs in
-`include/esp2/PinConfig.h`. For the current motor-only bring-up they are still
-unassigned, so line following should not be used.
+Before floor testing, verify the line sensor GPIOs and active-HIGH comparator
+behavior in `include/esp2/PinConfig.h`.
 
 ## Re-Expose Raw Telemetry
 
@@ -90,6 +90,7 @@ qs('raw').textContent = JSON.stringify(j, null, 2)
 
 ## Re-Expose Future Mechanisms
 
-Stepper, servo, and mechanism fields are still placeholders in
-`TelemetrySnapshot`. Do not add movement controls until safe drivers and pin
-configuration are implemented.
+Stepper, pusher, winch, and mechanism limit fields are still placeholders in
+`TelemetrySnapshot`. The claw telemetry panel is present, but claw movement
+remains gated by explicit PWM channel, frequency, resolution, and pulse-range
+configuration in `include/esp2/PinConfig.h`.

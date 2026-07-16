@@ -74,7 +74,7 @@ PidTerms calculatePidTerms(LineFollowerState& state,
     derivative =
         clampFloat(derivative, -derivative_limit, derivative_limit);
     const float alpha =
-        normalizedFilterCoefficient(config.derivativeFilterCoefficient);
+        normalizedFilterCoefficient(config.derivativeFilterAlpha);
     derivative = (alpha * state.filtered_derivative) +
                  ((1.0F - alpha) * derivative);
   }
@@ -89,7 +89,7 @@ PidTerms calculatePidTerms(LineFollowerState& state,
   terms.derivative_term = config.kd * derivative;
   terms.correction = terms.proportional_term + terms.integral_term +
                      terms.derivative_term;
-  const float maximum_correction = nonnegative(config.maximumCorrection);
+  const float maximum_correction = nonnegative(config.maxCorrection);
   terms.correction =
       clampFloat(terms.correction, -maximum_correction, maximum_correction);
   return terms;
@@ -110,10 +110,7 @@ LineFollowerUpdate updateLineFollower(LineFollowerState& state,
     return update;
   }
 
-  const bool initial_search_expired =
-      !update.observation.safe_to_drive &&
-      (now_ms - state.started_at_ms) > config.initialLineSearchTimeoutMs;
-  if (initial_search_expired) {
+  if (!update.observation.safe_to_drive) {
     stopLineFollower(state);
     update.wheel_command = disabledFourWheelCommand();
     return update;

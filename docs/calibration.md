@@ -6,7 +6,7 @@ No calibration values are known yet. Do not invent them.
 
 - `LSFL` GPIO: TODO
 - `LSFR` GPIO: TODO
-- Digital polarity: LOW means black tape, HIGH means white/non-tape.
+- Digital polarity: HIGH means black tape, LOW means white/non-tape.
 - `LSS` threshold: TODO
 - `LSBL` threshold: TODO
 - `LSBR` threshold: TODO

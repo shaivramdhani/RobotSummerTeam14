@@ -46,16 +46,13 @@ Dashboard: http://192.168.4.1/
 ```
 
 The dashboard boots in `DISABLED`, exposes `/api/telemetry`, `/api/stop`,
-mode-gated drive/motor/line-follow commands, and refuses motion while required
-hardware settings are TODO. See `docs/telemetry.md`.
+mode-gated drive/motor/line-follow/claw commands, and refuses actuator movement
+while required hardware settings are TODO. See `docs/telemetry.md`.
 
-For the current two-ESP drive-test wiring, flash both ESPs and use the ESP2
-dashboard to test individual wheels and all drive directions. See
-`docs/drive-test.md`.
-
-The dashboard is currently simplified for motor bring-up. See
-`docs/repopulate-later.md` for how to bring back line-following and expanded
-telemetry panels later.
+For the current two-ESP wiring, flash both ESPs and use the ESP2 dashboard to
+test individual wheels, distributed drive, front line sensors, and the
+line-following PID/PD tuning loop. See `docs/drive-test.md` and
+`docs/line-following-plan.md`.
 
 ## Quick Commands
 
@@ -97,13 +94,20 @@ lf base <normalized-duty>
 lf speed <normalized-duty>
 lf max-duty <normalized-duty>
 lf max-correction <value>
+lf integral-limit <value>
+lf derivative-limit <value>
+lf derivative-alpha <value>
 lf polarity <1|-1>
+lf period-ms <integer>
+lf timeout-ms <integer>
+lf reset
 lf telemetry on
 lf telemetry off
 ```
 
 `lf start` and movement tests reject commands while required hardware facts are
-still TODO. See `docs/line-following-plan.md` for the bring-up procedure.
+still TODO or the ESP1 status link is stale. See `docs/line-following-plan.md`
+for the bring-up procedure.
 
 ## Upload
 

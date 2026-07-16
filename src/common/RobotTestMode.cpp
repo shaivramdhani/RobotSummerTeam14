@@ -58,6 +58,8 @@ const char* robotTestModeName(const RobotTestMode mode) {
       return "MECHANISM_TEST";
     case RobotTestMode::AutonomousDryRun:
       return "AUTONOMOUS_DRY_RUN";
+    case RobotTestMode::AutonomousSolarPanel:
+      return "AUTONOMOUS_SOLAR_PANEL";
   }
 
   return "DISABLED";
@@ -108,6 +110,12 @@ bool parseRobotTestMode(const char* text, RobotTestMode& mode) {
     mode = RobotTestMode::AutonomousDryRun;
     return true;
   }
+  if (sameModeToken(text, "autonomous-solar") ||
+      sameModeToken(text, "autonomous-solar-panel") ||
+      sameModeToken(text, "solar")) {
+    mode = RobotTestMode::AutonomousSolarPanel;
+    return true;
+  }
 
   return false;
 }
@@ -116,18 +124,19 @@ bool robotTestModeAllowsMotion(const RobotTestMode mode) {
   return mode == RobotTestMode::SingleMotorTest ||
          mode == RobotTestMode::ManualDriveTest ||
          mode == RobotTestMode::DistributedDriveTest ||
-         mode == RobotTestMode::LineFollowTest;
+         mode == RobotTestMode::LineFollowTest ||
+         mode == RobotTestMode::AutonomousSolarPanel;
 }
 
 bool robotTestModeRequiresRearLink(const RobotTestMode mode) {
   return mode == RobotTestMode::DistributedDriveTest ||
-         mode == RobotTestMode::LineFollowTest;
+         mode == RobotTestMode::LineFollowTest ||
+         mode == RobotTestMode::AutonomousSolarPanel;
 }
 
 bool robotTestModeIsSensorOnly(const RobotTestMode mode) {
   return mode == RobotTestMode::SensorMonitor ||
          mode == RobotTestMode::LineSensorTest ||
-         mode == RobotTestMode::MechanismTest ||
          mode == RobotTestMode::AutonomousDryRun ||
          mode == RobotTestMode::Disabled;
 }

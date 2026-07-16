@@ -120,11 +120,11 @@ press-and-hold motor test path.
 
 ## Do Not Use For This Test
 
-Do not use `LINE_SENSOR_TEST` or `LINE_FOLLOW_TEST` for this drive test. The
-front line sensor pins remain unassigned, so line following will not start.
+Do not use `LINE_FOLLOW_TEST` while performing the motor-only drive test. Finish
+wheel direction, inversion, stale-command, and UART checks before floor-testing
+line following.
 
-## Hidden For Now
+## Line-Following UI
 
-The old line-following, raw telemetry, PID tuning, and mode-selection UI is
-hidden from the dashboard for motor bring-up. See `docs/repopulate-later.md`
-for how to add those panels back later.
+The dashboard also exposes front line-sensor telemetry and line-following
+PID/PD controls for the next bring-up step. See `docs/line-following-plan.md`.

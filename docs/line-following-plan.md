@@ -23,21 +23,22 @@ architecture.
 
 ## Digital Sensor Truth Table
 
-The sensors are digital. LOW means black tape. HIGH means white or non-tape
+The sensors are digital. HIGH means black tape. LOW means white or non-tape
 surface. Firmware uses `pinMode(..., INPUT)` only; it does not enable
 `INPUT_PULLUP`.
 
 | LSFL | LSFR | Meaning | Error | Line visible | Last side |
 | --- | --- | --- | --- | --- | --- |
-| LOW | LOW | both sensors on tape | `0` | true | preserve previous side |
-| LOW | HIGH | left sensor on tape | `+1` | true | `+1` |
-| HIGH | LOW | right sensor on tape | `-1` | true | `-1` |
-| HIGH | HIGH after `+1` history | line lost to left-history side | `+5` | false | `+1` |
-| HIGH | HIGH after `-1` history | line lost to right-history side | `-5` | false | `-1` |
-| HIGH | HIGH without history | unsafe/no history | `0` | false | `0` |
+| HIGH | HIGH | both sensors on tape | `0` | true | preserve previous side |
+| LOW | HIGH | right sensor on tape | `-1` | true | `-1` |
+| HIGH | LOW | left sensor on tape | `+1` | true | `+1` |
+| LOW | LOW after `+1` history | line lost to left-history side | `+5` | false | `+1` |
+| LOW | LOW after `-1` history | line lost to right-history side | `-5` | false | `-1` |
+| LOW | LOW without history | unsafe/no history | `0` | false | `0` |
 
-Positive error is the exact logical result specified for `LSFL` LOW and `LSFR`
-HIGH. Physical steering direction is handled separately by `steeringPolarity`.
+Positive error is the exact logical result specified for `LSFL` HIGH and
+`LSFR` LOW. Physical steering direction is handled separately by
+`steeringPolarity`.
 
 ## PID Controller
 
@@ -57,15 +58,14 @@ Runtime tunables live in `LineFollowerConfig`:
 
 - `kp`, `ki`, `kd`
 - `baseDuty`
-- `maximumDuty`
-- `maximumCorrection`
+- `maxDuty`
+- `maxCorrection`
 - `integralLimit`
 - `derivativeLimit`
-- `derivativeFilterCoefficient`
+- `derivativeFilterAlpha`
 - `steeringPolarity`
 - `controlPeriodMs`
-- `rearCommandTimeoutMs`
-- `initialLineSearchTimeoutMs`
+- `remoteCommandTimeoutMs`
 - `telemetryEnabled`
 
 ## Motor Mixing
@@ -83,7 +83,7 @@ front-right and back-right. Mixing produces logical signed normalized commands;
 per-wheel direction signs and H-bridge PWM truth tables stay in each ESP's pin
 configuration.
 
-If either side exceeds `maximumDuty`, the pair is scaled back so the commands
+If either side exceeds `maxDuty`, the pair is scaled back so the commands
 remain inside the configured limit.
 
 ## Serial Commands on ESP2
@@ -100,15 +100,15 @@ lf kd <value>
 lf speed <normalized-duty>
 lf max-duty <normalized-duty>
 lf max-correction <value>
+lf integral-limit <value>
+lf derivative-limit <value>
+lf derivative-alpha <value>
 lf polarity <1|-1>
 lf period-ms <integer>
+lf timeout-ms <integer>
 lf telemetry on
 lf telemetry off
 lf reset
-lf test sensor
-lf test motor <fl|fr|bl|br> <duty>
-lf test drive <duty>
-lf test stop
 ```
 
 Malformed values are rejected. `lf max-duty` cannot exceed the verified
@@ -121,16 +121,18 @@ carefully and start below the desired test value.
 When telemetry is enabled, ESP2 prints about 10 Hz:
 
 ```text
-lf_csv,timestamp_ms,left_black,right_black,error,line_visible,
-proportional_term,integral_term,derivative_term,correction,
+lf_csv,timestamp_ms,current_mode,line_follower_enabled,lsfl_level,lsfr_level,
+left_black,right_black,error,last_known_side,line_visible,has_history,
+kp,ki,kd,proportional_term,integral_term,derivative_term,correction,
+steering_polarity,base_duty,max_duty,max_correction,
 front_left_command,front_right_command,back_left_command,back_right_command,
-rear_command_age_ms,rear_link_healthy
+rear_link_healthy,rear_command_sequence,rear_command_age_ms
 ```
 
 Sensor-only mode prints:
 
 ```text
-sensor,timestamp_ms,left_black,right_black
+sensor,timestamp_ms,lsfl_level,lsfr_level,left_black,right_black,error,line_visible
 ```
 
 ## Bring-Up Procedure
@@ -139,10 +141,10 @@ sensor,timestamp_ms,left_black,right_black
 2. Fill in verified GPIOs, UART pins/baud, PWM resources, motor truth table,
    per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 3. Build and upload both processors.
-4. Run `lf test sensor` and confirm LOW on black tape and HIGH on white surface.
-5. Run `lf test motor <wheel> <low-duty>` one wheel at a time and correct
+4. Run `line status` and confirm HIGH on black tape and LOW on white surface.
+5. Run `motor test <wheel> <low-duty> <ms>` one wheel at a time and correct
    `forward_sign` values until each wheel moves forward.
-6. Run `lf test drive <low-duty>` to confirm ESP2-to-ESP1 rear drive commands.
+6. Run `drive fwd <low-duty> <ms>` to confirm ESP2-to-ESP1 rear drive commands.
 7. Place the robot on a simple straight tape course.
 8. Set `lf ki 0` and `lf kd 0`.
 9. Set a low `lf speed` slightly above the motors' reliable movement threshold.

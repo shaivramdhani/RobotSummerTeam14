@@ -18,6 +18,15 @@ enum class LineObservationKind : std::uint8_t {
 
 struct LineObservation {
   LineObservationKind kind{LineObservationKind::Invalid};
+
+  bool leftOnTape{false};
+  bool rightOnTape{false};
+  std::int8_t lastKnownSide{0};
+  bool lineVisible{false};
+  bool hasHistory{false};
+  Milliseconds timestampMs{0};
+
+  // Compatibility fields for existing call sites and docs.
   bool left_black{false};
   bool right_black{false};
   std::int8_t error{0};
@@ -25,8 +34,6 @@ struct LineObservation {
   bool line_visible{false};
   bool safe_to_drive{false};
   Milliseconds timestamp_ms{0};
-
-  // Compatibility fields for existing call sites and docs.
   std::int16_t line_error_milli{0};
   Milliseconds observed_at_ms{0};
 };
@@ -40,6 +47,9 @@ constexpr std::int8_t normalizeLastKnownSide(std::int8_t side) {
 LineObservation observeDigitalLineSensors(bool left_black, bool right_black,
                                           std::int8_t previous_last_known_side,
                                           Milliseconds timestamp_ms);
+LineObservation observeDigitalLineSensorLevels(
+    bool left_electrical_high, bool right_electrical_high,
+    std::int8_t previous_last_known_side, Milliseconds timestamp_ms);
 LineObservation observeFrontLine(const FrontLineSensorSnapshot& snapshot);
 
 }  // namespace robot

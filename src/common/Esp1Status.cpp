@@ -10,11 +10,22 @@ void putI16(std::uint8_t* output, const std::int16_t value) {
   output[1] = static_cast<std::uint8_t>((raw >> 8U) & 0xFFU);
 }
 
+void putU16(std::uint8_t* output, const std::uint16_t value) {
+  output[0] = static_cast<std::uint8_t>(value & 0xFFU);
+  output[1] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
+}
+
 std::int16_t getI16(const std::uint8_t* input) {
   const std::uint16_t raw =
       static_cast<std::uint16_t>(input[0]) |
       (static_cast<std::uint16_t>(input[1]) << 8U);
   return static_cast<std::int16_t>(raw);
+}
+
+std::uint16_t getU16(const std::uint8_t* input) {
+  return static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(input[0]) |
+      (static_cast<std::uint16_t>(input[1]) << 8U));
 }
 
 void putU32(std::uint8_t* output, const std::uint32_t value) {
@@ -46,6 +57,7 @@ RobotTestMode byteToMode(const std::uint8_t value) {
     case RobotTestMode::LineFollowTest:
     case RobotTestMode::MechanismTest:
     case RobotTestMode::AutonomousDryRun:
+    case RobotTestMode::AutonomousSolarPanel:
       return static_cast<RobotTestMode>(value);
   }
   return RobotTestMode::Disabled;
@@ -58,6 +70,7 @@ FaultCode byteToFaultCode(const std::uint8_t value) {
     case FaultCode::InvalidCommand:
     case FaultCode::LimitSwitchConflict:
     case FaultCode::HardwareNotConfigured:
+    case FaultCode::SearchTimeout:
       return static_cast<FaultCode>(value);
   }
   return FaultCode::InvalidCommand;
@@ -83,7 +96,24 @@ UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
   flags |= report.fault_active ? kEsp1StatusFaultActiveFlag : 0U;
   flags |= report.back_left_inverted ? kEsp1StatusBackLeftInvertedFlag : 0U;
   flags |= report.back_right_inverted ? kEsp1StatusBackRightInvertedFlag : 0U;
+  flags |= report.ir_beacon_detected ? kEsp1StatusIrBeaconDetectedFlag : 0U;
+  flags |= report.ir_switch_raw_high ? kEsp1StatusIrSwitchRawHighFlag : 0U;
+  flags |= report.ir_switch_debounced_high
+               ? kEsp1StatusIrSwitchDebouncedHighFlag
+               : 0U;
   packet.payload[10] = flags;
+  putU16(&packet.payload[11], report.ir_adc_average);
+  putU16(&packet.payload[13], report.ir_adc_min);
+  putU16(&packet.payload[15], report.ir_adc_max);
+  putU16(&packet.payload[17], report.ir_amplitude_pp);
+  putU16(&packet.payload[19], report.ir_selected_frequency_hz);
+  putU16(&packet.payload[21], report.ir_adc_latest_sample);
+  putU16(&packet.payload[23], report.ir_1khz_amplitude);
+  putU16(&packet.payload[25], report.ir_10khz_amplitude);
+  putU16(&packet.payload[27], report.ir_selected_amplitude);
+  putU16(&packet.payload[29], report.ir_active_threshold);
+  putU32(&packet.payload[31], report.ir_adc_sample_rate_hz);
+  packet.payload[35] = report.ir_consecutive_detection_count;
   packet.header.integrity_crc16 = calculatePacketIntegrity(packet);
   return packet;
 }
@@ -108,6 +138,24 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
       (flags & kEsp1StatusBackLeftInvertedFlag) != 0U;
   report.back_right_inverted =
       (flags & kEsp1StatusBackRightInvertedFlag) != 0U;
+  report.ir_beacon_detected =
+      (flags & kEsp1StatusIrBeaconDetectedFlag) != 0U;
+  report.ir_switch_raw_high =
+      (flags & kEsp1StatusIrSwitchRawHighFlag) != 0U;
+  report.ir_switch_debounced_high =
+      (flags & kEsp1StatusIrSwitchDebouncedHighFlag) != 0U;
+  report.ir_adc_average = getU16(&packet.payload[11]);
+  report.ir_adc_min = getU16(&packet.payload[13]);
+  report.ir_adc_max = getU16(&packet.payload[15]);
+  report.ir_amplitude_pp = getU16(&packet.payload[17]);
+  report.ir_selected_frequency_hz = getU16(&packet.payload[19]);
+  report.ir_adc_latest_sample = getU16(&packet.payload[21]);
+  report.ir_1khz_amplitude = getU16(&packet.payload[23]);
+  report.ir_10khz_amplitude = getU16(&packet.payload[25]);
+  report.ir_selected_amplitude = getU16(&packet.payload[27]);
+  report.ir_active_threshold = getU16(&packet.payload[29]);
+  report.ir_adc_sample_rate_hz = getU32(&packet.payload[31]);
+  report.ir_consecutive_detection_count = packet.payload[35];
   return true;
 }
 

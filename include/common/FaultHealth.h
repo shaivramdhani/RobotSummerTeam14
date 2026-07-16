@@ -12,6 +12,7 @@ enum class FaultCode : std::uint8_t {
   InvalidCommand = 2,
   LimitSwitchConflict = 3,
   HardwareNotConfigured = 4,
+  SearchTimeout = 5,
 };
 
 struct HealthReport {

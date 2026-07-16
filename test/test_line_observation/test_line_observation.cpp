@@ -11,6 +11,7 @@
 #include "common/RearDriveCommand.h"
 #include "common/RobotCommandValidation.h"
 #include "common/RobotTestModeManager.h"
+#include "common/SolarPanelAutonomy.h"
 #include "common/TelemetrySnapshot.h"
 
 namespace {
@@ -22,25 +23,32 @@ void assertNear(const float expected, const float actual,
 
 robot::LineFollowerConfig pidConfig() {
   robot::LineFollowerConfig config{};
-  config.maximumDuty = 0.6F;
-  config.maximumCorrection = 0.6F;
+  config.maxDuty = 0.6F;
+  config.maxCorrection = 0.6F;
   config.integralLimit = 1.0F;
   config.derivativeLimit = 100.0F;
   return config;
 }
 
-void test_low_low_maps_to_zero_error() {
+robot::SolarPanelAutonomyConfig solarConfig() {
+  return {100U, 60U, 200U, 0.0F, 500U, 5000U};
+}
+
+void test_both_on_tape_maps_to_zero_error() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(true, true, 0, 10U);
 
+  TEST_ASSERT_TRUE(observation.leftOnTape);
+  TEST_ASSERT_TRUE(observation.rightOnTape);
   TEST_ASSERT_TRUE(observation.left_black);
   TEST_ASSERT_TRUE(observation.right_black);
   TEST_ASSERT_EQUAL_INT8(0, observation.error);
+  TEST_ASSERT_TRUE(observation.lineVisible);
   TEST_ASSERT_TRUE(observation.line_visible);
   TEST_ASSERT_TRUE(observation.safe_to_drive);
 }
 
-void test_low_high_maps_to_positive_one() {
+void test_left_on_tape_maps_to_positive_one() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(true, false, 0, 10U);
 
@@ -49,7 +57,7 @@ void test_low_high_maps_to_positive_one() {
   TEST_ASSERT_TRUE(observation.line_visible);
 }
 
-void test_high_low_maps_to_negative_one() {
+void test_right_on_tape_maps_to_negative_one() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(false, true, 0, 10U);
 
@@ -58,17 +66,19 @@ void test_high_low_maps_to_negative_one() {
   TEST_ASSERT_TRUE(observation.line_visible);
 }
 
-void test_high_high_after_positive_history_maps_to_positive_five() {
+void test_both_off_tape_after_positive_history_maps_to_positive_five() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(false, false, 1, 10U);
 
   TEST_ASSERT_EQUAL_INT8(5, observation.error);
+  TEST_ASSERT_EQUAL_INT8(1, observation.lastKnownSide);
   TEST_ASSERT_EQUAL_INT8(1, observation.last_known_side);
   TEST_ASSERT_FALSE(observation.line_visible);
+  TEST_ASSERT_TRUE(observation.hasHistory);
   TEST_ASSERT_TRUE(observation.safe_to_drive);
 }
 
-void test_high_high_after_negative_history_maps_to_negative_five() {
+void test_both_off_tape_after_negative_history_maps_to_negative_five() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(false, false, -1, 10U);
 
@@ -78,23 +88,68 @@ void test_high_high_after_negative_history_maps_to_negative_five() {
   TEST_ASSERT_TRUE(observation.safe_to_drive);
 }
 
-void test_high_high_without_history_is_unsafe() {
+void test_both_off_tape_without_history_is_unsafe() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(false, false, 0, 10U);
 
   TEST_ASSERT_EQUAL_INT8(0, observation.error);
   TEST_ASSERT_EQUAL_INT8(0, observation.last_known_side);
   TEST_ASSERT_FALSE(observation.line_visible);
+  TEST_ASSERT_FALSE(observation.hasHistory);
   TEST_ASSERT_FALSE(observation.safe_to_drive);
 }
 
-void test_both_low_preserves_last_known_side() {
+void test_both_on_tape_preserves_last_known_side() {
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(true, true, -1, 10U);
 
   TEST_ASSERT_EQUAL_INT8(0, observation.error);
   TEST_ASSERT_EQUAL_INT8(-1, observation.last_known_side);
   TEST_ASSERT_TRUE(observation.line_visible);
+}
+
+void test_electrical_high_high_maps_to_both_on_tape() {
+  const robot::LineObservation observation =
+      robot::observeDigitalLineSensorLevels(true, true, 0, 25U);
+
+  TEST_ASSERT_TRUE(observation.leftOnTape);
+  TEST_ASSERT_TRUE(observation.rightOnTape);
+  TEST_ASSERT_EQUAL_INT8(0, observation.error);
+  TEST_ASSERT_TRUE(observation.lineVisible);
+  TEST_ASSERT_EQUAL_UINT32(25U, observation.timestampMs);
+}
+
+void test_electrical_low_high_maps_to_right_on_tape() {
+  const robot::LineObservation observation =
+      robot::observeDigitalLineSensorLevels(false, true, 0, 25U);
+
+  TEST_ASSERT_FALSE(observation.leftOnTape);
+  TEST_ASSERT_TRUE(observation.rightOnTape);
+  TEST_ASSERT_EQUAL_INT8(-1, observation.error);
+  TEST_ASSERT_EQUAL_INT8(-1, observation.lastKnownSide);
+  TEST_ASSERT_TRUE(observation.hasHistory);
+}
+
+void test_electrical_high_low_maps_to_left_on_tape() {
+  const robot::LineObservation observation =
+      robot::observeDigitalLineSensorLevels(true, false, 0, 25U);
+
+  TEST_ASSERT_TRUE(observation.leftOnTape);
+  TEST_ASSERT_FALSE(observation.rightOnTape);
+  TEST_ASSERT_EQUAL_INT8(1, observation.error);
+  TEST_ASSERT_EQUAL_INT8(1, observation.lastKnownSide);
+  TEST_ASSERT_TRUE(observation.hasHistory);
+}
+
+void test_electrical_low_low_without_history_is_unsafe() {
+  const robot::LineObservation observation =
+      robot::observeDigitalLineSensorLevels(false, false, 0, 25U);
+
+  TEST_ASSERT_FALSE(observation.leftOnTape);
+  TEST_ASSERT_FALSE(observation.rightOnTape);
+  TEST_ASSERT_FALSE(observation.lineVisible);
+  TEST_ASSERT_FALSE(observation.hasHistory);
+  TEST_ASSERT_FALSE(observation.safe_to_drive);
 }
 
 void test_zero_error_gives_zero_correction_after_reset() {
@@ -128,7 +183,7 @@ void test_correction_clamps() {
   robot::LineFollowerState state{};
   robot::LineFollowerConfig config = pidConfig();
   config.kp = 10.0F;
-  config.maximumCorrection = 0.25F;
+  config.maxCorrection = 0.25F;
   robot::startLineFollower(state, 100U);
   const robot::LineObservation observation =
       robot::observeDigitalLineSensors(true, false, 0, 120U);
@@ -221,11 +276,24 @@ void test_reset_clears_pid_state() {
   TEST_ASSERT_EQUAL_INT8(0, state.last_known_side);
 }
 
+void test_update_stops_when_line_lost_without_history() {
+  robot::LineFollowerState state{};
+  robot::LineFollowerConfig config = pidConfig();
+  robot::startLineFollower(state, 100U);
+
+  const robot::LineFollowerUpdate update =
+      robot::updateLineFollower(state, false, false, config, 110U);
+
+  TEST_ASSERT_FALSE(state.enabled);
+  TEST_ASSERT_FALSE(update.should_drive);
+  TEST_ASSERT_FALSE(update.wheel_command.front_left.enabled);
+}
+
 void test_zero_correction_gives_equal_left_and_right_commands() {
   robot::LineFollowerConfig config{};
   config.baseDuty = 0.2F;
-  config.maximumDuty = 0.5F;
-  config.maximumCorrection = 0.3F;
+  config.maxDuty = 0.5F;
+  config.maxCorrection = 0.3F;
 
   const robot::FourWheelCommand command =
       robot::mixDifferentialLineFollow(0.0F, config, 100U);
@@ -237,8 +305,8 @@ void test_zero_correction_gives_equal_left_and_right_commands() {
 void test_positive_correction_changes_sides_oppositely() {
   robot::LineFollowerConfig config{};
   config.baseDuty = 0.2F;
-  config.maximumDuty = 0.5F;
-  config.maximumCorrection = 0.3F;
+  config.maxDuty = 0.5F;
+  config.maxCorrection = 0.3F;
 
   const robot::FourWheelCommand command =
       robot::mixDifferentialLineFollow(0.1F, config, 100U);
@@ -250,8 +318,8 @@ void test_positive_correction_changes_sides_oppositely() {
 void test_negative_polarity_reverses_correction() {
   robot::LineFollowerConfig config{};
   config.baseDuty = 0.2F;
-  config.maximumDuty = 0.5F;
-  config.maximumCorrection = 0.3F;
+  config.maxDuty = 0.5F;
+  config.maxCorrection = 0.3F;
   config.steeringPolarity = -1;
 
   const robot::FourWheelCommand command =
@@ -264,8 +332,8 @@ void test_negative_polarity_reverses_correction() {
 void test_final_duties_remain_inside_limits() {
   robot::LineFollowerConfig config{};
   config.baseDuty = 0.5F;
-  config.maximumDuty = 0.4F;
-  config.maximumCorrection = 0.4F;
+  config.maxDuty = 0.4F;
+  config.maxCorrection = 0.4F;
 
   const robot::FourWheelCommand command =
       robot::mixDifferentialLineFollow(0.4F, config, 100U);
@@ -347,6 +415,25 @@ void test_mode_manager_accepts_sensor_mode_without_motors() {
   TEST_ASSERT_FALSE(manager.motorsMayBeCommanded());
 }
 
+void test_mechanism_mode_is_not_sensor_only() {
+  TEST_ASSERT_FALSE(
+      robot::robotTestModeIsSensorOnly(robot::RobotTestMode::MechanismTest));
+  TEST_ASSERT_FALSE(robot::robotTestModeAllowsMotion(
+      robot::RobotTestMode::MechanismTest));
+}
+
+void test_autonomous_solar_mode_allows_motion_and_requires_rear_link() {
+  robot::RobotTestMode mode{};
+
+  TEST_ASSERT_TRUE(robot::parseRobotTestMode("autonomous-solar", mode));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::RobotTestMode::AutonomousSolarPanel),
+      static_cast<std::uint8_t>(mode));
+  TEST_ASSERT_TRUE(robot::robotTestModeAllowsMotion(mode));
+  TEST_ASSERT_TRUE(robot::robotTestModeRequiresRearLink(mode));
+  TEST_ASSERT_FALSE(robot::robotTestModeIsSensorOnly(mode));
+}
+
 void test_emergency_stop_works_from_any_mode() {
   robot::RobotTestModeManager manager{};
   manager.setMode(robot::RobotTestMode::ManualDriveTest, 25U);
@@ -396,8 +483,8 @@ void test_command_validation_rejects_malformed_motor_id() {
 
 void test_command_validation_rejects_invalid_pid_value() {
   robot::LineFollowerConfig config{};
-  config.maximumDuty = 0.3F;
-  config.maximumCorrection = 0.2F;
+  config.maxDuty = 0.3F;
+  config.maxCorrection = 0.2F;
   config.kp = -0.1F;
 
   const robot::CommandValidationResult result =
@@ -429,6 +516,97 @@ void test_event_log_stores_newest_events_and_wraps() {
   TEST_ASSERT_EQUAL_STRING("newest", newest.message);
 }
 
+void test_solar_detector_no_beacon_does_not_confirm() {
+  robot::SolarBeaconDetectorState state{};
+  const robot::SolarPanelAutonomyConfig config = solarConfig();
+
+  robot::SolarBeaconDetectorUpdate update{};
+  for (robot::Milliseconds now = 100U; now <= 600U; now += 100U) {
+    update = robot::updateSolarBeaconDetector(state, 20U, config, now, true);
+  }
+
+  TEST_ASSERT_FALSE(update.confirmation_active);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+  TEST_ASSERT_EQUAL_UINT32(0U, update.confirmation_progress_ms);
+}
+
+void test_solar_detector_brief_spike_does_not_confirm() {
+  robot::SolarBeaconDetectorState state{};
+  const robot::SolarPanelAutonomyConfig config = solarConfig();
+
+  robot::SolarBeaconDetectorUpdate update =
+      robot::updateSolarBeaconDetector(state, 150U, config, 100U, true);
+  TEST_ASSERT_TRUE(update.confirmation_active);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+
+  update = robot::updateSolarBeaconDetector(state, 20U, config, 150U, true);
+  TEST_ASSERT_FALSE(update.confirmation_active);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+
+  update = robot::updateSolarBeaconDetector(state, 20U, config, 350U, true);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+}
+
+void test_solar_detector_sustained_beacon_confirms() {
+  robot::SolarBeaconDetectorState state{};
+  const robot::SolarPanelAutonomyConfig config = solarConfig();
+
+  robot::updateSolarBeaconDetector(state, 150U, config, 100U, true);
+  robot::SolarBeaconDetectorUpdate update =
+      robot::updateSolarBeaconDetector(state, 150U, config, 250U, true);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+
+  update = robot::updateSolarBeaconDetector(state, 150U, config, 300U, true);
+  TEST_ASSERT_TRUE(update.beacon_detected);
+  TEST_ASSERT_EQUAL_UINT32(config.confirmation_time_ms,
+                           update.confirmation_progress_ms);
+}
+
+void test_solar_detector_hysteresis_holds_until_release_threshold() {
+  robot::SolarBeaconDetectorState state{};
+  const robot::SolarPanelAutonomyConfig config = solarConfig();
+
+  robot::updateSolarBeaconDetector(state, 150U, config, 100U, true);
+  robot::SolarBeaconDetectorUpdate update =
+      robot::updateSolarBeaconDetector(state, 90U, config, 200U, true);
+  TEST_ASSERT_TRUE(update.confirmation_active);
+  TEST_ASSERT_EQUAL_UINT32(100U, update.confirmation_progress_ms);
+
+  update = robot::updateSolarBeaconDetector(state, 50U, config, 250U, true);
+  TEST_ASSERT_FALSE(update.confirmation_active);
+  TEST_ASSERT_EQUAL_UINT32(0U, update.confirmation_progress_ms);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+}
+
+void test_solar_detector_ignore_window_blocks_confirmation() {
+  robot::SolarBeaconDetectorState state{};
+  const robot::SolarPanelAutonomyConfig config = solarConfig();
+
+  robot::SolarBeaconDetectorUpdate update =
+      robot::updateSolarBeaconDetector(state, 150U, config, 100U, false);
+  TEST_ASSERT_FALSE(update.confirmation_active);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+
+  update = robot::updateSolarBeaconDetector(state, 150U, config, 600U, true);
+  TEST_ASSERT_TRUE(update.confirmation_active);
+  TEST_ASSERT_FALSE(update.beacon_detected);
+  TEST_ASSERT_EQUAL_UINT32(0U, update.confirmation_progress_ms);
+}
+
+void test_solar_detector_reset_clears_state() {
+  robot::SolarBeaconDetectorState state{};
+  const robot::SolarPanelAutonomyConfig config = solarConfig();
+  robot::updateSolarBeaconDetector(state, 150U, config, 100U, true);
+  robot::updateSolarBeaconDetector(state, 150U, config, 300U, true);
+
+  robot::resetSolarBeaconDetectorState(state);
+
+  TEST_ASSERT_FALSE(state.filter_initialized);
+  TEST_ASSERT_FALSE(state.confirmation_active);
+  TEST_ASSERT_FALSE(state.beacon_detected);
+  TEST_ASSERT_EQUAL_UINT32(0U, state.confirmation_progress_ms);
+}
+
 void test_telemetry_json_contains_required_fields_and_booleans() {
   robot::TelemetrySnapshot snapshot{};
   snapshot.uptime_ms = 123U;
@@ -438,22 +616,115 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.lsfr_black = false;
   snapshot.front_left.desired_command_milli = 100;
   snapshot.front_right.desired_command_milli = -100;
+  snapshot.ir_adc_average = 1800U;
+  snapshot.ir_adc_min = 1200U;
+  snapshot.ir_adc_max = 2200U;
+  snapshot.ir_amplitude_pp = 1000U;
+  snapshot.ir_beacon_detected = true;
+  snapshot.ir_switch_raw_state = true;
+  snapshot.ir_switch_debounced_state = true;
+  snapshot.selected_beacon_frequency_hz = 1000U;
+  snapshot.ir_adc_latest_sample = 1900U;
+  snapshot.ir_adc_sample_mean = 1800U;
+  snapshot.ir_1khz_goertzel_amplitude = 400U;
+  snapshot.ir_10khz_goertzel_amplitude = 30U;
+  snapshot.ir_selected_frequency_amplitude = 400U;
+  snapshot.ir_active_threshold = 120U;
+  snapshot.ir_consecutive_detection_count = 3U;
+  snapshot.ir_adc_sample_rate_hz = 50000U;
+  snapshot.motor_command_magnitude_milli = 300U;
+  snapshot.autonomous_state =
+      robot::SolarPanelAutonomyState::SolarBeaconAligned;
+  snapshot.autonomous_fault_reason = robot::SolarPanelFaultReason::None;
+  snapshot.autonomous_time_in_state_ms = 2500U;
+  snapshot.solar_ir_raw_amplitude = 400U;
+  snapshot.solar_ir_filtered_amplitude = 380.5F;
+  snapshot.solar_ir_detection_threshold = 120U;
+  snapshot.solar_ir_release_threshold = 80U;
+  snapshot.solar_ir_detection_threshold_1khz = 120U;
+  snapshot.solar_ir_release_threshold_1khz = 80U;
+  snapshot.solar_ir_detection_threshold_10khz = 220U;
+  snapshot.solar_ir_release_threshold_10khz = 160U;
+  snapshot.solar_ir_confirmation_progress_ms = 300U;
+  snapshot.solar_ir_confirmation_time_ms = 300U;
+  snapshot.solar_ir_filter_alpha = 0.75F;
+  snapshot.solar_ir_confirmation_active = true;
+  snapshot.solar_beacon_confirmed = true;
+  snapshot.solar_ir_ignore_after_start_ms = 500U;
+  snapshot.solar_search_timeout_ms = 30000U;
+  snapshot.solar_start_base_duty = 0.25F;
+  snapshot.solar_slow_after_ms = 7000U;
+  snapshot.solar_slow_base_duty = 0.15F;
+  snapshot.solar_slow_mode_active = true;
+  snapshot.claws.claw_1.hardware_configured = true;
+  snapshot.claws.claw_1.start_configured = true;
+  snapshot.claws.claw_1.start_angle_deg = 30;
+  snapshot.claws.claw_1.open_angle_deg = 120;
+  snapshot.claws.claw_1.commanded_angle_deg = 120;
+  snapshot.claws.claw_1.commanded_open = true;
 
-  char output[2048]{};
+  char output[8192]{};
   TEST_ASSERT_TRUE(
       robot::writeTelemetryJson(snapshot, output, sizeof(output), false));
 
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"current_mode\":\"LINE_SENSOR_TEST\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"enabled\":false"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_black\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_level\":\"UNKNOWN\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"hasHistory\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"maxDuty\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"front_left\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"line_error\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"ir_adc_average\":1800"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"ir_beacon_detected\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"selectedBeaconFrequencyHz\":1000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"switchRawState\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"ir_1khz_goertzel_amplitude\":400"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"ir_adc_sample_rate_hz\":50000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"motor_command_magnitude_milli\":300"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"autonomous_state\":\"SOLAR_BEACON_ALIGNED\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"autonomous\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"ir_filtered_amplitude\":380.50"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"ir_detection_threshold_10khz\":220"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"filter_alpha\":0.75000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"start_base_duty\":0.25000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"slow_after_ms\":7000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"slow_base_duty\":0.15000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"slow_mode_active\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"confirmation_progress_ms\":300"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"claws\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"rotation_deg\":90"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"claw_1\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"commandedAngleDeg\":120"));
 }
 
 void test_esp1_status_packet_round_trips() {
-  const robot::Esp1StatusReport report{
+  robot::Esp1StatusReport report{
       1234U, robot::RobotTestMode::Disabled, true,
       robot::FaultCode::CommunicationStale, 111, -222, true, false};
+  report.ir_adc_average = 1800U;
+  report.ir_adc_min = 1100U;
+  report.ir_adc_max = 2300U;
+  report.ir_amplitude_pp = 1200U;
+  report.ir_beacon_detected = true;
+  report.ir_switch_raw_high = false;
+  report.ir_switch_debounced_high = false;
+  report.ir_selected_frequency_hz = 10000U;
+  report.ir_adc_latest_sample = 1700U;
+  report.ir_1khz_amplitude = 25U;
+  report.ir_10khz_amplitude = 450U;
+  report.ir_selected_amplitude = 450U;
+  report.ir_active_threshold = 120U;
+  report.ir_consecutive_detection_count = 4U;
+  report.ir_adc_sample_rate_hz = 50000U;
 
   const robot::UartPacket packet = robot::makeEsp1StatusPacket(report, 42U);
   robot::Esp1StatusReport decoded{};
@@ -468,19 +739,38 @@ void test_esp1_status_packet_round_trips() {
   TEST_ASSERT_EQUAL_INT16(-222, decoded.back_right_applied_command_milli);
   TEST_ASSERT_TRUE(decoded.back_left_inverted);
   TEST_ASSERT_FALSE(decoded.back_right_inverted);
+  TEST_ASSERT_EQUAL_UINT16(1800U, decoded.ir_adc_average);
+  TEST_ASSERT_EQUAL_UINT16(1100U, decoded.ir_adc_min);
+  TEST_ASSERT_EQUAL_UINT16(2300U, decoded.ir_adc_max);
+  TEST_ASSERT_EQUAL_UINT16(1200U, decoded.ir_amplitude_pp);
+  TEST_ASSERT_TRUE(decoded.ir_beacon_detected);
+  TEST_ASSERT_FALSE(decoded.ir_switch_raw_high);
+  TEST_ASSERT_FALSE(decoded.ir_switch_debounced_high);
+  TEST_ASSERT_EQUAL_UINT16(10000U, decoded.ir_selected_frequency_hz);
+  TEST_ASSERT_EQUAL_UINT16(1700U, decoded.ir_adc_latest_sample);
+  TEST_ASSERT_EQUAL_UINT16(25U, decoded.ir_1khz_amplitude);
+  TEST_ASSERT_EQUAL_UINT16(450U, decoded.ir_10khz_amplitude);
+  TEST_ASSERT_EQUAL_UINT16(450U, decoded.ir_selected_amplitude);
+  TEST_ASSERT_EQUAL_UINT16(120U, decoded.ir_active_threshold);
+  TEST_ASSERT_EQUAL_UINT8(4U, decoded.ir_consecutive_detection_count);
+  TEST_ASSERT_EQUAL_UINT32(50000U, decoded.ir_adc_sample_rate_hz);
 }
 
 }  // namespace
 
 int main() {
   UNITY_BEGIN();
-  RUN_TEST(test_low_low_maps_to_zero_error);
-  RUN_TEST(test_low_high_maps_to_positive_one);
-  RUN_TEST(test_high_low_maps_to_negative_one);
-  RUN_TEST(test_high_high_after_positive_history_maps_to_positive_five);
-  RUN_TEST(test_high_high_after_negative_history_maps_to_negative_five);
-  RUN_TEST(test_high_high_without_history_is_unsafe);
-  RUN_TEST(test_both_low_preserves_last_known_side);
+  RUN_TEST(test_both_on_tape_maps_to_zero_error);
+  RUN_TEST(test_left_on_tape_maps_to_positive_one);
+  RUN_TEST(test_right_on_tape_maps_to_negative_one);
+  RUN_TEST(test_both_off_tape_after_positive_history_maps_to_positive_five);
+  RUN_TEST(test_both_off_tape_after_negative_history_maps_to_negative_five);
+  RUN_TEST(test_both_off_tape_without_history_is_unsafe);
+  RUN_TEST(test_both_on_tape_preserves_last_known_side);
+  RUN_TEST(test_electrical_high_high_maps_to_both_on_tape);
+  RUN_TEST(test_electrical_low_high_maps_to_right_on_tape);
+  RUN_TEST(test_electrical_high_low_maps_to_left_on_tape);
+  RUN_TEST(test_electrical_low_low_without_history_is_unsafe);
   RUN_TEST(test_zero_error_gives_zero_correction_after_reset);
   RUN_TEST(test_proportional_term_has_correct_sign);
   RUN_TEST(test_correction_clamps);
@@ -489,6 +779,7 @@ int main() {
   RUN_TEST(test_derivative_uses_elapsed_time);
   RUN_TEST(test_derivative_clamps);
   RUN_TEST(test_reset_clears_pid_state);
+  RUN_TEST(test_update_stops_when_line_lost_without_history);
   RUN_TEST(test_zero_correction_gives_equal_left_and_right_commands);
   RUN_TEST(test_positive_correction_changes_sides_oppositely);
   RUN_TEST(test_negative_polarity_reverses_correction);
@@ -500,6 +791,8 @@ int main() {
   RUN_TEST(test_mode_manager_starts_disabled);
   RUN_TEST(test_mode_manager_rejects_drive_while_disabled);
   RUN_TEST(test_mode_manager_accepts_sensor_mode_without_motors);
+  RUN_TEST(test_mechanism_mode_is_not_sensor_only);
+  RUN_TEST(test_autonomous_solar_mode_allows_motion_and_requires_rear_link);
   RUN_TEST(test_emergency_stop_works_from_any_mode);
   RUN_TEST(test_command_validation_rejects_out_of_range_duty);
   RUN_TEST(test_command_validation_accepts_drive_test_duty_0_7);
@@ -508,6 +801,12 @@ int main() {
   RUN_TEST(test_command_validation_rejects_invalid_pid_value);
   RUN_TEST(test_command_validation_rejects_mode_incompatible_motor_command);
   RUN_TEST(test_event_log_stores_newest_events_and_wraps);
+  RUN_TEST(test_solar_detector_no_beacon_does_not_confirm);
+  RUN_TEST(test_solar_detector_brief_spike_does_not_confirm);
+  RUN_TEST(test_solar_detector_sustained_beacon_confirms);
+  RUN_TEST(test_solar_detector_hysteresis_holds_until_release_threshold);
+  RUN_TEST(test_solar_detector_ignore_window_blocks_confirmation);
+  RUN_TEST(test_solar_detector_reset_clears_state);
   RUN_TEST(test_telemetry_json_contains_required_fields_and_booleans);
   RUN_TEST(test_esp1_status_packet_round_trips);
   return UNITY_END();

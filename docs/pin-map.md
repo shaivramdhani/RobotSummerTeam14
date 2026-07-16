@@ -46,8 +46,8 @@ ESP1 UART baud rate: TODO.
 
 | Signal | GPIO | Active level / electrical notes |
 | --- | --- | --- |
-| `LSFL` | TODO | TODO |
-| `LSFR` | TODO | TODO |
+| `LSFL` | 19 | Digital comparator, HIGH = black tape |
+| `LSFR` | 20 | Digital comparator, HIGH = black tape |
 | `PWMFL0` | TODO | TODO |
 | `PWMFL1` | TODO | TODO |
 | `PWMFR0` | TODO | TODO |
@@ -55,9 +55,9 @@ ESP1 UART baud rate: TODO.
 | `STEP` | TODO | TODO |
 | `DIR` | TODO | TODO |
 | `SLEEP` | TODO | TODO |
-| `MSCLAW1` | TODO | TODO |
-| `MSCLAW2` | TODO | TODO |
-| `MSCLAW3` | TODO | TODO |
+| `MSCLAW1` | 14 | PWM channel/frequency/pulse range TODO |
+| `MSCLAW2` | 13 | PWM channel/frequency/pulse range TODO |
+| `MSCLAW3` | 12 | PWM channel/frequency/pulse range TODO |
 | `PusherServo` | TODO | TODO |
 | `WinchServo` | TODO | TODO |
 | `LimitSwitchStepperBottom` | TODO | TODO |

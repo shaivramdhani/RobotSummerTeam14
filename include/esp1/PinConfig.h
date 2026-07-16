@@ -38,8 +38,8 @@ struct UartConfig {
 
 struct Esp1Pins {
   int left_ir_filtered{kUnassignedGpio};           // TODO: GPIO, active level
-  int right_ir_filtered{kUnassignedGpio};          // TODO: GPIO, active level
-  int freq{kUnassignedGpio};                       // TODO: GPIO, signal type
+  int right_ir_filtered{7};  // GPIO7, ADC1_CH6, analog 0-3.3 V max
+  int freq{2};  // IR frequency-select switch, INPUT_PULLUP
   int ultrasonic_trigger_1{kUnassignedGpio};       // TODO: GPIO, timing
   int ultrasonic_echo_1{kUnassignedGpio};          // TODO: GPIO, voltage level
   int ultrasonic_trigger_2{kUnassignedGpio};       // TODO: GPIO, timing
@@ -47,14 +47,14 @@ struct Esp1Pins {
   int line_sensor_side{kUnassignedGpio};           // TODO: GPIO/ADC, active level
   int line_sensor_back_left{kUnassignedGpio};      // TODO: GPIO/ADC, active level
   int line_sensor_back_right{kUnassignedGpio};     // TODO: GPIO/ADC, active level
-  int pwm_back_left_0{42};            // TODO: GPIO, PWM resource
-  int pwm_back_left_1{41};            // TODO: GPIO, PWM resource
-  int pwm_back_right_0{15};           // TODO: GPIO, PWM resource
-  int pwm_back_right_1{16};           // TODO: GPIO, PWM resource
+  int pwm_back_left_0{16};            // TODO: GPIO, PWM resource
+  int pwm_back_left_1{15};            // TODO: GPIO, PWM resource
+  int pwm_back_right_0{42};           // TODO: GPIO, PWM resource
+  int pwm_back_right_1{41};           // TODO: GPIO, PWM resource
   int pwm_funnel_0{kUnassignedGpio};               // TODO: GPIO, PWM resource
   int pwm_funnel_1{kUnassignedGpio};               // TODO: GPIO, PWM resource
-  int limit_switch_back_right_side{kUnassignedGpio};   // TODO: GPIO, active level
-  int limit_switch_front_right_side{kUnassignedGpio};  // TODO: GPIO, active level
+  int limit_switch_back_right_side{1};   // TODO: GPIO, active level
+  int limit_switch_front_right_side{9};  // TODO: GPIO, active level
   int uart_tx_to_esp2{21};                         // UART TX to ESP2 GPIO40
   int uart_rx_from_esp2{40};                       // UART RX from ESP2 GPIO21
 };
