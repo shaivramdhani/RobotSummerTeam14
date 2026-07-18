@@ -101,6 +101,7 @@ UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
   flags |= report.ir_switch_debounced_high
                ? kEsp1StatusIrSwitchDebouncedHighFlag
                : 0U;
+  flags |= report.funnel_configured ? kEsp1StatusFunnelConfiguredFlag : 0U;
   packet.payload[10] = flags;
   putU16(&packet.payload[11], report.ir_adc_average);
   putU16(&packet.payload[13], report.ir_adc_min);
@@ -114,6 +115,25 @@ UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
   putU16(&packet.payload[29], report.ir_active_threshold);
   putU32(&packet.payload[31], report.ir_adc_sample_rate_hz);
   packet.payload[35] = report.ir_consecutive_detection_count;
+  putI16(&packet.payload[36],
+         clampCommandMilli(report.funnel_applied_command_milli));
+  std::uint8_t sensor_flags = 0U;
+  sensor_flags |= report.solar_panel_limit_switches_configured
+                      ? kEsp1StatusSolarLimitConfiguredFlag
+                      : 0U;
+  sensor_flags |= report.solar_limit_back_right_high
+                      ? kEsp1StatusSolarLimitBackRightHighFlag
+                      : 0U;
+  sensor_flags |= report.solar_limit_front_right_high
+                      ? kEsp1StatusSolarLimitFrontRightHighFlag
+                      : 0U;
+  sensor_flags |= report.side_line_sensor_configured
+                      ? kEsp1StatusSideLineConfiguredFlag
+                      : 0U;
+  sensor_flags |= report.side_line_sensor_high
+                      ? kEsp1StatusSideLineHighFlag
+                      : 0U;
+  packet.payload[38] = sensor_flags;
   packet.header.integrity_crc16 = calculatePacketIntegrity(packet);
   return packet;
 }
@@ -144,6 +164,8 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
       (flags & kEsp1StatusIrSwitchRawHighFlag) != 0U;
   report.ir_switch_debounced_high =
       (flags & kEsp1StatusIrSwitchDebouncedHighFlag) != 0U;
+  report.funnel_configured =
+      (flags & kEsp1StatusFunnelConfiguredFlag) != 0U;
   report.ir_adc_average = getU16(&packet.payload[11]);
   report.ir_adc_min = getU16(&packet.payload[13]);
   report.ir_adc_max = getU16(&packet.payload[15]);
@@ -156,6 +178,18 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
   report.ir_active_threshold = getU16(&packet.payload[29]);
   report.ir_adc_sample_rate_hz = getU32(&packet.payload[31]);
   report.ir_consecutive_detection_count = packet.payload[35];
+  report.funnel_applied_command_milli = getI16(&packet.payload[36]);
+  const std::uint8_t sensor_flags = packet.payload[38];
+  report.solar_panel_limit_switches_configured =
+      (sensor_flags & kEsp1StatusSolarLimitConfiguredFlag) != 0U;
+  report.solar_limit_back_right_high =
+      (sensor_flags & kEsp1StatusSolarLimitBackRightHighFlag) != 0U;
+  report.solar_limit_front_right_high =
+      (sensor_flags & kEsp1StatusSolarLimitFrontRightHighFlag) != 0U;
+  report.side_line_sensor_configured =
+      (sensor_flags & kEsp1StatusSideLineConfiguredFlag) != 0U;
+  report.side_line_sensor_high =
+      (sensor_flags & kEsp1StatusSideLineHighFlag) != 0U;
   return true;
 }
 

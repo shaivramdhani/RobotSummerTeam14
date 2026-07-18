@@ -43,8 +43,15 @@ struct Esp1RemoteStatusTelemetry {
   FaultCode fault_code{FaultCode::None};
   std::int16_t back_left_applied_command_milli{0};
   std::int16_t back_right_applied_command_milli{0};
+  std::int16_t funnel_applied_command_milli{0};
   bool back_left_inverted{false};
   bool back_right_inverted{false};
+  bool funnel_configured{false};
+  bool solar_panel_limit_switches_configured{false};
+  bool solar_limit_back_right_high{false};
+  bool solar_limit_front_right_high{false};
+  bool side_line_sensor_configured{false};
+  bool side_line_sensor_high{false};
 };
 
 struct ServoClawTelemetry {
@@ -82,8 +89,11 @@ struct TelemetrySnapshot {
 
   int lsfl_raw_level{-1};
   int lsfr_raw_level{-1};
+  int lss_raw_level{-1};
   bool lsfl_black{false};
   bool lsfr_black{false};
+  bool lss_black{false};
+  bool lss_configured{false};
   std::int8_t line_error{0};
   bool line_visible{false};
   bool line_has_history{false};
@@ -132,9 +142,22 @@ struct TelemetrySnapshot {
   bool solar_slow_mode_active{false};
   bool solar_ir_confirmation_active{false};
   bool solar_beacon_confirmed{false};
+  Milliseconds solar_contact_timeout_ms{0};
+  float solar_contact_strafe_duty{0.0F};
+  Milliseconds solar_strafe_start_delay_ms{0};
+  Milliseconds solar_retry_strafe_left_duration_ms{0};
+  Milliseconds solar_retry_forward_duration_ms{0};
+  Milliseconds solar_retry_strafe_timeout_ms{0};
+  bool solar_panel_limit_switches_configured{false};
+  bool solar_limit_back_right_high{false};
+  bool solar_limit_front_right_high{false};
+  bool solar_limit_back_right_hit{false};
+  bool solar_limit_front_right_hit{false};
+  bool solar_limit_all_hit{false};
 
   MotorTelemetry front_left{};
   MotorTelemetry front_right{};
+  MotorTelemetry funnel{};
   RearCommandTelemetry rear{};
   Esp1RemoteStatusTelemetry esp1{};
   ServoClawBankTelemetry claws{};

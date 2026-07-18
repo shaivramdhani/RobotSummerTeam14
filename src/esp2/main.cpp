@@ -5,14 +5,17 @@
 #include <esp_system.h>
 
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "common/ChassisMixer.h"
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
+#include "common/FunnelCommand.h"
 #include "common/LineFollower.h"
 #include "common/LineObservation.h"
 #include "common/LineSensor.h"
@@ -25,6 +28,7 @@
 #include "common/UartProtocol.h"
 #include "esp2/MechanismControllers.h"
 #include "esp2/PinConfig.h"
+#include "esp2/StepperAxis.h"
 
 namespace {
 
@@ -59,10 +63,29 @@ constexpr robot::Milliseconds SOLAR_SEARCH_TIMEOUT_MS = 13000U;
 constexpr float SOLAR_START_BASE_DUTY = 0.3F;
 constexpr robot::Milliseconds SOLAR_SLOW_AFTER_MS = 7500U;
 constexpr float SOLAR_SLOW_BASE_DUTY = 0.1F;
+constexpr robot::Milliseconds SOLAR_CONTACT_TIMEOUT_MS =
+    SOLAR_SEARCH_TIMEOUT_MS;
+constexpr float SOLAR_CONTACT_STRAFE_DUTY = SOLAR_SLOW_BASE_DUTY;
+constexpr robot::Milliseconds SOLAR_STRAFE_START_DELAY_MS = 300U;
+// TODO(team): tune both adjustment durations on the real robot. Zero keeps the
+// new motion phases disabled until values are applied through telemetry.
+constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_LEFT_DURATION_MS = 0U;
+constexpr robot::Milliseconds SOLAR_RETRY_FORWARD_DURATION_MS = 0U;
+constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_TIMEOUT_MS =
+    SOLAR_CONTACT_TIMEOUT_MS;
+// Team wiring report: raw HIGH means the solar side switch has been hit.
+constexpr bool SOLAR_LIMIT_SWITCH_HIT_WHEN_HIGH = true;
 constexpr robot::SolarPanelAutonomyConfig kSolarPanelAutonomyConfig{
     IR_BEACON_DETECT_THRESHOLD_1KHZ, IR_BEACON_RELEASE_THRESHOLD_1KHZ,
     IR_BEACON_CONFIRM_TIME_MS, IR_FILTER_ALPHA, IR_IGNORE_AFTER_START_MS,
     SOLAR_SEARCH_TIMEOUT_MS};
+constexpr robot::SolarPanelContactConfig kSolarPanelContactConfig{
+    SOLAR_CONTACT_TIMEOUT_MS,
+    SOLAR_CONTACT_STRAFE_DUTY,
+    SOLAR_STRAFE_START_DELAY_MS,
+    SOLAR_RETRY_STRAFE_LEFT_DURATION_MS,
+    SOLAR_RETRY_FORWARD_DURATION_MS,
+    SOLAR_RETRY_STRAFE_TIMEOUT_MS};
 
 static_assert(IR_BEACON_RELEASE_THRESHOLD_1KHZ <=
                   IR_BEACON_DETECT_THRESHOLD_1KHZ,
@@ -79,6 +102,15 @@ static_assert(SOLAR_START_BASE_DUTY >= 0.0F &&
               "solar start base duty must be in [0, 1]");
 static_assert(SOLAR_SLOW_BASE_DUTY >= 0.0F && SOLAR_SLOW_BASE_DUTY <= 1.0F,
               "solar slow base duty must be in [0, 1]");
+static_assert(SOLAR_CONTACT_TIMEOUT_MS > 0U,
+              "solar contact timeout must be nonzero");
+static_assert(SOLAR_CONTACT_STRAFE_DUTY >= 0.0F &&
+                  SOLAR_CONTACT_STRAFE_DUTY <= 1.0F,
+              "solar contact strafe duty must be in [0, 1]");
+static_assert(SOLAR_STRAFE_START_DELAY_MS > 0U,
+              "solar strafe start delay must be nonzero");
+static_assert(SOLAR_RETRY_STRAFE_TIMEOUT_MS > 0U,
+              "solar retry strafe timeout must be nonzero");
 
 WebServer g_server{80};
 char g_json_buffer[kJsonBufferSize]{};
@@ -115,12 +147,14 @@ bool parseFloat(const char* text, float& value) {
 }
 
 bool parseUnsigned(const char* text, robot::Milliseconds& value) {
-  if (text == nullptr) {
+  if (text == nullptr || text[0] < '0' || text[0] > '9') {
     return false;
   }
+  errno = 0;
   char* end = nullptr;
   const unsigned long parsed = strtoul(text, &end, 10);
-  if (end == text || *end != '\0') {
+  if (errno == ERANGE || end == text || *end != '\0' ||
+      parsed > std::numeric_limits<robot::Milliseconds>::max()) {
     return false;
   }
   value = static_cast<robot::Milliseconds>(parsed);
@@ -383,6 +417,26 @@ class RearCommandLink {
     const std::uint16_t sequence = next_sequence_++;
     const robot::UartPacket packet =
         robot::makeRearDriveCommandPacket(command, sequence);
+    const bool sent = sendPacket(packet);
+    last_rear_sequence_sent_ = sequence;
+    last_rear_sent_at_ms_ = command.sender_timestamp_ms;
+    return sent;
+  }
+
+  bool send(const robot::FunnelCommand& command) {
+    if (!configured_) {
+      healthy_ = false;
+      return false;
+    }
+
+    const std::uint16_t sequence = next_sequence_++;
+    const robot::UartPacket packet =
+        robot::makeFunnelCommandPacket(command, sequence);
+    return sendPacket(packet);
+  }
+
+ private:
+  bool sendPacket(const robot::UartPacket& packet) {
     std::uint8_t frame[robot::kUartFrameOverheadSize +
                        robot::kUartMaxPayloadSize]{};
     std::size_t frame_size = 0U;
@@ -397,11 +451,10 @@ class RearCommandLink {
     if (!healthy_) {
       ++packet_error_count_;
     }
-    last_sequence_sent_ = sequence;
-    last_sent_at_ms_ = command.sender_timestamp_ms;
     return healthy_;
   }
 
+ public:
   void pollReceive(const robot::Milliseconds now_ms) {
     if (!configured_) {
       return;
@@ -430,18 +483,18 @@ class RearCommandLink {
   bool healthy(const robot::Milliseconds now_ms,
                const robot::Milliseconds timeout_ms) const {
     return configured_ && healthy_ &&
-           elapsedSince(now_ms, last_sent_at_ms_) <= timeout_ms;
+           elapsedSince(now_ms, last_rear_sent_at_ms_) <= timeout_ms;
   }
   bool remoteStatusFresh(const robot::Milliseconds now_ms,
                          const robot::Milliseconds timeout_ms) const {
     return configured_ && status_available_ &&
            elapsedSince(now_ms, last_status_received_at_ms_) <= timeout_ms;
   }
-  robot::Milliseconds lastSentAtMs() const { return last_sent_at_ms_; }
+  robot::Milliseconds lastSentAtMs() const { return last_rear_sent_at_ms_; }
   robot::Milliseconds lastStatusReceivedAtMs() const {
     return last_status_received_at_ms_;
   }
-  std::uint16_t lastSequenceSent() const { return last_sequence_sent_; }
+  std::uint16_t lastSequenceSent() const { return last_rear_sequence_sent_; }
   std::uint32_t packetErrorCount() const { return packet_error_count_; }
   bool statusAvailable() const { return status_available_; }
   const robot::Esp1StatusReport& latestStatus() const {
@@ -452,11 +505,11 @@ class RearCommandLink {
   const robot::esp2::UartConfig& config_;
   robot::UartFrameParser parser_{};
   std::uint16_t next_sequence_{0};
-  std::uint16_t last_sequence_sent_{0};
+  std::uint16_t last_rear_sequence_sent_{0};
   bool configured_{false};
   bool healthy_{false};
   bool status_available_{false};
-  robot::Milliseconds last_sent_at_ms_{0};
+  robot::Milliseconds last_rear_sent_at_ms_{0};
   robot::Milliseconds last_status_received_at_ms_{0};
   std::uint32_t packet_error_count_{0};
   robot::Esp1StatusReport latest_status_{};
@@ -737,11 +790,14 @@ struct RuntimeContext {
   robot::EventLog events{};
   robot::FourWheelCommand requested_command{};
   robot::FourWheelCommand last_commanded_wheels{};
+  robot::MotorCommand requested_funnel_command{};
   robot::LineFollowerUpdate last_update{};
   robot::LineObservation last_line_observation{};
   robot::SolarPanelAutonomyConfig solar_config{kSolarPanelAutonomyConfig};
   SolarIrThresholds solar_thresholds{};
   SolarLineFollowSpeedConfig solar_speed_config{};
+  robot::SolarPanelContactConfig solar_contact_config{
+      kSolarPanelContactConfig};
   robot::SolarBeaconDetectorState solar_detector{};
   robot::SolarBeaconDetectorUpdate last_solar_detector_update{};
   robot::SolarPanelAutonomyState autonomous_state{
@@ -769,6 +825,7 @@ struct RuntimeBindings {
   DualPwmMotorOutput* front_right{nullptr};
   RearCommandLink* rear_link{nullptr};
   ClawServoBank* claws{nullptr};
+  robot::esp2::StepperAxis* stepper{nullptr};
   Preferences* preferences{nullptr};
 };
 
@@ -816,6 +873,26 @@ robot::SolarPanelAutonomyConfig activeSolarPanelConfig(
     config.release_threshold = context.solar_thresholds.release_1khz;
   }
   return config;
+}
+
+bool solarPanelLimitSwitchHit(const bool raw_high) {
+  return raw_high == SOLAR_LIMIT_SWITCH_HIT_WHEN_HIGH;
+}
+
+bool solarPanelLimitSwitchesAllHit(
+    const robot::Esp1StatusReport& report) {
+  return report.solar_panel_limit_switches_configured &&
+         solarPanelLimitSwitchHit(report.solar_limit_back_right_high) &&
+         solarPanelLimitSwitchHit(report.solar_limit_front_right_high);
+}
+
+bool solarPanelLimitSwitchesReady(
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  return rear_link.remoteStatusFresh(now_ms,
+                                     remoteStatusTimeoutMs(context.config)) &&
+         rear_link.latestStatus().solar_panel_limit_switches_configured;
 }
 
 bool solarSlowModeActive(const RuntimeContext& context,
@@ -909,6 +986,33 @@ robot::MotorCommand makeTimedMotorCommand(
   return command;
 }
 
+robot::FourWheelCommand makeSolarStrafeRightCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
+                 activeMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(1.0F, 0.0F, 0.0F, duty, now_ms,
+                                   context.config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeSolarStrafeLeftCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
+                 activeMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(-1.0F, 0.0F, 0.0F, duty, now_ms,
+                                   context.config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeSolarForwardCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
+                 activeMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(0.0F, 1.0F, 0.0F, duty, now_ms,
+                                   context.config.remoteCommandTimeoutMs);
+}
+
 void sendStoppedRearCommand(RearCommandLink& rear_link,
                             const robot::LineFollowerConfig& config,
                             const robot::Milliseconds now_ms) {
@@ -917,6 +1021,25 @@ void sendStoppedRearCommand(RearCommandLink& rear_link,
   command.sender_timestamp_ms = now_ms;
   command.timeout_ms = config.remoteCommandTimeoutMs;
   rear_link.send(command);
+}
+
+bool sendFunnelMotorCommand(RearCommandLink& rear_link,
+                            const robot::MotorCommand& motor,
+                            const robot::LineFollowerConfig& config,
+                            const robot::Milliseconds now_ms) {
+  robot::FunnelCommand command{};
+  command.enabled = motor.enabled;
+  command.command_milli = motor.duty_command_milli;
+  command.sender_timestamp_ms = now_ms;
+  command.timeout_ms = config.remoteCommandTimeoutMs;
+  return rear_link.send(command);
+}
+
+bool sendStoppedFunnelCommand(RearCommandLink& rear_link,
+                              const robot::LineFollowerConfig& config,
+                              const robot::Milliseconds now_ms) {
+  return sendFunnelMotorCommand(rear_link, robot::disabledMotorCommand(), config,
+                                now_ms);
 }
 
 void disableMotionActuators(RuntimeContext& context,
@@ -939,6 +1062,8 @@ void disableActuators(RuntimeContext& context, robot::IMotorOutput& front_left,
                       RearCommandLink& rear_link,
                       const robot::Milliseconds now_ms) {
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  context.requested_funnel_command = robot::disabledMotorCommand();
+  sendStoppedFunnelCommand(rear_link, context.config, now_ms);
   if (g_runtime.claws != nullptr) {
     g_runtime.claws->disable();
   }
@@ -951,6 +1076,7 @@ void emergencyStop(RuntimeContext& context, robot::IMotorOutput& front_left,
                    const robot::EventSource source) {
   disableActuators(context, front_left, front_right, rear_link, now_ms);
   context.modes.emergencyStop(now_ms);
+  if (g_runtime.stepper != nullptr) g_runtime.stepper->stop();
   resetSolarPanelAutonomy(context, now_ms);
   setFault(context, robot::FaultCode::None, "");
   logEvent(context, now_ms, robot::EventSeverity::Warn, source,
@@ -991,7 +1117,19 @@ bool startRequirementsMet(const DigitalFrontLineSensorReader& sensors,
          context.config.maxDuty > 0.0F && hardwareDutyCap() > 0.0F;
 }
 
-void sendRearWheelCommand(RearCommandLink& rear_link,
+bool solarPanelStartRequirementsMet(
+    const DigitalFrontLineSensorReader& sensors,
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  return startRequirementsMet(sensors, front_left, front_right, rear_link,
+                              now_ms, context) &&
+         solarPanelLimitSwitchesReady(rear_link, now_ms, context);
+}
+
+bool sendRearWheelCommand(RearCommandLink& rear_link,
                           const robot::FourWheelCommand& wheels,
                           const robot::LineFollowerConfig& config,
                           const robot::Milliseconds now_ms) {
@@ -1001,10 +1139,11 @@ void sendRearWheelCommand(RearCommandLink& rear_link,
   rear.back_right_command_milli = wheels.back_right.duty_command_milli;
   rear.sender_timestamp_ms = now_ms;
   rear.timeout_ms = config.remoteCommandTimeoutMs;
-  rear_link.send(rear);
+  return rear_link.send(rear);
 }
 
-void applyWheelCommand(RuntimeContext& context, robot::IMotorOutput& front_left,
+bool applyWheelCommand(RuntimeContext& context,
+                       robot::IMotorOutput& front_left,
                        robot::IMotorOutput& front_right,
                        RearCommandLink& rear_link,
                        const robot::FourWheelCommand& wheels,
@@ -1012,7 +1151,7 @@ void applyWheelCommand(RuntimeContext& context, robot::IMotorOutput& front_left,
   context.last_commanded_wheels = wheels;
   front_left.apply(wheels.front_left);
   front_right.apply(wheels.front_right);
-  sendRearWheelCommand(rear_link, wheels, context.config, now_ms);
+  return sendRearWheelCommand(rear_link, wheels, context.config, now_ms);
 }
 
 void printTelemetry(RuntimeContext& context,
@@ -1046,6 +1185,20 @@ void enterSolarPanelAligned(RuntimeContext& context,
   clearFault(context);
   logEvent(context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::System, "solar beacon aligned");
+}
+
+void enterSolarPanelContacted(RuntimeContext& context,
+                              robot::IMotorOutput& front_left,
+                              robot::IMotorOutput& front_right,
+                              RearCommandLink& rear_link,
+                              const robot::Milliseconds now_ms) {
+  disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  enterSolarPanelAutonomyState(
+      context, robot::SolarPanelAutonomyState::SolarPanelContacted, now_ms);
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::System,
+           "solar panel limit switches contacted");
 }
 
 void enterSolarPanelSearchFault(
@@ -1082,13 +1235,13 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       context.solar_start_requested = false;
       robot::resetSolarBeaconDetectorState(context.solar_detector);
       context.last_solar_detector_update = {};
-      if (!startRequirementsMet(sensors, front_left, front_right, rear_link,
-                                now_ms, context)) {
+      if (!solarPanelStartRequirementsMet(sensors, front_left, front_right,
+                                          rear_link, now_ms, context)) {
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::HardwareNotReady,
             robot::FaultCode::HardwareNotConfigured,
-            "solar start rejected: hardware requirements incomplete",
+            "solar start rejected: hardware or limit switches incomplete",
             robot::EventSource::System);
         return;
       }
@@ -1127,6 +1280,16 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       }
 
       const robot::Esp1StatusReport& esp1 = rear_link.latestStatus();
+      if (esp1.fault_active &&
+          esp1.fault_code == robot::FaultCode::CommunicationStale) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar line follow stopped: ESP1 reported stale commands",
+            robot::EventSource::Uart);
+        return;
+      }
       const bool detection_permitted =
           time_in_state_ms >= context.solar_config.ignore_after_start_ms;
       const robot::SolarPanelAutonomyConfig active_solar_config =
@@ -1157,8 +1320,16 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       context.last_update = robot::updateLineFollower(
           context.follower_state, left_black, right_black, active_line_config,
           now_ms);
-      applyWheelCommand(context, front_left, front_right, rear_link,
-                        context.last_update.wheel_command, now_ms);
+      if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                             context.last_update.wheel_command, now_ms)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar line follow stopped: rear command send failed",
+            robot::EventSource::Uart);
+        return;
+      }
       context.last_command_ms = now_ms;
       if (!context.follower_state.enabled &&
           !context.last_update.observation.safe_to_drive) {
@@ -1175,6 +1346,167 @@ void runSolarPanelAutonomy(RuntimeContext& context,
     }
 
     case robot::SolarPanelAutonomyState::SolarBeaconAligned:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      if (!solarPanelLimitSwitchesReady(rear_link, now_ms, context)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::HardwareNotReady,
+            robot::FaultCode::HardwareNotConfigured,
+            "solar contact rejected: limit switch status unavailable",
+            robot::EventSource::System);
+        return;
+      }
+      if (solarPanelLimitSwitchesAllHit(rear_link.latestStatus())) {
+        enterSolarPanelContacted(context, front_left, front_right, rear_link,
+                                 now_ms);
+        return;
+      }
+      if (time_in_state_ms <
+          context.solar_contact_config.strafe_start_delay_ms) {
+        printTelemetry(context, sensors, rear_link, now_ms);
+        return;
+      }
+      enterSolarPanelAutonomyState(
+          context,
+          robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, now_ms);
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::System,
+               "solar panel right strafe started");
+      return;
+
+    case robot::SolarPanelAutonomyState::StrafeRightToSolarPanel:
+    case robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry:
+    case robot::SolarPanelAutonomyState::MoveForwardForSolarRetry:
+    case robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel: {
+      if (!rear_link.remoteStatusFresh(now_ms,
+                                       remoteStatusTimeoutMs(context.config))) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar contact stopped: rear link unhealthy",
+            robot::EventSource::Uart);
+        return;
+      }
+      const robot::Esp1StatusReport& esp1 = rear_link.latestStatus();
+      if (esp1.fault_active &&
+          esp1.fault_code == robot::FaultCode::CommunicationStale) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar contact stopped: ESP1 reported stale commands",
+            robot::EventSource::Uart);
+        return;
+      }
+      if (!esp1.solar_panel_limit_switches_configured) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::HardwareNotReady,
+            robot::FaultCode::HardwareNotConfigured,
+            "solar contact stopped: limit switches not configured",
+            robot::EventSource::System);
+        return;
+      }
+
+      const bool back_hit =
+          solarPanelLimitSwitchHit(esp1.solar_limit_back_right_high);
+      const bool front_hit =
+          solarPanelLimitSwitchHit(esp1.solar_limit_front_right_high);
+      const robot::SolarPanelContactSequenceUpdate sequence_update =
+          robot::updateSolarPanelContactSequence(
+              context.autonomous_state, front_hit, back_hit,
+              time_in_state_ms, context.solar_contact_config);
+      if (sequence_update.next_state ==
+          robot::SolarPanelAutonomyState::SolarPanelContacted) {
+        enterSolarPanelContacted(context, front_left, front_right, rear_link,
+                                 now_ms);
+        return;
+      }
+      if (sequence_update.next_state ==
+          robot::SolarPanelAutonomyState::SolarSearchFault) {
+        const char* timeout_message =
+            context.autonomous_state ==
+                    robot::SolarPanelAutonomyState::
+                        RetryStrafeRightToSolarPanel
+                ? "solar contact retry timeout before both limit switches hit"
+                : "solar contact timeout before both limit switches hit";
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::LimitSwitchTimeout,
+            robot::FaultCode::SearchTimeout, timeout_message,
+            robot::EventSource::System);
+        return;
+      }
+      if (sequence_update.transitioned) {
+        disableMotionActuators(context, front_left, front_right, rear_link,
+                               now_ms);
+        enterSolarPanelAutonomyState(context, sequence_update.next_state,
+                                     now_ms);
+        const char* message = "solar contact adjustment state changed";
+        if (sequence_update.next_state ==
+            robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry) {
+          message = "solar contact front-only: left adjustment started";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::
+                       MoveForwardForSolarRetry) {
+          message = "solar contact forward adjustment started";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::
+                       RetryStrafeRightToSolarPanel) {
+          message = "solar panel right strafe retry started";
+        }
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::System, message);
+        const bool zero_duration_adjustment =
+            (context.autonomous_state ==
+                 robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry &&
+             context.solar_contact_config.retry_strafe_left_duration_ms ==
+                 0U) ||
+            (context.autonomous_state ==
+                 robot::SolarPanelAutonomyState::MoveForwardForSolarRetry &&
+             context.solar_contact_config.retry_forward_duration_ms == 0U);
+        if (zero_duration_adjustment) {
+          printTelemetry(context, sensors, rear_link, now_ms);
+          return;
+        }
+      }
+
+      robot::FourWheelCommand wheels{};
+      switch (context.autonomous_state) {
+        case robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry:
+          wheels = makeSolarStrafeLeftCommand(context, now_ms);
+          break;
+        case robot::SolarPanelAutonomyState::MoveForwardForSolarRetry:
+          wheels = makeSolarForwardCommand(context, now_ms);
+          break;
+        case robot::SolarPanelAutonomyState::StrafeRightToSolarPanel:
+        case robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel:
+          wheels = makeSolarStrafeRightCommand(context, now_ms);
+          break;
+        default:
+          wheels = robot::disabledFourWheelCommand();
+          break;
+      }
+      if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                             wheels, now_ms)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar contact stopped: rear command send failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      context.last_command_ms = now_ms;
+      context.command_deadman_armed = true;
+      context.mode_expires_at_ms = 0U;
+      printTelemetry(context, sensors, rear_link, now_ms);
+      return;
+    }
+
+    case robot::SolarPanelAutonomyState::SolarPanelContacted:
     case robot::SolarPanelAutonomyState::SolarSearchFault:
       disableMotionActuators(context, front_left, front_right, rear_link,
                              now_ms);
@@ -1185,37 +1517,13 @@ void runSolarPanelAutonomy(RuntimeContext& context,
 robot::FourWheelCommand makeManualDriveCommand(
     const RuntimeContext& context, const float vx, const float vy,
     const float wz, const float duty, const robot::Milliseconds now_ms) {
-  float fl = vy + vx + wz;
-  float fr = vy - vx - wz;
-  float bl = vy - vx + wz;
-  float br = vy + vx - wz;
-  const float peak = std::fmax(
-      std::fmax(std::fabs(fl), std::fabs(fr)),
-      std::fmax(std::fabs(bl), std::fabs(br)));
-  if (peak > 1.0F) {
-    fl /= peak;
-    fr /= peak;
-    bl /= peak;
-    br /= peak;
-  }
-
-  const robot::Milliseconds expires_at_ms = now_ms + kCommandTimeoutMs;
-  robot::FourWheelCommand command{};
-  command.front_left = makeTimedMotorCommand(fl * duty, now_ms,
-                                             kCommandTimeoutMs);
-  command.front_right = makeTimedMotorCommand(fr * duty, now_ms,
-                                              kCommandTimeoutMs);
-  if (context.modes.currentMode() ==
+  robot::FourWheelCommand command =
+      robot::mixOpenLoopMecanum(vx, vy, wz, duty, now_ms, kCommandTimeoutMs);
+  if (context.modes.currentMode() !=
       robot::RobotTestMode::DistributedDriveTest) {
-    command.back_left = makeTimedMotorCommand(bl * duty, now_ms,
-                                              kCommandTimeoutMs);
-    command.back_right = makeTimedMotorCommand(br * duty, now_ms,
-                                               kCommandTimeoutMs);
+    command.back_left = robot::disabledMotorCommand();
+    command.back_right = robot::disabledMotorCommand();
   }
-  command.front_left.expires_at_ms = expires_at_ms;
-  command.front_right.expires_at_ms = expires_at_ms;
-  command.back_left.expires_at_ms = expires_at_ms;
-  command.back_right.expires_at_ms = expires_at_ms;
   return command;
 }
 
@@ -1353,9 +1661,24 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.last_solar_detector_update.confirmation_active;
   snapshot.solar_beacon_confirmed =
       context.last_solar_detector_update.beacon_detected;
+  snapshot.solar_contact_timeout_ms =
+      context.solar_contact_config.timeout_ms;
+  snapshot.solar_contact_strafe_duty =
+      context.solar_contact_config.strafe_duty;
+  snapshot.solar_strafe_start_delay_ms =
+      context.solar_contact_config.strafe_start_delay_ms;
+  snapshot.solar_retry_strafe_left_duration_ms =
+      context.solar_contact_config.retry_strafe_left_duration_ms;
+  snapshot.solar_retry_forward_duration_ms =
+      context.solar_contact_config.retry_forward_duration_ms;
+  snapshot.solar_retry_strafe_timeout_ms =
+      context.solar_contact_config.retry_strafe_timeout_ms;
 
   fillMotorTelemetry(snapshot.front_left, front_left);
   fillMotorTelemetry(snapshot.front_right, front_right);
+  snapshot.funnel.desired_command_milli =
+      context.requested_funnel_command.duty_command_milli;
+  snapshot.funnel.enabled = context.requested_funnel_command.enabled;
   claws.fillTelemetry(snapshot.claws);
   snapshot.servo_claw_1_position =
       snapshot.claws.claw_1.commanded_angle_deg;
@@ -1394,8 +1717,41 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
         esp1.back_left_applied_command_milli;
     snapshot.esp1.back_right_applied_command_milli =
         esp1.back_right_applied_command_milli;
+    snapshot.esp1.funnel_applied_command_milli =
+        esp1.funnel_applied_command_milli;
     snapshot.esp1.back_left_inverted = esp1.back_left_inverted;
     snapshot.esp1.back_right_inverted = esp1.back_right_inverted;
+    snapshot.esp1.funnel_configured = esp1.funnel_configured;
+    snapshot.esp1.solar_panel_limit_switches_configured =
+        esp1.solar_panel_limit_switches_configured;
+    snapshot.esp1.solar_limit_back_right_high =
+        esp1.solar_limit_back_right_high;
+    snapshot.esp1.solar_limit_front_right_high =
+        esp1.solar_limit_front_right_high;
+    snapshot.esp1.side_line_sensor_configured =
+        esp1.side_line_sensor_configured;
+    snapshot.esp1.side_line_sensor_high =
+        esp1.side_line_sensor_high;
+    snapshot.lss_configured = esp1.side_line_sensor_configured;
+    if (snapshot.rear.esp1_link_healthy && snapshot.lss_configured) {
+      snapshot.lss_raw_level = esp1.side_line_sensor_high ? 1 : 0;
+      snapshot.lss_black = esp1.side_line_sensor_high;
+    }
+    snapshot.solar_panel_limit_switches_configured =
+        esp1.solar_panel_limit_switches_configured;
+    snapshot.solar_limit_back_right_high =
+        esp1.solar_limit_back_right_high;
+    snapshot.solar_limit_front_right_high =
+        esp1.solar_limit_front_right_high;
+    snapshot.solar_limit_back_right_hit =
+        solarPanelLimitSwitchHit(esp1.solar_limit_back_right_high);
+    snapshot.solar_limit_front_right_hit =
+        solarPanelLimitSwitchHit(esp1.solar_limit_front_right_high);
+    snapshot.solar_limit_all_hit = solarPanelLimitSwitchesAllHit(esp1);
+    snapshot.funnel.applied_command_milli =
+        esp1.funnel_applied_command_milli;
+    snapshot.funnel.enabled = esp1.funnel_applied_command_milli != 0;
+    snapshot.funnel.configured = esp1.funnel_configured;
     snapshot.ir_adc_average = esp1.ir_adc_average;
     snapshot.ir_adc_min = esp1.ir_adc_min;
     snapshot.ir_adc_max = esp1.ir_adc_max;
@@ -1518,6 +1874,7 @@ void handleClaw();
 void handleClawsAll();
 void handleClawsConfig();
 void handleClawsSave();
+void handleFunnel();
 void handleConfig();
 void handleConfigSave();
 void handleEvents();
@@ -1600,11 +1957,33 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Start duty <input id="solarStartDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Slow after ms <input id="solarSlowAfterMs" type="number" min="0" step="500"></label>
       <label>Slow duty <input id="solarSlowDuty" type="number" min="0" max="1" step="0.01"></label>
+      <label>Contact timeout ms <input id="solarContactTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Strafe delay ms <input id="solarStrafeDelayMs" type="number" min="0" step="50"></label>
+      <label>Strafe duty <input id="solarStrafeDuty" type="number" min="0" max="1" step="0.01"></label>
+      <label>Retry left strafe ms <input id="solarRetryLeftMs" type="number" min="0" step="50"></label>
+      <label>Retry forward ms <input id="solarRetryForwardMs" type="number" min="0" step="50"></label>
+      <label>Retry right timeout ms <input id="solarRetryStrafeTimeoutMs" type="number" min="1" step="500"></label>
     </div>
     <div class="row">
       <button class="run" onclick="autoSolarStart()">Start</button>
       <button onclick="autoSolarApply()">Apply</button>
       <button onclick="autoSolarSave()">Save</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Solar Limits</h2>
+    <div class="kv">
+      <span>Configured</span><span id="solarLimitsConfigured" class="mono"></span>
+      <span>Back right side</span><span id="solarLimitBackRight" class="mono"></span>
+      <span>Front right side</span><span id="solarLimitFrontRight" class="mono"></span>
+      <span>Both hit</span><span id="solarLimitsAll" class="mono"></span>
+      <span>Timeout</span><span id="solarLimitTimeout" class="mono"></span>
+      <span>Strafe delay</span><span id="solarLimitDelay" class="mono"></span>
+      <span>Strafe duty</span><span id="solarLimitDuty" class="mono"></span>
+      <span>Retry left</span><span id="solarRetryLeft" class="mono"></span>
+      <span>Retry forward</span><span id="solarRetryForward" class="mono"></span>
+      <span>Retry right timeout</span><span id="solarRetryTimeout" class="mono"></span>
     </div>
   </section>
 
@@ -1625,6 +2004,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Enabled</span><span id="lfEnabled" class="mono"></span>
       <span>LSFL</span><span id="lsfl" class="mono"></span>
       <span>LSFR</span><span id="lsfr" class="mono"></span>
+      <span>LSS (side)</span><span id="lss" class="mono"></span>
       <span>Error</span><span id="lfError" class="mono"></span>
       <span>PID</span><span id="lfPid" class="mono"></span>
     </div>
@@ -1675,8 +2055,40 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     <pre id="motors"></pre>
   </section>
 
-  <section>
-    <h2>Claws</h2>
+	  <section>
+	    <h2>Vertical Stepper (DRV8425)</h2>
+    <div class="kv">
+      <span>Position</span><span id="stepperPosition" class="mono"></span>
+      <span>Motion</span><span id="stepperMotion" class="mono"></span>
+      <span>Speed</span><span id="stepperSpeedNow" class="mono"></span>
+      <span>Driver</span><span id="stepperSleep" class="mono"></span>
+      <span>Lower limit</span><span id="stepperLimit" class="mono"></span>
+      <span>Homed</span><span id="stepperHomed" class="mono"></span>
+    </div>
+    <div class="two">
+      <label>Speed steps/s <input id="stepperSpeed" type="number" min="1" value="800"></label>
+      <label>Acceleration steps/s² <input id="stepperAcceleration" type="number" min="1" value="1200"></label>
+      <label>Maximum position <input id="stepperMaximum" type="number" min="1" placeholder="REQUIRED"></label>
+      <label>Jog microsteps <input id="stepperJog" type="number" min="1" value="100"></label>
+      <label>Absolute target <input id="stepperTarget" type="number" min="0" value="0"></label>
+    </div>
+    <div class="row">
+      <button class="run" onpointerdown="stepperHold('up')" onpointerup="stepperRelease()" onpointerleave="stepperRelease()" onpointercancel="stepperRelease()">Hold Up</button>
+      <button class="run" onpointerdown="stepperHold('down')" onpointerup="stepperRelease()" onpointerleave="stepperRelease()" onpointercancel="stepperRelease()">Hold Down</button>
+      <button class="stop" onclick="stepperCommand('stop')">Stop</button>
+      <button onclick="stepperCommand('wake')">Wake</button>
+      <button onclick="stepperCommand('sleep')">Sleep</button>
+      <button class="warn" onclick="stepperCommand('home')">Home</button>
+      <button class="warn" title="Debug only: changes software position without moving" onclick="stepperCommand('zero')">Set Zero (DEBUG)</button>
+    </div>
+    <div class="row">
+      <button onclick="stepperJog(1)">Jog Up</button><button onclick="stepperJog(-1)">Jog Down</button>
+      <button onclick="stepperMove()">Move Absolute</button><button onclick="stepperConfig()">Apply Config</button>
+    </div>
+  </section>
+
+	  <section>
+	    <h2>Claws</h2>
     <div class="kv">
       <span>Hardware</span><span id="clawHardware" class="mono"></span>
       <span>Commanded</span><span id="clawCommanded" class="mono"></span>
@@ -1700,10 +2112,27 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Claw 2</span><button onclick="claw(2,'close')">Close</button><button class="run" onclick="claw(2,'open')">Open</button>
       <span>Claw 3</span><button onclick="claw(3,'close')">Close</button><button class="run" onclick="claw(3,'open')">Open</button>
     </div>
-    <pre id="claws"></pre>
-  </section>
+	    <pre id="claws"></pre>
+	  </section>
 
-  <section class="wide">
+	  <section>
+	    <h2>Funnel Motor</h2>
+	    <div class="kv">
+	      <span>Configured</span><span id="funnelConfigured" class="mono"></span>
+	      <span>Desired</span><span id="funnelDesired" class="mono"></span>
+	      <span>Applied</span><span id="funnelApplied" class="mono"></span>
+	    </div>
+	    <div class="row">
+	      Duty <input id="funnelSpeed" type="number" min="0" max="1" step="0.01" value="0.25">
+	    </div>
+	    <div class="row">
+	      <button class="run" onpointerdown="funnelHold(1)" onpointerup="funnelRelease()" onpointerleave="funnelRelease()" onpointercancel="funnelRelease()">Hold Forward</button>
+	      <button class="run" onpointerdown="funnelHold(-1)" onpointerup="funnelRelease()" onpointerleave="funnelRelease()" onpointercancel="funnelRelease()">Hold Reverse</button>
+	    </div>
+	    <pre id="funnel"></pre>
+	  </section>
+
+	  <section class="wide">
     <h2>Recent Events</h2>
     <pre id="events"></pre>
   </section>
@@ -1715,6 +2144,35 @@ let clawsLoaded = false;
 let solarLoaded = false;
 function qs(id){ return document.getElementById(id); }
 function api(path){ return fetch(path).then(r => r.json().catch(() => ({})).then(j => ({ok:r.ok, status:r.status, json:j}))); }
+function stepperCommand(command, extra=''){ return api(`/api/stepper/command?command=${command}${extra}`); }
+let stepperHeartbeat = null;
+function stepperHold(direction){
+  stepperRelease(false);
+  stepperCommand(direction);
+  stepperHeartbeat = setInterval(() => stepperCommand('hold'), 150);
+}
+function stepperRelease(sendStop=true){
+  if(stepperHeartbeat){ clearInterval(stepperHeartbeat); stepperHeartbeat=null; }
+  if(sendStop) stepperCommand('stop');
+}
+function stepperJog(sign){ const n=Math.abs(Number(qs('stepperJog').value)); return stepperCommand('jog',`&steps=${sign*n}`); }
+function stepperMove(){ return stepperCommand('move',`&steps=${qs('stepperTarget').value}`); }
+function stepperConfig(){
+  const p=new URLSearchParams({command:'config',speed:qs('stepperSpeed').value,acceleration:qs('stepperAcceleration').value});
+  if(qs('stepperMaximum').value) p.set('maximum',qs('stepperMaximum').value);
+  return api(`/api/stepper/command?${p.toString()}`);
+}
+function updateStepper(){ fetch('/api/stepper').then(r=>r.json()).then(s=>{
+  qs('stepperPosition').textContent=`${s.positionSteps} µsteps`;
+  qs('stepperMotion').textContent=s.motionState;
+  qs('stepperSpeedNow').textContent=`${s.speedStepsPerSecond} µsteps/s`;
+  qs('stepperSleep').textContent=s.sleeping?'asleep':'awake / holding';
+  qs('stepperLimit').textContent=s.lowerLimitActive?'PRESSED':'released';
+  qs('stepperLimit').className=s.lowerLimitActive?'mono bad':'mono good';
+  qs('stepperHomed').textContent=yn(s.homed);
+  qs('stepperHomed').className=s.homed?'mono good':'mono bad';
+  if(document.activeElement!==qs('stepperMaximum') && s.maximumPositionSteps>0) qs('stepperMaximum').value=s.maximumPositionSteps;
+}).catch(()=>{ qs('stepperMotion').textContent='disconnected'; }); }
 function stopAll(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; api('/api/stop'); }
 function drive(vx,vy,wz){
   const duty = Number(qs('driveDuty').value || 0);
@@ -1729,6 +2187,13 @@ function motorHold(sign){
 }
 function motorRelease(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; motorCommand(0); }
 function invert(){ api(`/api/invert?id=${qs('motorId').value}`); }
+function funnelCommand(speed){ api(`/api/funnel?speed=${speed}`); }
+function funnelHold(sign){
+  const speed = Math.abs(Number(qs('funnelSpeed').value || 0)) * sign;
+  const send = () => funnelCommand(speed);
+  send(); if (holdTimer) clearInterval(holdTimer); holdTimer=setInterval(send, 200);
+}
+function funnelRelease(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; funnelCommand(0); }
 function setLfValue(id, value){ const el = qs(id); if (el && document.activeElement !== el) el.value = value; }
 function loadLfControls(j){
   if (lfLoaded || !j.pid) return;
@@ -1781,6 +2246,12 @@ function loadSolarControls(j){
   setLfValue('solarStartDuty', a.start_base_duty);
   setLfValue('solarSlowAfterMs', a.slow_after_ms);
   setLfValue('solarSlowDuty', a.slow_base_duty);
+  setLfValue('solarContactTimeoutMs', a.contact_timeout_ms);
+  setLfValue('solarStrafeDelayMs', a.strafe_start_delay_ms);
+  setLfValue('solarStrafeDuty', a.strafe_duty);
+  setLfValue('solarRetryLeftMs', a.retry_strafe_left_duration_ms);
+  setLfValue('solarRetryForwardMs', a.retry_forward_duration_ms);
+  setLfValue('solarRetryStrafeTimeoutMs', a.retry_strafe_timeout_ms);
   solarLoaded = true;
 }
 function solarParams(){
@@ -1797,6 +2268,12 @@ function solarParams(){
   add('start-duty', 'solarStartDuty');
   add('slow-after-ms', 'solarSlowAfterMs');
   add('slow-duty', 'solarSlowDuty');
+  add('contact-timeout-ms', 'solarContactTimeoutMs');
+  add('strafe-delay-ms', 'solarStrafeDelayMs');
+  add('strafe-duty', 'solarStrafeDuty');
+  add('retry-left-ms', 'solarRetryLeftMs');
+  add('retry-forward-ms', 'solarRetryForwardMs');
+  add('retry-strafe-timeout-ms', 'solarRetryStrafeTimeoutMs');
   return p;
 }
 function autoSolarApply(){ return api(`/api/autonomous/solar/config?${solarParams().toString()}`); }
@@ -1836,6 +2313,7 @@ function clawSummary(c){
   return `start=${start} open=${c.openAngleDeg} target=${target}`;
 }
 function yn(v){ return v ? 'yes' : 'no'; }
+function level(v){ return v ? 'HIGH' : 'LOW'; }
 function update(){
   fetch('/api/telemetry').then(r => r.json()).then(j => {
     qs('mode').textContent = j.current_mode;
@@ -1853,21 +2331,41 @@ function update(){
     qs('autoThresholds').textContent = `${a.ir_detection_threshold ?? 0} / ${a.ir_release_threshold ?? 0}`;
     qs('autoConfirm').textContent = `${a.confirmation_progress_ms ?? 0} / ${a.confirmation_time_ms ?? 0} ms detected=${yn(a.beacon_detected)}`;
     qs('autoSlow').textContent = `${yn(a.slow_mode_active)} start=${a.start_base_duty ?? 0} after=${a.slow_after_ms ?? 0} ms slow=${a.slow_base_duty ?? 0}`;
+    const limits = j.solarLimitSwitches || a.limit_switches || {};
+    qs('solarLimitsConfigured').textContent = yn(limits.configured);
+    qs('solarLimitsConfigured').className = limits.configured ? 'mono good' : 'mono bad';
+    qs('solarLimitBackRight').textContent = `${level(limits.backRightHigh ?? limits.back_right_high)} hit=${yn(limits.backRightHit ?? limits.back_right_hit)}`;
+    qs('solarLimitFrontRight').textContent = `${level(limits.frontRightHigh ?? limits.front_right_high)} hit=${yn(limits.frontRightHit ?? limits.front_right_hit)}`;
+    qs('solarLimitsAll').textContent = yn(limits.allHit ?? limits.all_hit);
+    qs('solarLimitsAll').className = (limits.allHit ?? limits.all_hit) ? 'mono good' : 'mono';
+    qs('solarLimitTimeout').textContent = `${a.contact_timeout_ms ?? 0} ms`;
+    qs('solarLimitDelay').textContent = `${a.strafe_start_delay_ms ?? 0} ms`;
+    qs('solarLimitDuty').textContent = a.strafe_duty ?? 0;
+    qs('solarRetryLeft').textContent = `${a.retry_strafe_left_duration_ms ?? 0} ms`;
+    qs('solarRetryForward').textContent = `${a.retry_forward_duration_ms ?? 0} ms`;
+    qs('solarRetryTimeout').textContent = `${a.retry_strafe_timeout_ms ?? 0} ms`;
     loadSolarControls(j);
     loadLfControls(j);
     loadClawControls(j);
     qs('lfEnabled').textContent = yn(j.line.line_follower_enabled);
     qs('lsfl').textContent = `${j.line.lsfl_level} black=${yn(j.line.lsfl_black)}`;
     qs('lsfr').textContent = `${j.line.lsfr_level} black=${yn(j.line.lsfr_black)}`;
+    qs('lss').textContent = `${j.line.lss_level} black=${yn(j.line.lss_black)} configured=${yn(j.line.lss_configured)}`;
     qs('lfError').textContent = `${j.line.line_error}, side=${j.line.last_known_line_side}, visible=${yn(j.line.line_visible)}, hist=${yn(j.line.has_history)}`;
     qs('lfPid').textContent = `P=${j.pid.p_term.toFixed(3)} I=${j.pid.i_term.toFixed(3)} D=${j.pid.d_term.toFixed(3)} C=${j.pid.correction.toFixed(3)}`;
     qs('irSelectedHz').textContent = j.selectedBeaconFrequencyHz ?? 0;
     qs('irAmp').textContent = j.ir_amplitude_pp ?? 0;
     qs('ir1k').textContent = j.ir_1khz_goertzel_amplitude ?? 0;
-    qs('ir10k').textContent = j.ir_10khz_goertzel_amplitude ?? 0;
-    qs('irSelectedAmp').textContent = j.ir_selected_frequency_amplitude ?? 0;
-    qs('motors').textContent = JSON.stringify({motors:j.motors, rear:j.rear}, null, 2);
-    const claws = j.claws || {};
+	    qs('ir10k').textContent = j.ir_10khz_goertzel_amplitude ?? 0;
+	    qs('irSelectedAmp').textContent = j.ir_selected_frequency_amplitude ?? 0;
+	    qs('motors').textContent = JSON.stringify({motors:j.motors, rear:j.rear}, null, 2);
+	    const funnel = (j.motors && j.motors.funnel) || {};
+	    qs('funnelConfigured').textContent = yn(funnel.configured);
+	    qs('funnelConfigured').className = funnel.configured ? 'mono good' : 'mono bad';
+	    qs('funnelDesired').textContent = funnel.desired_command_milli ?? 0;
+	    qs('funnelApplied').textContent = funnel.applied_command_milli ?? 0;
+	    qs('funnel').textContent = JSON.stringify({funnel:funnel, esp1:j.esp1}, null, 2);
+	    const claws = j.claws || {};
     const clawList = [claws.claw_1, claws.claw_2, claws.claw_3];
     qs('clawHardware').textContent = clawList.map(c => yn(c && c.hardwareConfigured)).join(' / ');
     qs('clawCommanded').textContent = clawList.map(clawSummary).join(' | ');
@@ -1875,7 +2373,7 @@ function update(){
   }).catch(() => { qs('fault').textContent = 'telemetry disconnected'; qs('fault').className = 'mono bad'; });
   fetch('/api/events').then(r => r.json()).then(j => { qs('events').textContent = JSON.stringify(j.events, null, 2); });
 }
-setInterval(update, 300); update();
+setInterval(update, 300); setInterval(updateStepper, 300); update(); updateStepper();
 </script>
 </body>
 </html>
@@ -2142,38 +2640,65 @@ void handleSensors() {
   const robot::TelemetrySnapshot snapshot = currentSnapshot();
   std::snprintf(g_json_buffer, sizeof(g_json_buffer),
                 "{\"lsfl_raw_level\":%d,\"lsfr_raw_level\":%d,"
+                "\"lss_raw_level\":%d,"
                 "\"lsfl_level\":\"%s\",\"lsfr_level\":\"%s\","
+                "\"lss_level\":\"%s\","
                 "\"lsfl_black\":%s,\"lsfr_black\":%s,"
+                "\"lss_black\":%s,\"lss_configured\":%s,"
                 "\"limit_switch_stepper_bottom\":%s,"
                 "\"limit_switch_stepper_middle\":%s,"
                 "\"limit_switch_stepper_top\":%s,"
                 "\"limit_switch_funnel_left\":%s,"
-                "\"limit_switch_funnel_right\":%s}",
+                "\"limit_switch_funnel_right\":%s,"
+                "\"solar_limit_switches_configured\":%s,"
+                "\"solar_limit_back_right_high\":%s,"
+                "\"solar_limit_front_right_high\":%s,"
+                "\"solar_limit_back_right_hit\":%s,"
+                "\"solar_limit_front_right_hit\":%s,"
+                "\"solar_limit_all_hit\":%s}",
                 snapshot.lsfl_raw_level, snapshot.lsfr_raw_level,
+                snapshot.lss_raw_level,
                 digitalLevelName(snapshot.lsfl_raw_level),
                 digitalLevelName(snapshot.lsfr_raw_level),
+                digitalLevelName(snapshot.lss_raw_level),
                 snapshot.lsfl_black ? "true" : "false",
                 snapshot.lsfr_black ? "true" : "false",
+                snapshot.lss_black ? "true" : "false",
+                snapshot.lss_configured ? "true" : "false",
                 snapshot.limit_switch_stepper_bottom ? "true" : "false",
                 snapshot.limit_switch_stepper_middle ? "true" : "false",
                 snapshot.limit_switch_stepper_top ? "true" : "false",
                 snapshot.limit_switch_funnel_left ? "true" : "false",
-                snapshot.limit_switch_funnel_right ? "true" : "false");
+                snapshot.limit_switch_funnel_right ? "true" : "false",
+                snapshot.solar_panel_limit_switches_configured ? "true"
+                                                               : "false",
+                snapshot.solar_limit_back_right_high ? "true" : "false",
+                snapshot.solar_limit_front_right_high ? "true" : "false",
+                snapshot.solar_limit_back_right_hit ? "true" : "false",
+                snapshot.solar_limit_front_right_hit ? "true" : "false",
+                snapshot.solar_limit_all_hit ? "true" : "false");
   g_server.send(200, "application/json", g_json_buffer);
 }
 
 void handleLine() {
   const robot::TelemetrySnapshot snapshot = currentSnapshot();
   std::snprintf(g_json_buffer, sizeof(g_json_buffer),
-                "{\"LSFL\":%d,\"LSFR\":%d,\"LSFLLevel\":\"%s\","
-                "\"LSFRLevel\":\"%s\",\"leftBlack\":%s,"
-                "\"rightBlack\":%s,\"error\":%d,\"lastKnownSide\":%d,"
+                "{\"LSFL\":%d,\"LSFR\":%d,\"LSS\":%d,"
+                "\"LSFLLevel\":\"%s\",\"LSFRLevel\":\"%s\","
+                "\"LSSLevel\":\"%s\",\"leftBlack\":%s,"
+                "\"rightBlack\":%s,\"sideBlack\":%s,"
+                "\"sideConfigured\":%s,\"error\":%d,"
+                "\"lastKnownSide\":%d,"
                 "\"lineVisible\":%s,\"hasHistory\":%s}",
                 snapshot.lsfl_raw_level, snapshot.lsfr_raw_level,
+                snapshot.lss_raw_level,
                 digitalLevelName(snapshot.lsfl_raw_level),
                 digitalLevelName(snapshot.lsfr_raw_level),
+                digitalLevelName(snapshot.lss_raw_level),
                 snapshot.lsfl_black ? "true" : "false",
                 snapshot.lsfr_black ? "true" : "false",
+                snapshot.lss_black ? "true" : "false",
+                snapshot.lss_configured ? "true" : "false",
                 static_cast<int>(snapshot.line_error),
                 static_cast<int>(snapshot.last_known_line_side),
                 snapshot.line_visible ? "true" : "false",
@@ -2205,6 +2730,8 @@ void handleAutonomousSolarConfig() {
   robot::SolarPanelAutonomyConfig next_config = context.solar_config;
   SolarIrThresholds next_thresholds = context.solar_thresholds;
   SolarLineFollowSpeedConfig next_speed = context.solar_speed_config;
+  robot::SolarPanelContactConfig next_contact =
+      context.solar_contact_config;
   robot::Milliseconds milliseconds_value = 0U;
   float float_value = 0.0F;
 
@@ -2304,6 +2831,54 @@ void handleAutonomousSolarConfig() {
     }
     next_speed.slow_base_duty = float_value;
   }
+  if (g_server.hasArg("contact-timeout-ms")) {
+    if (!argUnsigned("contact-timeout-ms", milliseconds_value,
+                     next_contact.timeout_ms, true)) {
+      sendErrorJson(400, "malformed contact-timeout-ms");
+      return;
+    }
+    next_contact.timeout_ms = milliseconds_value;
+  }
+  if (g_server.hasArg("strafe-delay-ms")) {
+    if (!argUnsigned("strafe-delay-ms", milliseconds_value,
+                     next_contact.strafe_start_delay_ms, true)) {
+      sendErrorJson(400, "malformed strafe-delay-ms");
+      return;
+    }
+    next_contact.strafe_start_delay_ms = milliseconds_value;
+  }
+  if (g_server.hasArg("strafe-duty")) {
+    if (!argFloat("strafe-duty", float_value, next_contact.strafe_duty,
+                  true)) {
+      sendErrorJson(400, "malformed strafe-duty");
+      return;
+    }
+    next_contact.strafe_duty = float_value;
+  }
+  if (g_server.hasArg("retry-left-ms")) {
+    if (!argUnsigned("retry-left-ms", milliseconds_value,
+                     next_contact.retry_strafe_left_duration_ms, true)) {
+      sendErrorJson(400, "malformed retry-left-ms");
+      return;
+    }
+    next_contact.retry_strafe_left_duration_ms = milliseconds_value;
+  }
+  if (g_server.hasArg("retry-forward-ms")) {
+    if (!argUnsigned("retry-forward-ms", milliseconds_value,
+                     next_contact.retry_forward_duration_ms, true)) {
+      sendErrorJson(400, "malformed retry-forward-ms");
+      return;
+    }
+    next_contact.retry_forward_duration_ms = milliseconds_value;
+  }
+  if (g_server.hasArg("retry-strafe-timeout-ms")) {
+    if (!argUnsigned("retry-strafe-timeout-ms", milliseconds_value,
+                     next_contact.retry_strafe_timeout_ms, true)) {
+      sendErrorJson(400, "malformed retry-strafe-timeout-ms");
+      return;
+    }
+    next_contact.retry_strafe_timeout_ms = milliseconds_value;
+  }
 
   robot::SolarPanelAutonomyConfig validate_1khz = next_config;
   validate_1khz.detection_threshold = next_thresholds.detect_1khz;
@@ -2314,15 +2889,17 @@ void handleAutonomousSolarConfig() {
   if (!solarThresholdsValid(next_thresholds) ||
       !robot::solarPanelAutonomyConfigValid(validate_1khz) ||
       !robot::solarPanelAutonomyConfigValid(validate_10khz) ||
-      !solarSpeedConfigValid(next_speed)) {
+      !solarSpeedConfigValid(next_speed) ||
+      !robot::solarPanelContactConfigValid(next_contact)) {
     sendErrorJson(409,
-                  "solar config requires release <= detect, alpha [0,1), timeout > 0, slow duty [0,1]");
+                  "solar config requires release <= detect, alpha [0,1), contact timeouts > 0, duties [0,1]");
     return;
   }
 
   context.solar_config = next_config;
   context.solar_thresholds = next_thresholds;
   context.solar_speed_config = next_speed;
+  context.solar_contact_config = next_contact;
   robot::resetSolarBeaconDetectorState(context.solar_detector);
   context.last_solar_detector_update = {};
   clearFault(context);
@@ -2531,6 +3108,78 @@ void handleClawsAll() {
   logEvent(context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Web, "all claw command accepted");
   sendOkJson("all claw command accepted");
+}
+
+void handleFunnel() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+
+  float speed = 0.0F;
+  if (!argFloat("speed", speed, 0.0F, true)) {
+    sendErrorJson(400, "malformed funnel command");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  enterMechanismTestIfNeeded(context, now_ms);
+
+  robot::CommandValidationResult validation =
+      robot::validateModeAllowsMechanism(context.modes.currentMode());
+  if (validation.accepted) {
+    validation = robot::validateNormalizedDuty(
+        speed, clampFloat(kSingleMotorDutyCap, 0.0F, hardwareDutyCap()));
+  }
+  if (validation.accepted) {
+    validation = robot::validateTimedDuration(
+        kCommandTimeoutMs, validationLimits(context).maximum_duration_ms);
+  }
+  if (!validation.accepted) {
+    setFault(context, robot::FaultCode::InvalidCommand, validation.reason);
+    logEvent(context, now_ms, robot::EventSeverity::Warn,
+             robot::EventSource::Web, validation.reason);
+    sendErrorJson(409, validation.reason);
+    return;
+  }
+
+  const bool moving = std::fabs(speed) > 0.0001F;
+  if (!g_runtime.rear_link->configured()) {
+    setFault(context, robot::FaultCode::CommunicationStale,
+             "funnel UART to ESP1 is not configured");
+    sendErrorJson(409, "funnel UART to ESP1 is not configured");
+    return;
+  }
+  if (moving && g_runtime.rear_link->remoteStatusFresh(
+                    now_ms, remoteStatusTimeoutMs(context.config)) &&
+      !g_runtime.rear_link->latestStatus().funnel_configured) {
+    setFault(context, robot::FaultCode::HardwareNotConfigured,
+             "funnel motor PWM hardware is not configured on ESP1");
+    sendErrorJson(409, "funnel motor PWM hardware is not configured on ESP1");
+    return;
+  }
+
+  context.requested_funnel_command =
+      moving ? makeTimedMotorCommand(speed, now_ms, kCommandTimeoutMs)
+             : robot::disabledMotorCommand();
+  if (!sendFunnelMotorCommand(*g_runtime.rear_link,
+                              context.requested_funnel_command,
+                              context.config, now_ms)) {
+    setFault(context, robot::FaultCode::CommunicationStale,
+             "funnel command failed to send");
+    sendErrorJson(503, "funnel command failed to send");
+    return;
+  }
+
+  context.last_command_ms = now_ms;
+  clearFault(context);
+  if (moving) {
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::Web, "funnel hold command");
+  }
+  sendOkJson("funnel command accepted");
 }
 
 void handleClawsSave() {
@@ -2871,6 +3520,20 @@ void handleConfigSave() {
                                  context.solar_speed_config.slow_after_ms);
   g_runtime.preferences->putFloat("sslow",
                                   context.solar_speed_config.slow_base_duty);
+  g_runtime.preferences->putUInt("sctmo",
+                                 context.solar_contact_config.timeout_ms);
+  g_runtime.preferences->putUInt(
+      "sdelay",
+      context.solar_contact_config.strafe_start_delay_ms);
+  g_runtime.preferences->putFloat("sstrfd",
+                                  context.solar_contact_config.strafe_duty);
+  g_runtime.preferences->putUInt(
+      "srleft",
+      context.solar_contact_config.retry_strafe_left_duration_ms);
+  g_runtime.preferences->putUInt(
+      "srfwd", context.solar_contact_config.retry_forward_duration_ms);
+  g_runtime.preferences->putUInt(
+      "srtmo", context.solar_contact_config.retry_strafe_timeout_ms);
   sendOkJson("config saved");
 }
 
@@ -2885,6 +3548,55 @@ void handleEvents() {
     return;
   }
   g_server.send(200, "application/json", g_json_buffer);
+}
+
+void handleStepperStatus() {
+  if (!runtimeReady() || g_runtime.stepper == nullptr) { sendErrorJson(503, "runtime not ready"); return; }
+  const auto& axis = *g_runtime.stepper;
+  std::snprintf(g_json_buffer, sizeof(g_json_buffer),
+      "{\"positionSteps\":%lld,\"motionState\":\"%s\",\"speedStepsPerSecond\":%u,"
+      "\"configuredSpeedStepsPerSecond\":%u,\"accelerationStepsPerSecond2\":%u,"
+      "\"sleeping\":%s,\"lowerLimitActive\":%s,\"homed\":%s,\"busy\":%s,"
+      "\"maximumPositionSteps\":%lld,\"microstepsPerRevolution\":1600}",
+      static_cast<long long>(axis.positionSteps()), axis.motionStateName(),
+      axis.speedStepsPerSecond(), axis.configuredSpeedStepsPerSecond(),
+      axis.accelerationStepsPerSecond2(), axis.sleeping() ? "true" : "false",
+      axis.lowerLimitActive() ? "true" : "false", axis.isHomed() ? "true" : "false",
+      axis.isBusy() ? "true" : "false", static_cast<long long>(axis.maximumPositionSteps()));
+  g_server.send(200, "application/json", g_json_buffer);
+}
+
+bool stepperInt64Arg(const char* name, std::int64_t& value) {
+  if (!g_server.hasArg(name)) return false;
+  char* end = nullptr;
+  const String text = g_server.arg(name);
+  const long long parsed = strtoll(text.c_str(), &end, 10);
+  if (end == text.c_str() || *end != '\0') return false;
+  value = static_cast<std::int64_t>(parsed); return true;
+}
+
+void handleStepperCommand() {
+  if (!runtimeReady() || g_runtime.stepper == nullptr || !g_server.hasArg("command")) { sendErrorJson(400, "missing stepper command"); return; }
+  auto& axis = *g_runtime.stepper;
+  const String command = g_server.arg("command");
+  bool accepted = true;
+  if (command == "stop") axis.stop();
+  else if (command == "wake") accepted = axis.wake();
+  else if (command == "sleep") axis.sleep();
+  else if (command == "home") accepted = axis.home();
+  else if (command == "zero") axis.setZeroDebug();
+  else if (command == "up" || command == "down") accepted = axis.moveContinuous(command == "up" ? robot::esp2::StepperDirection::Up : robot::esp2::StepperDirection::Down);
+  else if (command == "hold") axis.refreshHoldCommand();
+  else if (command == "jog") { std::int64_t value; accepted = stepperInt64Arg("steps", value) && axis.jogSteps(value); }
+  else if (command == "move") { std::int64_t value; accepted = stepperInt64Arg("steps", value) && axis.moveToSteps(value); }
+  else if (command == "config") {
+    std::int64_t value;
+    if (stepperInt64Arg("speed", value)) accepted = value > 0 && value <= UINT32_MAX && axis.setSpeed(static_cast<std::uint32_t>(value));
+    if (accepted && stepperInt64Arg("acceleration", value)) accepted = value > 0 && value <= UINT32_MAX && axis.setAcceleration(static_cast<std::uint32_t>(value));
+    if (accepted && stepperInt64Arg("maximum", value)) accepted = axis.setMaximumPositionSteps(value);
+  } else accepted = false;
+  if (!accepted) { sendErrorJson(409, "stepper command rejected by limits or state"); return; }
+  sendOkJson(command == "zero" ? "debug software zero set" : "stepper command accepted");
 }
 
 void setupWebHandlers() {
@@ -2909,9 +3621,12 @@ void setupWebHandlers() {
   g_server.on("/api/claws", HTTP_ANY, handleClawsAll);
   g_server.on("/api/claws/config", HTTP_ANY, handleClawsConfig);
   g_server.on("/api/claws/save", HTTP_ANY, handleClawsSave);
+  g_server.on("/api/funnel", HTTP_ANY, handleFunnel);
   g_server.on("/api/config", HTTP_GET, handleConfig);
   g_server.on("/api/config/save", HTTP_ANY, handleConfigSave);
   g_server.on("/api/events", HTTP_GET, handleEvents);
+  g_server.on("/api/stepper", HTTP_GET, handleStepperStatus);
+  g_server.on("/api/stepper/command", HTTP_ANY, handleStepperCommand);
   g_server.onNotFound([]() { sendErrorJson(404, "not found"); });
 }
 
@@ -2982,6 +3697,28 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
   Serial.print(context.solar_speed_config.slow_after_ms);
   Serial.print(", solar-slow-duty=");
   Serial.print(context.solar_speed_config.slow_base_duty, 4);
+  Serial.print(", solar-contact-timeout-ms=");
+  Serial.print(context.solar_contact_config.timeout_ms);
+  Serial.print(", solar-strafe-delay-ms=");
+  Serial.print(context.solar_contact_config.strafe_start_delay_ms);
+  Serial.print(", solar-strafe-duty=");
+  Serial.print(context.solar_contact_config.strafe_duty, 4);
+  Serial.print(", solar-retry-left-ms=");
+  Serial.print(
+      context.solar_contact_config.retry_strafe_left_duration_ms);
+  Serial.print(", solar-retry-forward-ms=");
+  Serial.print(context.solar_contact_config.retry_forward_duration_ms);
+  Serial.print(", solar-retry-strafe-timeout-ms=");
+  Serial.print(context.solar_contact_config.retry_strafe_timeout_ms);
+  if (rear_link.statusAvailable()) {
+    const robot::Esp1StatusReport& esp1 = rear_link.latestStatus();
+    Serial.print(", solar-limit-configured=");
+    Serial.print(esp1.solar_panel_limit_switches_configured ? 1 : 0);
+    Serial.print(", solar-limit-br-high=");
+    Serial.print(esp1.solar_limit_back_right_high ? 1 : 0);
+    Serial.print(", solar-limit-fr-high=");
+    Serial.print(esp1.solar_limit_front_right_high ? 1 : 0);
+  }
   Serial.print(", sensors-configured=");
   Serial.print(sensors.configured() ? 1 : 0);
   Serial.print(", front-left-configured=");
@@ -3670,6 +4407,26 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
   context.solar_speed_config.slow_base_duty =
       preferences.getFloat("sslow",
                            context.solar_speed_config.slow_base_duty);
+  context.solar_contact_config.timeout_ms =
+      preferences.getUInt("sctmo",
+                          context.solar_contact_config.timeout_ms);
+  context.solar_contact_config.strafe_start_delay_ms =
+      preferences.getUInt(
+          "sdelay",
+          context.solar_contact_config.strafe_start_delay_ms);
+  context.solar_contact_config.strafe_duty =
+      preferences.getFloat("sstrfd",
+                           context.solar_contact_config.strafe_duty);
+  context.solar_contact_config.retry_strafe_left_duration_ms =
+      preferences.getUInt(
+          "srleft",
+          context.solar_contact_config.retry_strafe_left_duration_ms);
+  context.solar_contact_config.retry_forward_duration_ms =
+      preferences.getUInt(
+          "srfwd", context.solar_contact_config.retry_forward_duration_ms);
+  context.solar_contact_config.retry_strafe_timeout_ms =
+      preferences.getUInt(
+          "srtmo", context.solar_contact_config.timeout_ms);
 
   ClawServoSettings claw_settings = claws.settings();
   claw_settings.start_angle_deg[0] =
@@ -3703,10 +4460,12 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
           activeSolarPanelConfig(context, kIrBeaconFrequency1Khz)) ||
       !robot::solarPanelAutonomyConfigValid(
           activeSolarPanelConfig(context, kIrBeaconFrequency10Khz)) ||
-      !solarSpeedConfigValid(context.solar_speed_config)) {
+      !solarSpeedConfigValid(context.solar_speed_config) ||
+      !robot::solarPanelContactConfigValid(context.solar_contact_config)) {
     context.solar_config = kSolarPanelAutonomyConfig;
     context.solar_thresholds = {};
     context.solar_speed_config = {};
+    context.solar_contact_config = kSolarPanelContactConfig;
   }
 }
 
@@ -3726,7 +4485,11 @@ void motionControlTask(void* parameters) {
   DualPwmMotorOutput front_right_motor{
       robot::esp2::kHardwareConfig.front_right_motor};
   RearCommandLink rear_link{robot::esp2::kHardwareConfig.uart_to_esp1};
-  robot::esp2::StepperController stepper{};
+  robot::esp2::StepperAxis stepper{{robot::esp2::kPins.stepper_sleep,
+      robot::esp2::kPins.stepper_dir, robot::esp2::kPins.stepper_step,
+      robot::esp2::kPins.limit_switch_stepper_bottom, 800U, 1200U, 200U,
+      3U, 3U, 2000U, 500U, 15U,
+      0, 0U, 0U}};  // Maximum is intentionally unset until supplied from the dashboard.
   ClawServoBank claws{robot::esp2::kHardwareConfig.servo_claw_1,
                       robot::esp2::kHardwareConfig.servo_claw_2,
                       robot::esp2::kHardwareConfig.servo_claw_3};
@@ -3736,7 +4499,7 @@ void motionControlTask(void* parameters) {
   front_left_motor.initializeDisabled();
   front_right_motor.initializeDisabled();
   rear_link.initialize();
-  stepper.initializeDisabled();
+  stepper.begin();
   claws.initializeDisabled();
 
   preferences.begin("telemetry", false);
@@ -3745,7 +4508,7 @@ void motionControlTask(void* parameters) {
   resetSolarPanelAutonomy(context, static_cast<robot::Milliseconds>(millis()));
 
   g_runtime = {&context, &line_sensor_reader, &front_left_motor,
-               &front_right_motor, &rear_link, &claws, &preferences};
+               &front_right_motor, &rear_link, &claws, &stepper, &preferences};
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(kApSsid, kApPassword);
@@ -3761,10 +4524,20 @@ void motionControlTask(void* parameters) {
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
     g_server.handleClient();
+    stepper.update();
     rear_link.pollReceive(now_ms);
     refreshLineObservation(context, line_sensor_reader, now_ms);
     pollSerialCommands(context, line_sensor_reader, front_left_motor,
                        front_right_motor, rear_link, now_ms);
+
+    if (context.requested_funnel_command.enabled &&
+        context.requested_funnel_command.expires_at_ms != 0U &&
+        now_ms >= context.requested_funnel_command.expires_at_ms) {
+      context.requested_funnel_command = robot::disabledMotorCommand();
+      sendStoppedFunnelCommand(rear_link, context.config, now_ms);
+      logEvent(context, now_ms, robot::EventSeverity::Warn,
+               robot::EventSource::System, "funnel command deadman expired");
+    }
 
     const bool timed_mode_expired =
         context.command_deadman_armed && context.mode_expires_at_ms != 0U &&

@@ -1,11 +1,13 @@
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include <unity.h>
 
 #include "common/ChassisMixer.h"
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
+#include "common/FunnelCommand.h"
 #include "common/LineFollower.h"
 #include "common/LineObservation.h"
 #include "common/RearDriveCommand.h"
@@ -32,6 +34,16 @@ robot::LineFollowerConfig pidConfig() {
 
 robot::SolarPanelAutonomyConfig solarConfig() {
   return {100U, 60U, 200U, 0.0F, 500U, 5000U};
+}
+
+robot::SolarPanelContactConfig solarContactConfig() {
+  return {100U, 0.25F, 10U, 20U, 30U, 40U};
+}
+
+void assertSolarState(const robot::SolarPanelAutonomyState expected,
+                      const robot::SolarPanelAutonomyState actual) {
+  TEST_ASSERT_EQUAL_UINT8(static_cast<std::uint8_t>(expected),
+                          static_cast<std::uint8_t>(actual));
 }
 
 void test_both_on_tape_maps_to_zero_error() {
@@ -342,6 +354,51 @@ void test_final_duties_remain_inside_limits() {
   TEST_ASSERT_TRUE(std::abs(command.front_right.duty_command_milli) <= 400);
 }
 
+void test_open_loop_right_strafe_uses_mecanum_signs() {
+  const robot::FourWheelCommand command =
+      robot::mixOpenLoopMecanum(1.0F, 0.0F, 0.0F, 0.25F, 100U, 700U);
+
+  TEST_ASSERT_EQUAL_INT16(250, command.front_left.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(-250, command.front_right.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(-250, command.back_left.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(250, command.back_right.duty_command_milli);
+  TEST_ASSERT_TRUE(command.front_left.enabled);
+  TEST_ASSERT_TRUE(command.front_right.enabled);
+  TEST_ASSERT_TRUE(command.back_left.enabled);
+  TEST_ASSERT_TRUE(command.back_right.enabled);
+  TEST_ASSERT_EQUAL_UINT32(800U, command.front_left.expires_at_ms);
+}
+
+void test_open_loop_left_strafe_uses_mecanum_signs() {
+  const robot::FourWheelCommand command =
+      robot::mixOpenLoopMecanum(-1.0F, 0.0F, 0.0F, 0.25F, 100U, 700U);
+
+  TEST_ASSERT_EQUAL_INT16(-250, command.front_left.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(250, command.front_right.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(250, command.back_left.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(-250, command.back_right.duty_command_milli);
+  TEST_ASSERT_TRUE(command.front_left.enabled);
+  TEST_ASSERT_TRUE(command.front_right.enabled);
+  TEST_ASSERT_TRUE(command.back_left.enabled);
+  TEST_ASSERT_TRUE(command.back_right.enabled);
+  TEST_ASSERT_EQUAL_UINT32(800U, command.front_left.expires_at_ms);
+}
+
+void test_open_loop_forward_uses_equal_positive_mecanum_signs() {
+  const robot::FourWheelCommand command =
+      robot::mixOpenLoopMecanum(0.0F, 1.0F, 0.0F, 0.25F, 100U, 700U);
+
+  TEST_ASSERT_EQUAL_INT16(250, command.front_left.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(250, command.front_right.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(250, command.back_left.duty_command_milli);
+  TEST_ASSERT_EQUAL_INT16(250, command.back_right.duty_command_milli);
+  TEST_ASSERT_TRUE(command.front_left.enabled);
+  TEST_ASSERT_TRUE(command.front_right.enabled);
+  TEST_ASSERT_TRUE(command.back_left.enabled);
+  TEST_ASSERT_TRUE(command.back_right.enabled);
+  TEST_ASSERT_EQUAL_UINT32(800U, command.front_left.expires_at_ms);
+}
+
 void test_valid_rear_command_is_accepted() {
   robot::RearDriveCommandReceiver receiver{};
   const robot::RearDriveCommand command{true, 123, -456, 100U, 250U};
@@ -387,6 +444,59 @@ void test_explicit_stop_packet_stops_motors() {
 
   TEST_ASSERT_FALSE(receiver.backLeftCommand(120U).enabled);
   TEST_ASSERT_FALSE(receiver.backRightCommand(120U).enabled);
+}
+
+void test_valid_funnel_command_is_accepted() {
+  robot::FunnelCommandReceiver receiver{};
+  const robot::FunnelCommand command{true, -375, 100U, 250U};
+  const robot::UartPacket packet = robot::makeFunnelCommandPacket(command, 9);
+
+  TEST_ASSERT_TRUE(receiver.acceptPacket(packet, 100U));
+
+  const robot::FunnelStatus status = receiver.status(120U);
+  TEST_ASSERT_TRUE(status.link_healthy);
+  TEST_ASSERT_TRUE(status.command_enabled);
+  TEST_ASSERT_EQUAL_UINT16(9, status.last_sequence);
+  TEST_ASSERT_EQUAL_INT16(-375, receiver.motorCommand(120U).duty_command_milli);
+}
+
+void test_stale_funnel_command_stops_motor() {
+  robot::FunnelCommandReceiver receiver{};
+  const robot::FunnelCommand command{true, 250, 100U, 50U};
+  const robot::UartPacket packet = robot::makeFunnelCommandPacket(command, 9);
+
+  TEST_ASSERT_TRUE(receiver.acceptPacket(packet, 100U));
+
+  TEST_ASSERT_FALSE(receiver.motorCommand(151U).enabled);
+
+  const robot::FunnelStatus status = receiver.status(351U);
+  TEST_ASSERT_TRUE(status.command_enabled);
+  TEST_ASSERT_TRUE(robot::enabledFunnelCommandIsStale(status, 250U));
+}
+
+void test_stale_disabled_funnel_command_does_not_report_motion_fault() {
+  robot::FunnelCommandReceiver receiver{};
+  const robot::FunnelCommand command{false, 0, 100U, 50U};
+  const robot::UartPacket packet = robot::makeFunnelCommandPacket(command, 9);
+
+  TEST_ASSERT_TRUE(receiver.acceptPacket(packet, 100U));
+
+  const robot::FunnelStatus status = receiver.status(351U);
+  TEST_ASSERT_FALSE(status.link_healthy);
+  TEST_ASSERT_TRUE(status.has_valid_command);
+  TEST_ASSERT_FALSE(status.command_enabled);
+  TEST_ASSERT_FALSE(robot::enabledFunnelCommandIsStale(status, 250U));
+  TEST_ASSERT_FALSE(receiver.motorCommand(351U).enabled);
+}
+
+void test_corrupt_funnel_packet_is_rejected() {
+  robot::FunnelCommandReceiver receiver{};
+  const robot::FunnelCommand command{true, 250, 100U, 50U};
+  robot::UartPacket packet = robot::makeFunnelCommandPacket(command, 9);
+  packet.payload[2] ^= 0x20U;
+
+  TEST_ASSERT_FALSE(receiver.acceptPacket(packet, 100U));
+  TEST_ASSERT_FALSE(receiver.status(100U).has_valid_command);
 }
 
 void test_mode_manager_starts_disabled() {
@@ -516,6 +626,220 @@ void test_event_log_stores_newest_events_and_wraps() {
   TEST_ASSERT_EQUAL_STRING("newest", newest.message);
 }
 
+void test_solar_contact_config_validation() {
+  robot::SolarPanelContactConfig config = solarContactConfig();
+  TEST_ASSERT_TRUE(robot::solarPanelContactConfigValid(config));
+
+  config.strafe_start_delay_ms = 0U;
+  config.retry_strafe_left_duration_ms = 0U;
+  config.retry_forward_duration_ms = 0U;
+  TEST_ASSERT_TRUE(robot::solarPanelContactConfigValid(config));
+
+  config = solarContactConfig();
+  config.timeout_ms = 0U;
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config = solarContactConfig();
+  config.retry_strafe_timeout_ms = 0U;
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config = solarContactConfig();
+  config.strafe_duty = -0.01F;
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config.strafe_duty = 1.01F;
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config.strafe_duty = std::numeric_limits<float>::quiet_NaN();
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+}
+
+void test_solar_retry_state_names_are_exposed() {
+  TEST_ASSERT_EQUAL_STRING(
+      "STRAFE_LEFT_FOR_SOLAR_RETRY",
+      robot::solarPanelAutonomyStateName(
+          robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry));
+  TEST_ASSERT_EQUAL_STRING(
+      "MOVE_FORWARD_FOR_SOLAR_RETRY",
+      robot::solarPanelAutonomyStateName(
+          robot::SolarPanelAutonomyState::MoveForwardForSolarRetry));
+  TEST_ASSERT_EQUAL_STRING(
+      "RETRY_STRAFE_RIGHT_TO_SOLAR_PANEL",
+      robot::solarPanelAutonomyStateName(
+          robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel));
+}
+
+void test_solar_front_only_at_first_timeout_begins_adjustment() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, true,
+          false, config.timeout_ms - 1U, config);
+  assertSolarState(robot::SolarPanelAutonomyState::StrafeRightToSolarPanel,
+                   update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, true, false,
+      config.timeout_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+}
+
+void test_solar_first_timeout_faults_without_front_only_contact() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, false,
+          false, config.timeout_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, false, true,
+      config.timeout_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+}
+
+void test_solar_adjustment_runs_left_then_forward_then_right() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry, false,
+          false, config.retry_strafe_left_duration_ms - 1U, config);
+  assertSolarState(robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry,
+                   update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry, false, false,
+      config.retry_strafe_left_duration_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::MoveForwardForSolarRetry,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::MoveForwardForSolarRetry, false, false,
+      config.retry_forward_duration_ms - 1U, config);
+  assertSolarState(robot::SolarPanelAutonomyState::MoveForwardForSolarRetry,
+                   update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::MoveForwardForSolarRetry, false, false,
+      config.retry_forward_duration_ms, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel,
+      update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+}
+
+void test_solar_zero_adjustment_durations_transition_immediately() {
+  robot::SolarPanelContactConfig config = solarContactConfig();
+  config.retry_strafe_left_duration_ms = 0U;
+  config.retry_forward_duration_ms = 0U;
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry, false,
+          false, 0U, config);
+  assertSolarState(robot::SolarPanelAutonomyState::MoveForwardForSolarRetry,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::MoveForwardForSolarRetry, false, false,
+      0U, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel,
+      update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+}
+
+void test_solar_second_strafe_times_out_without_another_adjustment() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel, true,
+          false, config.retry_strafe_timeout_ms - 1U, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel,
+      update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel, true,
+      false, config.retry_strafe_timeout_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      update.next_state, true, false, config.retry_strafe_timeout_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
+                   update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+}
+
+void test_solar_second_strafe_timeout_is_independently_adjustable() {
+  robot::SolarPanelContactConfig config = solarContactConfig();
+  config.retry_strafe_timeout_ms = 80U;
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel, true,
+          false, 40U, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel,
+      update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel, true,
+      false, 80U, config);
+  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+}
+
+void test_solar_all_hit_has_priority_in_every_contact_motion_state() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+  const robot::SolarPanelAutonomyState states[] = {
+      robot::SolarPanelAutonomyState::StrafeRightToSolarPanel,
+      robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry,
+      robot::SolarPanelAutonomyState::MoveForwardForSolarRetry,
+      robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel,
+  };
+
+  for (const robot::SolarPanelAutonomyState state : states) {
+    const robot::SolarPanelContactSequenceUpdate update =
+        robot::updateSolarPanelContactSequence(state, true, true, 1000U,
+                                               config);
+    assertSolarState(robot::SolarPanelAutonomyState::SolarPanelContacted,
+                     update.next_state);
+    TEST_ASSERT_TRUE(update.transitioned);
+  }
+}
+
+void test_solar_non_contact_state_is_unchanged() {
+  const robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::LineFollowToSolar, true, true,
+          1000U, solarContactConfig());
+
+  assertSolarState(robot::SolarPanelAutonomyState::LineFollowToSolar,
+                   update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+}
+
 void test_solar_detector_no_beacon_does_not_confirm() {
   robot::SolarBeaconDetectorState state{};
   const robot::SolarPanelAutonomyConfig config = solarConfig();
@@ -612,10 +936,19 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.uptime_ms = 123U;
   snapshot.current_mode = robot::RobotTestMode::LineSensorTest;
   snapshot.enabled = false;
+  snapshot.lss_raw_level = 1;
   snapshot.lsfl_black = true;
   snapshot.lsfr_black = false;
+  snapshot.lss_black = true;
+  snapshot.lss_configured = true;
   snapshot.front_left.desired_command_milli = 100;
   snapshot.front_right.desired_command_milli = -100;
+  snapshot.funnel.desired_command_milli = 250;
+  snapshot.funnel.applied_command_milli = 250;
+  snapshot.funnel.enabled = true;
+  snapshot.funnel.configured = true;
+  snapshot.esp1.funnel_applied_command_milli = 250;
+  snapshot.esp1.funnel_configured = true;
   snapshot.ir_adc_average = 1800U;
   snapshot.ir_adc_min = 1200U;
   snapshot.ir_adc_max = 2200U;
@@ -656,6 +989,23 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.solar_slow_after_ms = 7000U;
   snapshot.solar_slow_base_duty = 0.15F;
   snapshot.solar_slow_mode_active = true;
+  snapshot.solar_contact_timeout_ms = 4000U;
+  snapshot.solar_contact_strafe_duty = 0.12F;
+  snapshot.solar_strafe_start_delay_ms = 300U;
+  snapshot.solar_retry_strafe_left_duration_ms = 321U;
+  snapshot.solar_retry_forward_duration_ms = 654U;
+  snapshot.solar_retry_strafe_timeout_ms = 987U;
+  snapshot.solar_panel_limit_switches_configured = true;
+  snapshot.solar_limit_back_right_high = true;
+  snapshot.solar_limit_front_right_high = false;
+  snapshot.solar_limit_back_right_hit = true;
+  snapshot.solar_limit_front_right_hit = false;
+  snapshot.solar_limit_all_hit = false;
+  snapshot.esp1.solar_panel_limit_switches_configured = true;
+  snapshot.esp1.solar_limit_back_right_high = true;
+  snapshot.esp1.solar_limit_front_right_high = false;
+  snapshot.esp1.side_line_sensor_configured = true;
+  snapshot.esp1.side_line_sensor_high = true;
   snapshot.claws.claw_1.hardware_configured = true;
   snapshot.claws.claw_1.start_configured = true;
   snapshot.claws.claw_1.start_angle_deg = 30;
@@ -671,9 +1021,17 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"enabled\":false"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_black\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_level\":\"UNKNOWN\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_raw_level\":1"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_level\":\"HIGH\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_black\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_configured\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"hasHistory\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"maxDuty\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"front_left\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"funnel\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"funnel_applied_command_milli\":250"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"funnel_configured\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"line_error\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"ir_adc_average\":1800"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"ir_beacon_detected\":true"));
@@ -699,11 +1057,40 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"slow_base_duty\":0.15000"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"slow_mode_active\":true"));
   TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"contact_timeout_ms\":4000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"strafe_duty\":0.12000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"strafe_start_delay_ms\":300"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"retry_strafe_left_duration_ms\":321"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"retry_forward_duration_ms\":654"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"retry_strafe_timeout_ms\":987"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"solarLimitSwitches\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"backRightHigh\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"frontRightHigh\":false"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"backRightHit\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"frontRightHit\":false"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"allHit\":false"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output,
+                  "\"solar_panel_limit_switches_configured\":true"));
+  TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"confirmation_progress_ms\":300"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"claws\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"rotation_deg\":90"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"claw_1\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"commandedAngleDeg\":120"));
+
+  snapshot.lss_raw_level = 0;
+  snapshot.lss_black = false;
+  snapshot.esp1.side_line_sensor_high = false;
+  TEST_ASSERT_TRUE(
+      robot::writeTelemetryJson(snapshot, output, sizeof(output), false));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_raw_level\":0"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_level\":\"LOW\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_black\":false"));
 }
 
 void test_esp1_status_packet_round_trips() {
@@ -725,6 +1112,13 @@ void test_esp1_status_packet_round_trips() {
   report.ir_active_threshold = 120U;
   report.ir_consecutive_detection_count = 4U;
   report.ir_adc_sample_rate_hz = 50000U;
+  report.funnel_applied_command_milli = -333;
+  report.funnel_configured = true;
+  report.solar_panel_limit_switches_configured = true;
+  report.solar_limit_back_right_high = true;
+  report.solar_limit_front_right_high = false;
+  report.side_line_sensor_configured = true;
+  report.side_line_sensor_high = true;
 
   const robot::UartPacket packet = robot::makeEsp1StatusPacket(report, 42U);
   robot::Esp1StatusReport decoded{};
@@ -754,6 +1148,21 @@ void test_esp1_status_packet_round_trips() {
   TEST_ASSERT_EQUAL_UINT16(120U, decoded.ir_active_threshold);
   TEST_ASSERT_EQUAL_UINT8(4U, decoded.ir_consecutive_detection_count);
   TEST_ASSERT_EQUAL_UINT32(50000U, decoded.ir_adc_sample_rate_hz);
+  TEST_ASSERT_EQUAL_INT16(-333, decoded.funnel_applied_command_milli);
+  TEST_ASSERT_TRUE(decoded.funnel_configured);
+  TEST_ASSERT_TRUE(decoded.solar_panel_limit_switches_configured);
+  TEST_ASSERT_TRUE(decoded.solar_limit_back_right_high);
+  TEST_ASSERT_FALSE(decoded.solar_limit_front_right_high);
+  TEST_ASSERT_TRUE(decoded.side_line_sensor_configured);
+  TEST_ASSERT_TRUE(decoded.side_line_sensor_high);
+
+  report.side_line_sensor_high = false;
+  const robot::UartPacket low_packet =
+      robot::makeEsp1StatusPacket(report, 43U);
+  decoded = {};
+  TEST_ASSERT_TRUE(robot::decodeEsp1StatusPacket(low_packet, decoded));
+  TEST_ASSERT_TRUE(decoded.side_line_sensor_configured);
+  TEST_ASSERT_FALSE(decoded.side_line_sensor_high);
 }
 
 }  // namespace
@@ -784,10 +1193,17 @@ int main() {
   RUN_TEST(test_positive_correction_changes_sides_oppositely);
   RUN_TEST(test_negative_polarity_reverses_correction);
   RUN_TEST(test_final_duties_remain_inside_limits);
+  RUN_TEST(test_open_loop_right_strafe_uses_mecanum_signs);
+  RUN_TEST(test_open_loop_left_strafe_uses_mecanum_signs);
+  RUN_TEST(test_open_loop_forward_uses_equal_positive_mecanum_signs);
   RUN_TEST(test_valid_rear_command_is_accepted);
   RUN_TEST(test_corrupt_rear_packet_is_rejected);
   RUN_TEST(test_stale_rear_command_stops_motors);
   RUN_TEST(test_explicit_stop_packet_stops_motors);
+  RUN_TEST(test_valid_funnel_command_is_accepted);
+  RUN_TEST(test_stale_funnel_command_stops_motor);
+  RUN_TEST(test_stale_disabled_funnel_command_does_not_report_motion_fault);
+  RUN_TEST(test_corrupt_funnel_packet_is_rejected);
   RUN_TEST(test_mode_manager_starts_disabled);
   RUN_TEST(test_mode_manager_rejects_drive_while_disabled);
   RUN_TEST(test_mode_manager_accepts_sensor_mode_without_motors);
@@ -801,6 +1217,16 @@ int main() {
   RUN_TEST(test_command_validation_rejects_invalid_pid_value);
   RUN_TEST(test_command_validation_rejects_mode_incompatible_motor_command);
   RUN_TEST(test_event_log_stores_newest_events_and_wraps);
+  RUN_TEST(test_solar_contact_config_validation);
+  RUN_TEST(test_solar_retry_state_names_are_exposed);
+  RUN_TEST(test_solar_front_only_at_first_timeout_begins_adjustment);
+  RUN_TEST(test_solar_first_timeout_faults_without_front_only_contact);
+  RUN_TEST(test_solar_adjustment_runs_left_then_forward_then_right);
+  RUN_TEST(test_solar_zero_adjustment_durations_transition_immediately);
+  RUN_TEST(test_solar_second_strafe_times_out_without_another_adjustment);
+  RUN_TEST(test_solar_second_strafe_timeout_is_independently_adjustable);
+  RUN_TEST(test_solar_all_hit_has_priority_in_every_contact_motion_state);
+  RUN_TEST(test_solar_non_contact_state_is_unchanged);
   RUN_TEST(test_solar_detector_no_beacon_does_not_confirm);
   RUN_TEST(test_solar_detector_brief_spike_does_not_confirm);
   RUN_TEST(test_solar_detector_sustained_beacon_confirms);

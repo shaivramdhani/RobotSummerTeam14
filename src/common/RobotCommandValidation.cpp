@@ -100,6 +100,14 @@ CommandValidationResult validateModeAllowsSingleMotor(
   return rejected("motor commands require SINGLE_MOTOR_TEST");
 }
 
+CommandValidationResult validateModeAllowsMechanism(
+    const RobotTestMode mode) {
+  if (mode == RobotTestMode::MechanismTest) {
+    return accepted();
+  }
+  return rejected("mechanism commands require MECHANISM_TEST");
+}
+
 CommandValidationResult validateNormalizedDuty(const float duty,
                                                const float maximum_abs) {
   if (!std::isfinite(duty)) {

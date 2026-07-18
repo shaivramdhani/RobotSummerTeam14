@@ -34,14 +34,15 @@ selects the target beacon frequency: `HIGH` selects 1 kHz and `LOW` selects
 | `SINGLE_MOTOR_TEST` | One wheel only | Direction and inversion checks. |
 | `MANUAL_DRIVE_TEST` | ESP2-local front wheels only | Deadman-protected local drive commands. |
 | `DISTRIBUTED_DRIVE_TEST` | All four wheels | ESP2 front wheels plus ESP1 back wheel commands. |
-| `LINE_SENSOR_TEST` | No | Raw LSFL/LSFR and interpreted line error. |
+| `LINE_SENSOR_TEST` | No | Raw LSFL/LSFR/LSS and interpreted front-line error. |
 | `LINE_FOLLOW_TEST` | Yes, gated | Digital two-sensor line follower. |
-| `MECHANISM_TEST` | Claw servos only, gated | Open/close claw servos with drive outputs stopped. |
+| `MECHANISM_TEST` | Mechanisms only, gated | Open/close claw servos and test the ESP1 funnel motor with drive outputs stopped. |
+| `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, and bounded solar-panel contact sequence. |
 | `AUTONOMOUS_DRY_RUN` | No | Stub view for future mission dry runs. |
 
 Mode changes stop actuators before switching. Sensor-only modes keep motors and
 mechanisms disabled. `MECHANISM_TEST` keeps drive outputs disabled and `/api/stop`
-disables the claw servo outputs.
+disables the claw servo outputs and sends a disabled funnel command to ESP1.
 
 ## Line Sensor Bench Test
 
@@ -49,10 +50,12 @@ Use this when you only want to verify comparator states and line interpretation,
 without driving motors:
 
 - Dashboard: press `Sensor Test` in the line-sensor panel. This switches ESP2
-  to `LINE_SENSOR_TEST`, disables actuators, and keeps updating LSFL/LSFR.
+  to `LINE_SENSOR_TEST`, disables actuators, and keeps updating LSFL/LSFR/LSS.
 - Serial: run `mode line-sensor`, then `line status`.
-- Telemetry: watch `line.lsfl_level` and `line.lsfr_level` for `HIGH`, `LOW`,
-  or `UNKNOWN`; `HIGH` means black tape for the current front sensors.
+- Telemetry: watch `line.lsfl_level`, `line.lsfr_level`, and `line.lss_level`
+  for `HIGH`, `LOW`, or `UNKNOWN`; `HIGH` means black tape for all three
+  sensors. LSS is ESP1 GPIO4 and reports `UNKNOWN` unless its configuration is
+  present and the ESP1 status link is fresh.
 
 ## IR Beacon Bench Test
 
@@ -66,6 +69,21 @@ without driving motors:
   windows.
 - While driving on a safe stand, confirm the dashboard keeps updating and motor
   commands remain responsive.
+
+## Solar Contact Retry
+
+If the front-right contact switch is hit but the back-right switch is not when
+the initial right-strafe contact timeout expires, ESP2 performs one correction:
+it strafes left, moves forward, and then makes one more right-strafe attempt.
+The second right-strafe attempt faults on its own timeout and cannot start a
+second correction sequence. Both switches stop the sequence successfully from
+any contact-motion state.
+
+The dashboard exposes `Retry left strafe ms`, `Retry forward ms`, and
+`Retry right timeout ms`. Apply updates the values at runtime; Save persists
+them to NVS. The two new motion durations default to `0` until the team tunes
+them on the real robot; the retry timeout initially uses the existing contact
+timeout.
 
 ## Safety Behavior
 
@@ -88,9 +106,14 @@ without driving motors:
 - ESP1 back motors stop on stale, invalid, duplicate, corrupt, or disabled
   wheel command packets.
 - ESP2 stops line following if the rear command link is unhealthy.
+- Solar autonomous motion also stops if a rear-wheel command cannot be sent or
+  ESP1 reports that its received commands have gone stale.
 - Claw servo commands are rejected unless the ESP2 claw PWM config is complete,
   the per-claw start angle is set, and the derived open angle stays within
   `0..180` degrees. Open is always start plus or minus `90` degrees.
+- Funnel commands are press-and-hold with the same `700 ms` deadman timeout as
+  single-motor tests. ESP1 initializes the funnel output disabled, rejects stale
+  or corrupt packets, and reports whether the funnel PWM hardware is configured.
 - Browser requests call high-level command handlers; they do not write GPIO/PWM
   directly.
 
@@ -107,16 +130,19 @@ without driving motors:
 | `/api/motor?id=<FL|FR|BL|BR>&speed=<>` | GET/POST | Single motor hold/deadman command. Use `speed=0` to release. |
 | `/api/invert?id=<FL|FR>` | GET/POST | Toggle front motor runtime inversion and save it. Rear inversion is a TODO on ESP1. |
 | `/api/sensors` | GET | Supported sensor states. |
-| `/api/line` | GET | LSFL/LSFR level, black booleans, error, last side, visibility. |
+| `/api/line` | GET | LSFL/LSFR/LSS level, black booleans, error, last side, visibility. |
 | `/api/line-follow/start?ms=<>` | GET/POST | Switch to `LINE_FOLLOW_TEST` and start line following. |
 | `/api/line-follow/stop` | GET/POST | Stop line following. |
 | `/api/line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>` | GET/POST | Runtime PID/config update. |
+| `/api/autonomous/solar/start` | GET/POST | Start the gated solar-panel autonomous test. |
+| `/api/autonomous/solar/config?...&retry-left-ms=<>&retry-forward-ms=<>&retry-strafe-timeout-ms=<>` | GET/POST | Update solar autonomy settings, including the one-shot contact correction timings. |
 | `/api/claw?id=<1|2|3>&state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command one claw servo. |
 | `/api/claws?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command all three claw servos. |
 | `/api/claws/config?claw1-start=<>&claw1-dir=<1|-1>&...` | GET/POST | Runtime claw start angle and 90-degree direction update. |
 | `/api/claws/save` | GET/POST | Save claw start angles and directions to NVS. |
+| `/api/funnel?speed=<>` | GET/POST | Switch to `MECHANISM_TEST` and send a timed ESP1 funnel motor command. Use `speed=0` to release. |
 | `/api/config` | GET | Current tunable settings. |
-| `/api/config/save` | GET/POST | Save line-following tunables to NVS. |
+| `/api/config/save` | GET/POST | Save line-following and solar-autonomy tunables to NVS. |
 | `/api/events` | GET | Fixed-size recent event log. |
 
 All command endpoints return JSON with `ok` and either `message` or `error`.
@@ -129,20 +155,26 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
   `fault_active`, `fault_code`, `fault_message`, `last_command_age_ms`,
   `deadman_remaining_ms`, `wifi_clients`, `ip_address`, `free_heap_bytes`,
   `reset_reason`.
-- Line: `lsfl_raw_level`, `lsfr_raw_level`, `lsfl_level`, `lsfr_level`,
-  `lsfl_black`, `lsfr_black`, `line_error`, `line_visible`,
+- Line: `lsfl_raw_level`, `lsfr_raw_level`, `lss_raw_level`, `lsfl_level`,
+  `lsfr_level`, `lss_level`, `lsfl_black`, `lsfr_black`, `lss_black`,
+  `lss_configured`, `line_error`, `line_visible`,
   `has_history`/`hasHistory`, `last_known_line_side`,
   `line_follower_enabled`.
 - PID: `kp`, `ki`, `kd`, `baseDuty`, `maxDuty`, `maxCorrection`,
   `integralLimit`, `derivativeLimit`, `derivativeFilterAlpha`,
   `steeringPolarity`, `controlPeriodMs`, `remoteCommandTimeoutMs`,
   `telemetryEnabled`, `p_term`, `i_term`, `d_term`, `correction`.
-- ESP2-local motor telemetry: physical FL/FR desired/applied milli-duty,
-  enabled, inversion, configured.
+- Solar autonomy: state, time in state, fault reason, IR thresholds and
+  confirmation, initial contact timeout, strafe duty/delay,
+  `retry_strafe_left_duration_ms`, `retry_forward_duration_ms`, and
+  `retry_strafe_timeout_ms`.
+- Motor telemetry: ESP2-local physical FL/FR desired/applied milli-duty and
+  ESP1 funnel desired/applied milli-duty, enabled, inversion, configured.
 - ESP1 command status: physical BL/BR command, sequence, age, link health,
   configured flag, packet error count.
 - ESP1 remote status from compact `HealthReport` frames: availability, uptime,
-  mode, fault status, rear applied commands, and rear inversion flags.
+  mode, fault status, rear applied commands, rear inversion flags, funnel applied
+  command/configuration, and side-line sensor configuration/raw level.
 - Claws: `rotation_deg`, plus `claw_1`/`claw_2`/`claw_3` hardware configured,
   start configured, output enabled, start angle, open angle, direction, and
   commanded angle/open state.

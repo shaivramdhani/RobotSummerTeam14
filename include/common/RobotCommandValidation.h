@@ -31,6 +31,7 @@ bool parseWheelId(const char* text, WheelId& wheel);
 
 CommandValidationResult validateModeAllowsDrive(RobotTestMode mode);
 CommandValidationResult validateModeAllowsSingleMotor(RobotTestMode mode);
+CommandValidationResult validateModeAllowsMechanism(RobotTestMode mode);
 CommandValidationResult validateNormalizedDuty(float duty, float maximum_abs);
 CommandValidationResult validateTimedDuration(Milliseconds duration_ms,
                                               Milliseconds maximum_ms);

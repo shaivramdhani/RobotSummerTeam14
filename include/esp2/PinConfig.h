@@ -52,15 +52,15 @@ struct Esp2Pins {
   int pwm_front_left_1{16};           // TODO: GPIO, PWM resource
   int pwm_front_right_0{41};          // TODO: GPIO, PWM resource
   int pwm_front_right_1{42};          // TODO: GPIO, PWM resource
-  int stepper_step{kUnassignedGpio};               // TODO: GPIO, active edge
-  int stepper_dir{kUnassignedGpio};                // TODO: GPIO, active level
-  int stepper_sleep{kUnassignedGpio};              // TODO: GPIO, active level
+  int stepper_step{4};               // DRV8425 STEP, rising edge = one microstep
+  int stepper_dir{3};                // DRV8425 DIR, HIGH = software Up
+  int stepper_sleep{2};              // DRV8425 nSLEEP, active LOW
   int servo_claw_1{14};               // TODO: GPIO, pulse range
   int servo_claw_2{13};               // TODO: GPIO, pulse range
   int servo_claw_3{12};               // TODO: GPIO, pulse range
   int servo_pusher{kUnassignedGpio};               // TODO: GPIO, pulse range
   int servo_winch{kUnassignedGpio};                // TODO: GPIO, pulse range
-  int limit_switch_stepper_bottom{kUnassignedGpio};  // TODO: GPIO, active level
+  int limit_switch_stepper_bottom{10};  // NO switch: LOW released, HIGH pressed
   int limit_switch_stepper_middle{kUnassignedGpio};  // TODO: GPIO, active level
   int limit_switch_stepper_top{kUnassignedGpio};     // TODO: GPIO, active level
   int limit_switch_funnel_left{kUnassignedGpio};     // TODO: GPIO, active level

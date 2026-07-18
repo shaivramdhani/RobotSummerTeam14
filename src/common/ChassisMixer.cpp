@@ -32,6 +32,43 @@ FourWheelCommand calculateDisabledFourWheelCommand(
   return disabledFourWheelCommand();
 }
 
+FourWheelCommand mixOpenLoopMecanum(const float lateral_command,
+                                    const float forward_command,
+                                    const float yaw_command,
+                                    const float duty,
+                                    const Milliseconds now_ms,
+                                    const Milliseconds timeout_ms) {
+  const float lateral = clampFloat(lateral_command, -1.0F, 1.0F);
+  const float forward = clampFloat(forward_command, -1.0F, 1.0F);
+  const float yaw = clampFloat(yaw_command, -1.0F, 1.0F);
+  const float duty_scale = clampFloat(duty, 0.0F, 1.0F);
+
+  float front_left = forward + lateral + yaw;
+  float front_right = forward - lateral - yaw;
+  float back_left = forward - lateral + yaw;
+  float back_right = forward + lateral - yaw;
+  const float peak =
+      std::fmax(std::fmax(std::fabs(front_left), std::fabs(front_right)),
+                std::fmax(std::fabs(back_left), std::fabs(back_right)));
+  if (peak > 1.0F) {
+    front_left /= peak;
+    front_right /= peak;
+    back_left /= peak;
+    back_right /= peak;
+  }
+
+  FourWheelCommand command{};
+  command.front_left =
+      makeMotorCommand(front_left * duty_scale, now_ms, timeout_ms);
+  command.front_right =
+      makeMotorCommand(front_right * duty_scale, now_ms, timeout_ms);
+  command.back_left =
+      makeMotorCommand(back_left * duty_scale, now_ms, timeout_ms);
+  command.back_right =
+      makeMotorCommand(back_right * duty_scale, now_ms, timeout_ms);
+  return command;
+}
+
 FourWheelCommand mixDifferentialLineFollow(const float correction,
                                            const LineFollowerConfig& config,
                                            const Milliseconds now_ms) {

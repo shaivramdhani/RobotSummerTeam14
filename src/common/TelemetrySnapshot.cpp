@@ -173,16 +173,24 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
   writer.appendEscaped(snapshot.reset_reason);
 
   writer.append(",\"line\":{\"lsfl_raw_level\":%d,\"lsfr_raw_level\":%d,"
+                "\"lss_raw_level\":%d,"
                 "\"lsfl_level\":\"%s\",\"lsfr_level\":\"%s\","
-                "\"lsfl_black\":%s,\"lsfr_black\":%s,\"line_error\":%d,"
+                "\"lss_level\":\"%s\","
+                "\"lsfl_black\":%s,\"lsfr_black\":%s,"
+                "\"lss_black\":%s,\"lss_configured\":%s,"
+                "\"line_error\":%d,"
                 "\"line_visible\":%s,\"has_history\":%s,"
                 "\"hasHistory\":%s,"
                 "\"last_known_line_side\":%d,"
                 "\"line_follower_enabled\":%s}",
                 snapshot.lsfl_raw_level, snapshot.lsfr_raw_level,
+                snapshot.lss_raw_level,
                 digitalLevelName(snapshot.lsfl_raw_level),
                 digitalLevelName(snapshot.lsfr_raw_level),
+                digitalLevelName(snapshot.lss_raw_level),
                 jsonBool(snapshot.lsfl_black), jsonBool(snapshot.lsfr_black),
+                jsonBool(snapshot.lss_black),
+                jsonBool(snapshot.lss_configured),
                 static_cast<int>(snapshot.line_error),
                 jsonBool(snapshot.line_visible),
                 jsonBool(snapshot.line_has_history),
@@ -233,7 +241,17 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"start_base_duty\":%.5f,"
                 "\"slow_after_ms\":%u,"
                 "\"slow_base_duty\":%.5f,"
-                "\"slow_mode_active\":%s}",
+                "\"slow_mode_active\":%s,"
+                "\"contact_timeout_ms\":%u,"
+                "\"strafe_duty\":%.5f,"
+                "\"strafe_start_delay_ms\":%u,"
+                "\"retry_strafe_left_duration_ms\":%u,"
+                "\"retry_forward_duration_ms\":%u,"
+                "\"retry_strafe_timeout_ms\":%u,"
+                "\"limit_switches\":{\"configured\":%s,"
+                "\"back_right_high\":%s,\"front_right_high\":%s,"
+                "\"back_right_hit\":%s,\"front_right_hit\":%s,"
+                "\"all_hit\":%s}}",
                 solarPanelAutonomyStateName(snapshot.autonomous_state),
                 static_cast<unsigned>(
                     snapshot.autonomous_time_in_state_ms),
@@ -269,11 +287,42 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 static_cast<unsigned>(
                     snapshot.solar_slow_after_ms),
                 snapshot.solar_slow_base_duty,
-                jsonBool(snapshot.solar_slow_mode_active));
+                jsonBool(snapshot.solar_slow_mode_active),
+                static_cast<unsigned>(
+                    snapshot.solar_contact_timeout_ms),
+                snapshot.solar_contact_strafe_duty,
+                static_cast<unsigned>(
+                    snapshot.solar_strafe_start_delay_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_retry_strafe_left_duration_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_retry_forward_duration_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_retry_strafe_timeout_ms),
+                jsonBool(
+                    snapshot.solar_panel_limit_switches_configured),
+                jsonBool(snapshot.solar_limit_back_right_high),
+                jsonBool(snapshot.solar_limit_front_right_high),
+                jsonBool(snapshot.solar_limit_back_right_hit),
+                jsonBool(snapshot.solar_limit_front_right_hit),
+                jsonBool(snapshot.solar_limit_all_hit));
+
+  writer.append(",\"solarLimitSwitches\":{\"configured\":%s,"
+                "\"backRightHigh\":%s,\"frontRightHigh\":%s,"
+                "\"backRightHit\":%s,\"frontRightHit\":%s,"
+                "\"allHit\":%s}",
+                jsonBool(
+                    snapshot.solar_panel_limit_switches_configured),
+                jsonBool(snapshot.solar_limit_back_right_high),
+                jsonBool(snapshot.solar_limit_front_right_high),
+                jsonBool(snapshot.solar_limit_back_right_hit),
+                jsonBool(snapshot.solar_limit_front_right_hit),
+                jsonBool(snapshot.solar_limit_all_hit));
 
   writer.append(",\"motors\":{");
   appendMotor(writer, "front_left", snapshot.front_left, true);
-  appendMotor(writer, "front_right", snapshot.front_right, false);
+  appendMotor(writer, "front_right", snapshot.front_right, true);
+  appendMotor(writer, "funnel", snapshot.funnel, false);
   writer.append("}");
 
   writer.append(",\"rear\":{\"back_left_desired_command_milli\":%d,"
@@ -296,7 +345,14 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"mode\":\"%s\",\"fault_active\":%s,\"fault_code\":\"%s\","
                 "\"back_left_applied_command_milli\":%d,"
                 "\"back_right_applied_command_milli\":%d,"
-                "\"back_left_inverted\":%s,\"back_right_inverted\":%s}",
+                "\"funnel_applied_command_milli\":%d,"
+                "\"back_left_inverted\":%s,\"back_right_inverted\":%s,"
+                "\"funnel_configured\":%s,"
+                "\"solar_panel_limit_switches_configured\":%s,"
+                "\"solar_limit_back_right_high\":%s,"
+                "\"solar_limit_front_right_high\":%s,"
+                "\"side_line_sensor_configured\":%s,"
+                "\"side_line_sensor_high\":%s}",
                 jsonBool(snapshot.esp1.available),
                 static_cast<unsigned>(snapshot.esp1.uptime_ms),
                 robotTestModeName(snapshot.esp1.mode),
@@ -304,8 +360,16 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 faultCodeName(snapshot.esp1.fault_code),
                 snapshot.esp1.back_left_applied_command_milli,
                 snapshot.esp1.back_right_applied_command_milli,
+                snapshot.esp1.funnel_applied_command_milli,
                 jsonBool(snapshot.esp1.back_left_inverted),
-                jsonBool(snapshot.esp1.back_right_inverted));
+                jsonBool(snapshot.esp1.back_right_inverted),
+                jsonBool(snapshot.esp1.funnel_configured),
+                jsonBool(snapshot.esp1
+                             .solar_panel_limit_switches_configured),
+                jsonBool(snapshot.esp1.solar_limit_back_right_high),
+                jsonBool(snapshot.esp1.solar_limit_front_right_high),
+                jsonBool(snapshot.esp1.side_line_sensor_configured),
+                jsonBool(snapshot.esp1.side_line_sensor_high));
 
   writer.append(",\"claws\":{\"rotation_deg\":%d,", snapshot.claws.rotation_deg);
   appendClaw(writer, "claw_1", snapshot.claws.claw_1, true);

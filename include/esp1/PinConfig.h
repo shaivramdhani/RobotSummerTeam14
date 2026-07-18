@@ -44,17 +44,17 @@ struct Esp1Pins {
   int ultrasonic_echo_1{kUnassignedGpio};          // TODO: GPIO, voltage level
   int ultrasonic_trigger_2{kUnassignedGpio};       // TODO: GPIO, timing
   int ultrasonic_echo_2{kUnassignedGpio};          // TODO: GPIO, voltage level
-  int line_sensor_side{kUnassignedGpio};           // TODO: GPIO/ADC, active level
+  int line_sensor_side{4};  // Digital comparator, HIGH = black tape
   int line_sensor_back_left{kUnassignedGpio};      // TODO: GPIO/ADC, active level
   int line_sensor_back_right{kUnassignedGpio};     // TODO: GPIO/ADC, active level
   int pwm_back_left_0{16};            // TODO: GPIO, PWM resource
   int pwm_back_left_1{15};            // TODO: GPIO, PWM resource
   int pwm_back_right_0{42};           // TODO: GPIO, PWM resource
   int pwm_back_right_1{41};           // TODO: GPIO, PWM resource
-  int pwm_funnel_0{kUnassignedGpio};               // TODO: GPIO, PWM resource
-  int pwm_funnel_1{kUnassignedGpio};               // TODO: GPIO, PWM resource
-  int limit_switch_back_right_side{1};   // TODO: GPIO, active level
-  int limit_switch_front_right_side{9};  // TODO: GPIO, active level
+  int pwm_funnel_0{5};               // TODO: GPIO, PWM resource
+  int pwm_funnel_1{6};               // TODO: GPIO, PWM resource
+  int limit_switch_back_right_side{1};   // Solar side switch, raw HIGH = hit
+  int limit_switch_front_right_side{9};  // Solar side switch, raw HIGH = hit
   int uart_tx_to_esp2{21};                         // UART TX to ESP2 GPIO40
   int uart_rx_from_esp2{40};                       // UART RX from ESP2 GPIO21
 };
@@ -63,6 +63,7 @@ struct Esp1HardwareConfig {
   Esp1Pins pins{};
   DualPwmMotorOutputConfig back_left_motor{};   // TODO: fill from schematic
   DualPwmMotorOutputConfig back_right_motor{};  // TODO: fill from schematic
+  DualPwmMotorOutputConfig funnel_motor{};      // TODO: PWM resource review
   UartConfig uart_to_esp2{};                    // TODO: fill TX/RX/baud
   float maximum_safe_test_duty{0.8F};           // TODO: verified safe duty
 };
@@ -76,6 +77,9 @@ inline constexpr Esp1HardwareConfig kHardwareConfig{
     {kPins.pwm_back_right_0, kPins.pwm_back_right_1, 2, 3,
      kDriveTestPwmFrequencyHz, kDriveTestPwmResolutionBits, 1,
      DualPwmHBridgeMode::Pwm0ForwardPwm1Reverse},
+    {kPins.pwm_funnel_0, kPins.pwm_funnel_1, 4,
+     5, kDriveTestPwmFrequencyHz,
+     kDriveTestPwmResolutionBits, 1, DualPwmHBridgeMode::Pwm0ForwardPwm1Reverse},
     {kPins.uart_tx_to_esp2, kPins.uart_rx_from_esp2,
      kDriveTestUartBaudRate},
     1.0F};

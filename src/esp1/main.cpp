@@ -6,6 +6,7 @@
 
 #include "common/Esp1Status.h"
 #include "common/FaultHealth.h"
+#include "common/FunnelCommand.h"
 #include "common/MotorOutput.h"
 #include "common/RearDriveCommand.h"
 #include "common/UartProtocol.h"
@@ -19,6 +20,7 @@ constexpr robot::Milliseconds kRearStatusPrintPeriodMs = 250U;
 constexpr std::uint32_t kTaskStackBytes = 6144U;
 constexpr UBaseType_t kTaskPriority = 1U;
 constexpr BaseType_t kTaskCore = 1;
+constexpr std::uint8_t kMaxUartPacketsPerCycle = 4U;
 
 // IR beacon ADC monitor defaults. GPIO stays in PinConfig; tune these values
 // here during bench testing. The analog input must remain within 0-3.3 V.
@@ -26,6 +28,12 @@ constexpr int kIrAdcGpio =
     robot::esp1::kHardwareConfig.pins.right_ir_filtered;
 constexpr int kIrFrequencySelectGpio =
     robot::esp1::kHardwareConfig.pins.freq;
+constexpr int kSolarLimitBackRightSideGpio =
+    robot::esp1::kHardwareConfig.pins.limit_switch_back_right_side;
+constexpr int kSolarLimitFrontRightSideGpio =
+    robot::esp1::kHardwareConfig.pins.limit_switch_front_right_side;
+constexpr int kSideLineSensorGpio =
+    robot::esp1::kHardwareConfig.pins.line_sensor_side;
 constexpr std::uint8_t kIrAdcResolutionBits = 12U;
 constexpr std::uint16_t kIrAdcMaximumSample =
     (static_cast<std::uint16_t>(1U) << kIrAdcResolutionBits) - 1U;
@@ -104,6 +112,17 @@ struct DebouncedSwitchState {
   robot::Milliseconds candidate_since_ms{0};
 };
 
+struct SolarPanelLimitSwitchReading {
+  bool configured{false};
+  bool back_right_high{false};
+  bool front_right_high{false};
+};
+
+struct SideLineSensorReading {
+  bool configured{false};
+  bool raw_high{false};
+};
+
 portMUX_TYPE g_ir_adc_result_mux = portMUX_INITIALIZER_UNLOCKED;
 IrAdcWindowResult g_latest_ir_adc_result{};
 std::uint16_t g_ir_adc_samples[kIrAdcSamplesPerWindow]{};
@@ -138,6 +157,51 @@ bool irAdcConfigComplete() {
 
 bool irSwitchConfigComplete() {
   return gpioAssigned(kIrFrequencySelectGpio);
+}
+
+bool solarPanelLimitSwitchesConfigComplete() {
+  return gpioAssigned(kSolarLimitBackRightSideGpio) &&
+         gpioAssigned(kSolarLimitFrontRightSideGpio);
+}
+
+bool sideLineSensorConfigComplete() {
+  return gpioAssigned(kSideLineSensorGpio);
+}
+
+void initializeSolarPanelLimitSwitches() {
+  if (!solarPanelLimitSwitchesConfigComplete()) {
+    return;
+  }
+  pinMode(kSolarLimitBackRightSideGpio, INPUT);
+  pinMode(kSolarLimitFrontRightSideGpio, INPUT);
+}
+
+SolarPanelLimitSwitchReading readSolarPanelLimitSwitches() {
+  SolarPanelLimitSwitchReading reading{};
+  reading.configured = solarPanelLimitSwitchesConfigComplete();
+  if (!reading.configured) {
+    return reading;
+  }
+  reading.back_right_high =
+      digitalRead(kSolarLimitBackRightSideGpio) == HIGH;
+  reading.front_right_high =
+      digitalRead(kSolarLimitFrontRightSideGpio) == HIGH;
+  return reading;
+}
+
+void initializeSideLineSensor() {
+  if (sideLineSensorConfigComplete()) {
+    pinMode(kSideLineSensorGpio, INPUT);
+  }
+}
+
+SideLineSensorReading readSideLineSensor() {
+  SideLineSensorReading reading{};
+  reading.configured = sideLineSensorConfigComplete();
+  if (reading.configured) {
+    reading.raw_high = digitalRead(kSideLineSensorGpio) == HIGH;
+  }
+  return reading;
 }
 
 std::uint16_t clampAdcSample(const int sample) {
@@ -437,17 +501,16 @@ class RearCommandLink {
       return false;
     }
 
-    bool received = false;
     while (Serial1.available() > 0) {
       const robot::UartFrameParserStatus status =
           parser_.push(static_cast<std::uint8_t>(Serial1.read()), packet);
       if (status == robot::UartFrameParserStatus::PacketReady) {
-        received = true;
+        return true;
       } else if (status == robot::UartFrameParserStatus::InvalidFrame) {
         invalid_frame_seen_ = true;
       }
     }
-    return received;
+    return false;
   }
 
   bool consumeInvalidFrameSeen() {
@@ -482,7 +545,9 @@ class RearCommandLink {
 void publishEsp1Status(RearCommandLink& link,
                        const DualPwmMotorOutput& back_left,
                        const DualPwmMotorOutput& back_right,
+                       const DualPwmMotorOutput& funnel_motor,
                        const robot::RearDriveStatus& rear_status,
+                       const robot::FunnelStatus& funnel_status,
                        const robot::Milliseconds now_ms) {
   static robot::Milliseconds last_publish_ms = 0U;
   static std::uint16_t sequence = 0U;
@@ -495,10 +560,13 @@ void publishEsp1Status(RearCommandLink& link,
   robot::Esp1StatusReport report{};
   report.uptime_ms = now_ms;
   report.mode = robot::RobotTestMode::Disabled;
-  report.fault_active = !rear_status.link_healthy &&
-                        rear_status.has_valid_command &&
-                        rear_status.command_age_ms >
-                            robot::kDefaultCommunicationTimeoutMs;
+  const bool rear_stale = !rear_status.link_healthy &&
+                          rear_status.has_valid_command &&
+                          rear_status.command_age_ms >
+                              robot::kDefaultCommunicationTimeoutMs;
+  const bool funnel_stale = robot::enabledFunnelCommandIsStale(
+      funnel_status, robot::kDefaultCommunicationTimeoutMs);
+  report.fault_active = rear_stale || funnel_stale;
   report.fault_code = report.fault_active
                           ? robot::FaultCode::CommunicationStale
                           : robot::FaultCode::None;
@@ -506,6 +574,20 @@ void publishEsp1Status(RearCommandLink& link,
       back_left.lastAppliedCommand().duty_command_milli;
   report.back_right_applied_command_milli =
       back_right.lastAppliedCommand().duty_command_milli;
+  report.funnel_applied_command_milli =
+      funnel_motor.lastAppliedCommand().duty_command_milli;
+  report.funnel_configured = funnel_motor.configured();
+  const SolarPanelLimitSwitchReading solar_limits =
+      readSolarPanelLimitSwitches();
+  report.solar_panel_limit_switches_configured =
+      solar_limits.configured;
+  report.solar_limit_back_right_high =
+      solar_limits.back_right_high;
+  report.solar_limit_front_right_high =
+      solar_limits.front_right_high;
+  const SideLineSensorReading side_line = readSideLineSensor();
+  report.side_line_sensor_configured = side_line.configured;
+  report.side_line_sensor_high = side_line.raw_high;
   report.ir_adc_average = ir.average;
   report.ir_adc_min = ir.minimum;
   report.ir_adc_max = ir.maximum;
@@ -650,12 +732,18 @@ void rearDriveTask(void* parameters) {
       robot::esp1::kHardwareConfig.back_left_motor};
   DualPwmMotorOutput back_right_motor{
       robot::esp1::kHardwareConfig.back_right_motor};
+  DualPwmMotorOutput funnel_motor{
+      robot::esp1::kHardwareConfig.funnel_motor};
   RearCommandLink link{robot::esp1::kHardwareConfig.uart_to_esp2};
   robot::RearDriveCommandReceiver receiver{};
+  robot::FunnelCommandReceiver funnel_receiver{};
 
   back_left_motor.initializeDisabled();
   back_right_motor.initializeDisabled();
+  funnel_motor.initializeDisabled();
   link.initialize();
+  initializeSolarPanelLimitSwitches();
+  initializeSideLineSensor();
 
   TickType_t last_wake_tick = xTaskGetTickCount();
 
@@ -663,20 +751,33 @@ void rearDriveTask(void* parameters) {
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
 
-    robot::UartPacket packet{};
-    if (link.receive(packet)) {
-      receiver.acceptPacket(packet, now_ms);
+    for (std::uint8_t packet_index = 0U;
+         packet_index < kMaxUartPacketsPerCycle; ++packet_index) {
+      robot::UartPacket packet{};
+      if (!link.receive(packet)) {
+        break;
+      }
+      if (packet.header.message_type == robot::UartMessageType::RearWheelCommand) {
+        receiver.acceptPacket(packet, now_ms);
+      } else if (packet.header.message_type ==
+                 robot::UartMessageType::MechanismCommand) {
+        funnel_receiver.acceptPacket(packet, now_ms);
+      }
     }
     if (link.consumeInvalidFrameSeen()) {
+      robot::UartPacket packet{};
       receiver.acceptPacket(packet, now_ms);
+      funnel_receiver.acceptPacket(packet, now_ms);
     }
 
     back_left_motor.apply(receiver.backLeftCommand(now_ms));
     back_right_motor.apply(receiver.backRightCommand(now_ms));
+    funnel_motor.apply(funnel_receiver.motorCommand(now_ms));
 
     const robot::RearDriveStatus rear_status = receiver.status(now_ms);
-    publishEsp1Status(link, back_left_motor, back_right_motor, rear_status,
-                      now_ms);
+    const robot::FunnelStatus funnel_status = funnel_receiver.status(now_ms);
+    publishEsp1Status(link, back_left_motor, back_right_motor, funnel_motor,
+                      rear_status, funnel_status, now_ms);
     printRearStatus(rear_status, back_left_motor, back_right_motor, link,
                     now_ms);
     printIrDebugLine(back_left_motor, back_right_motor, now_ms);

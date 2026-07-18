@@ -9,13 +9,19 @@
 
 namespace robot {
 
-constexpr std::uint16_t kEsp1StatusPayloadSize = 36U;
+constexpr std::uint16_t kEsp1StatusPayloadSize = 39U;
 constexpr std::uint8_t kEsp1StatusFaultActiveFlag = 0x01U;
 constexpr std::uint8_t kEsp1StatusBackLeftInvertedFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusBackRightInvertedFlag = 0x04U;
 constexpr std::uint8_t kEsp1StatusIrBeaconDetectedFlag = 0x08U;
 constexpr std::uint8_t kEsp1StatusIrSwitchRawHighFlag = 0x10U;
 constexpr std::uint8_t kEsp1StatusIrSwitchDebouncedHighFlag = 0x20U;
+constexpr std::uint8_t kEsp1StatusFunnelConfiguredFlag = 0x40U;
+constexpr std::uint8_t kEsp1StatusSolarLimitConfiguredFlag = 0x01U;
+constexpr std::uint8_t kEsp1StatusSolarLimitBackRightHighFlag = 0x02U;
+constexpr std::uint8_t kEsp1StatusSolarLimitFrontRightHighFlag = 0x04U;
+constexpr std::uint8_t kEsp1StatusSideLineConfiguredFlag = 0x08U;
+constexpr std::uint8_t kEsp1StatusSideLineHighFlag = 0x10U;
 
 struct Esp1StatusReport {
   Milliseconds uptime_ms{0};
@@ -26,6 +32,13 @@ struct Esp1StatusReport {
   std::int16_t back_right_applied_command_milli{0};
   bool back_left_inverted{false};
   bool back_right_inverted{false};
+  std::int16_t funnel_applied_command_milli{0};
+  bool funnel_configured{false};
+  bool solar_panel_limit_switches_configured{false};
+  bool solar_limit_back_right_high{false};
+  bool solar_limit_front_right_high{false};
+  bool side_line_sensor_configured{false};
+  bool side_line_sensor_high{false};
   std::uint16_t ir_adc_average{0};
   std::uint16_t ir_adc_min{0};
   std::uint16_t ir_adc_max{0};

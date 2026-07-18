@@ -18,15 +18,15 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | `USECHO1` | TODO | TODO |
 | `USTRIG2` | TODO | TODO |
 | `USECHO2` | TODO | TODO |
-| `LSS` | TODO | TODO |
+| `LSS` | 4 | Digital comparator, HIGH = black tape |
 | `LSBL` | TODO | TODO |
 | `LSBR` | TODO | TODO |
 | `PWMBL0` | TODO | TODO |
 | `PWMBL1` | TODO | TODO |
 | `PWMBR0` | TODO | TODO |
 | `PWMBR1` | TODO | TODO |
-| `PWMFunnel0` | TODO | TODO |
-| `PWMFunnel1` | TODO | TODO |
+| `PWMFunnel0` | 5 | PWM resource / active direction TODO |
+| `PWMFunnel1` | 6 | PWM resource / active direction TODO |
 | `LimitSwitchBackRightSide` | TODO | TODO |
 | `LimitSwitchFrontRightSide` | TODO | TODO |
 | UART TX to ESP2 | TODO | TODO |
@@ -38,6 +38,7 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | --- | --- | --- | --- | --- | --- | --- |
 | Back-left | TODO | TODO | TODO | TODO | TODO | TODO |
 | Back-right | TODO | TODO | TODO | TODO | TODO | TODO |
+| Funnel | TODO | TODO | TODO | TODO | TODO | TODO |
 
 ESP1 `maximum_safe_test_duty`: `1.0` for drive testing.
 ESP1 UART baud rate: TODO.
