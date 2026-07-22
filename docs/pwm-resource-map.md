@@ -16,15 +16,17 @@ frequency requirements, and any library constraints.
 | ESP1 | Funnel motor | `PWMFunnel0`, `PWMFunnel1` | TODO |
 | ESP2 | Front-left motor | `PWMFL0`, `PWMFL1` | TODO |
 | ESP2 | Front-right motor | `PWMFR0`, `PWMFR1` | TODO |
-| ESP2 | Servos | `MSCLAW1`, `MSCLAW2`, `MSCLAW3`, `PusherServo`, `WinchServo` | TODO |
+| ESP2 | Claw servos | `MSCLAW1`, `MSCLAW2`, `MSCLAW3` | LEDC 4–6, 50 Hz, 12-bit |
+| ESP2 | Winch servo | `WinchServo` GPIO6 | LEDC 7, 50 Hz, 12-bit |
+| ESP2 | Pusher servo | `PusherServo` | TODO |
 
 Firmware now provides dual-PWM motor adapters, but they refuse to initialize
 unless each motor has GPIOs, LEDC channels, PWM frequency, PWM resolution,
 H-bridge mode, and `forward_sign` configured in the owning ESP's `PinConfig.h`.
-The ESP2 claw servo adapter also refuses movement until each claw has GPIO,
-LEDC channel, PWM frequency, resolution, and safe pulse range configured. Claw
-GPIOs are known (`MSCLAW1` GPIO14, `MSCLAW2` GPIO13, `MSCLAW3` GPIO12), but PWM
-resource allocation and pulse ranges remain TODO.
+The ESP2 servo adapter refuses movement until each output has a GPIO, LEDC
+channel, PWM frequency, resolution, and safe pulse range configured. The winch
+uses GPIO6 and LEDC channel 7 with the same 50 Hz, 12-bit, 1000–2000 µs setup as
+the three claws.
 
 ## Review Questions
 

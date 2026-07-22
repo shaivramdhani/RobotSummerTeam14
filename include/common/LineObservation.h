@@ -50,6 +50,9 @@ LineObservation observeDigitalLineSensors(bool left_black, bool right_black,
 LineObservation observeDigitalLineSensorLevels(
     bool left_electrical_high, bool right_electrical_high,
     std::int8_t previous_last_known_side, Milliseconds timestamp_ms);
+LineObservation observeRearLineSensorsForReverseTravel(
+    bool back_left_black, bool back_right_black,
+    std::int8_t previous_last_known_side, Milliseconds timestamp_ms);
 LineObservation observeFrontLine(const FrontLineSensorSnapshot& snapshot);
 
 }  // namespace robot

@@ -100,14 +100,15 @@ void appendClaw(JsonWriter& writer, const char* name,
                 const ServoClawTelemetry& claw,
                 const bool trailing_comma) {
   writer.append("\"%s\":{\"hardwareConfigured\":%s,"
-                "\"startConfigured\":%s,\"outputEnabled\":%s,"
-                "\"startAngleDeg\":%d,\"openAngleDeg\":%d,"
-                "\"openDirection\":%d,\"commandedAngleDeg\":%d,"
+                "\"openConfigured\":%s,\"closedConfigured\":%s,"
+                "\"outputEnabled\":%s,\"openAngleDeg\":%d,"
+                "\"closedAngleDeg\":%d,\"commandedAngleDeg\":%d,"
                 "\"commandedOpen\":%s}%s",
                 name, jsonBool(claw.hardware_configured),
-                jsonBool(claw.start_configured),
-                jsonBool(claw.output_enabled), claw.start_angle_deg,
-                claw.open_angle_deg, claw.open_direction,
+                jsonBool(claw.open_configured),
+                jsonBool(claw.closed_configured),
+                jsonBool(claw.output_enabled), claw.open_angle_deg,
+                claw.closed_angle_deg,
                 claw.commanded_angle_deg, jsonBool(claw.commanded_open),
                 trailing_comma ? "," : "");
 }
@@ -198,6 +199,35 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 static_cast<int>(snapshot.last_known_line_side),
                 jsonBool(snapshot.line_follower_enabled));
 
+  writer.append(
+      ",\"rear_line\":{\"lsbl_raw_level\":%d,\"lsbr_raw_level\":%d,"
+      "\"lsbl_level\":\"%s\",\"lsbr_level\":\"%s\","
+      "\"lsbl_black\":%s,\"lsbr_black\":%s,\"configured\":%s,"
+      "\"data_fresh\":%s,\"sequence\":%u,\"sample_age_ms\":%u,"
+      "\"captured_at_ms\":%u,\"line_error\":%d,"
+      "\"line_visible\":%s,\"has_history\":%s,\"hasHistory\":%s,"
+      "\"last_known_line_side\":%d,\"line_follower_enabled\":%s,"
+      "\"logical_left_source\":\"LSBR\","
+      "\"logical_right_source\":\"LSBL\","
+      "\"logical_left_black\":%s,\"logical_right_black\":%s}",
+      snapshot.lsbl_raw_level, snapshot.lsbr_raw_level,
+      digitalLevelName(snapshot.lsbl_raw_level),
+      digitalLevelName(snapshot.lsbr_raw_level),
+      jsonBool(snapshot.lsbl_black), jsonBool(snapshot.lsbr_black),
+      jsonBool(snapshot.rear_line_configured),
+      jsonBool(snapshot.rear_line_data_fresh),
+      static_cast<unsigned>(snapshot.rear_line_sequence),
+      static_cast<unsigned>(snapshot.rear_line_sample_age_ms),
+      static_cast<unsigned>(snapshot.rear_line_captured_at_ms),
+      static_cast<int>(snapshot.rear_line_error),
+      jsonBool(snapshot.rear_line_visible),
+      jsonBool(snapshot.rear_line_has_history),
+      jsonBool(snapshot.rear_line_has_history),
+      static_cast<int>(snapshot.rear_last_known_line_side),
+      jsonBool(snapshot.rear_line_follower_enabled),
+      jsonBool(snapshot.rear_logical_left_black),
+      jsonBool(snapshot.rear_logical_right_black));
+
   writer.append(",\"pid\":{\"kp\":%.5f,\"ki\":%.5f,\"kd\":%.5f,"
                 "\"baseDuty\":%.5f,\"maxDuty\":%.5f,"
                 "\"maximumDuty\":%.5f,\"maxCorrection\":%.5f,"
@@ -218,6 +248,30 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 jsonBool(snapshot.line_telemetry_enabled), snapshot.pid_p_term,
                 snapshot.pid_i_term, snapshot.pid_d_term,
                 snapshot.pid_correction);
+
+  writer.append(
+      ",\"rear_pid\":{\"kp\":%.5f,\"ki\":%.5f,\"kd\":%.5f,"
+      "\"baseDuty\":%.5f,\"effectiveBaseDuty\":%.5f,"
+      "\"maxDuty\":%.5f,\"maximumDuty\":%.5f,"
+      "\"maxCorrection\":%.5f,\"maximumCorrection\":%.5f,"
+      "\"integralLimit\":%.5f,\"derivativeLimit\":%.5f,"
+      "\"derivativeFilterAlpha\":%.5f,\"steeringPolarity\":%d,"
+      "\"controlPeriodMs\":%u,\"remoteCommandTimeoutMs\":%u,"
+      "\"telemetryEnabled\":%s,\"p_term\":%.5f,\"i_term\":%.5f,"
+      "\"d_term\":%.5f,\"correction\":%.5f}",
+      snapshot.rear_kp, snapshot.rear_ki, snapshot.rear_kd,
+      snapshot.rear_base_duty, snapshot.rear_effective_base_duty,
+      snapshot.rear_maximum_duty, snapshot.rear_maximum_duty,
+      snapshot.rear_maximum_correction,
+      snapshot.rear_maximum_correction, snapshot.rear_integral_limit,
+      snapshot.rear_derivative_limit,
+      snapshot.rear_derivative_filter_alpha,
+      snapshot.rear_steering_polarity,
+      static_cast<unsigned>(snapshot.rear_control_period_ms),
+      static_cast<unsigned>(snapshot.rear_remote_command_timeout_ms),
+      jsonBool(snapshot.rear_line_telemetry_enabled),
+      snapshot.rear_pid_p_term, snapshot.rear_pid_i_term,
+      snapshot.rear_pid_d_term, snapshot.rear_pid_correction);
 
   writer.append(",\"autonomous_state\":\"%s\",",
                 solarPanelAutonomyStateName(snapshot.autonomous_state));
@@ -248,6 +302,11 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"retry_strafe_left_duration_ms\":%u,"
                 "\"retry_forward_duration_ms\":%u,"
                 "\"retry_strafe_timeout_ms\":%u,"
+                "\"post_contact_forward_duration_ms\":%u,"
+                "\"line_reacquire_strafe_duty\":%.5f,"
+                "\"post_contact_forward_start_delay_ms\":%u,"
+                "\"line_reacquire_strafe_start_delay_ms\":%u,"
+                "\"post_contact_forward_duty\":%.5f,"
                 "\"limit_switches\":{\"configured\":%s,"
                 "\"back_right_high\":%s,\"front_right_high\":%s,"
                 "\"back_right_hit\":%s,\"front_right_hit\":%s,"
@@ -299,6 +358,14 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                     snapshot.solar_retry_forward_duration_ms),
                 static_cast<unsigned>(
                     snapshot.solar_retry_strafe_timeout_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_post_contact_forward_duration_ms),
+                snapshot.solar_line_reacquire_strafe_duty,
+                static_cast<unsigned>(
+                    snapshot.solar_post_contact_forward_start_delay_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_line_reacquire_strafe_start_delay_ms),
+                snapshot.solar_post_contact_forward_duty,
                 jsonBool(
                     snapshot.solar_panel_limit_switches_configured),
                 jsonBool(snapshot.solar_limit_back_right_high),
@@ -318,6 +385,60 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 jsonBool(snapshot.solar_limit_back_right_hit),
                 jsonBool(snapshot.solar_limit_front_right_hit),
                 jsonBool(snapshot.solar_limit_all_hit));
+
+  writer.append(
+      ",\"tower_pieces\":{\"state\":\"%s\","
+      "\"fault_reason\":\"%s\",\"time_in_state_ms\":%u,"
+      "\"reverse_line_duty\":%.5f,\"side_line_timeout_ms\":%u,"
+      "\"post_line_delay_ms\":%u,\"strafe_right_duty\":%.5f,"
+      "\"strafe_right_duration_ms\":%u,"
+      "\"post_strafe_pause_ms\":%u,"
+      "\"clockwise_rotation_duty\":%.5f,"
+      "\"clockwise_rotation_duration_ms\":%u,"
+      "\"post_rotation_pause_ms\":%u,"
+      "\"reverse_duty\":%.5f,\"reverse_duration_ms\":%u,"
+      "\"shimmy_duty\":%.5f,"
+      "\"shimmy_right_duration_ms\":%u,"
+      "\"shimmy_left_duration_ms\":%u,"
+      "\"shimmy_timeout_ms\":%u,"
+      "\"side_line_count\":%u,\"target_side_line_count\":%u,"
+      "\"side_line_sensor_configured\":%s,"
+      "\"side_line_sensor_high\":%s,\"line_following\":%s,"
+      "\"strafing_right\":%s,\"rotating_clockwise\":%s,"
+      "\"driving_backward\":%s,\"shimmying_left\":%s,"
+      "\"shimmying_right\":%s,\"back_line_detected\":%s}",
+      towerPiecesStateName(snapshot.tower_pieces_state),
+      towerPiecesFaultReasonName(snapshot.tower_pieces_fault_reason),
+      static_cast<unsigned>(snapshot.tower_pieces_time_in_state_ms),
+      snapshot.tower_pieces_reverse_line_duty,
+      static_cast<unsigned>(snapshot.tower_pieces_side_line_timeout_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_line_delay_ms),
+      snapshot.tower_pieces_strafe_right_duty,
+      static_cast<unsigned>(snapshot.tower_pieces_strafe_right_duration_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_strafe_pause_ms),
+      snapshot.tower_pieces_clockwise_rotation_duty,
+      static_cast<unsigned>(
+          snapshot.tower_pieces_clockwise_rotation_duration_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_rotation_pause_ms),
+      snapshot.tower_pieces_reverse_duty,
+      static_cast<unsigned>(snapshot.tower_pieces_reverse_duration_ms),
+      snapshot.tower_pieces_shimmy_duty,
+      static_cast<unsigned>(
+          snapshot.tower_pieces_shimmy_right_duration_ms),
+      static_cast<unsigned>(
+          snapshot.tower_pieces_shimmy_left_duration_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_shimmy_timeout_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_side_line_count),
+      static_cast<unsigned>(snapshot.tower_pieces_target_side_line_count),
+      jsonBool(snapshot.tower_pieces_side_line_sensor_configured),
+      jsonBool(snapshot.tower_pieces_side_line_sensor_high),
+      jsonBool(snapshot.tower_pieces_line_following),
+      jsonBool(snapshot.tower_pieces_strafing_right),
+      jsonBool(snapshot.tower_pieces_rotating_clockwise),
+      jsonBool(snapshot.tower_pieces_driving_backward),
+      jsonBool(snapshot.tower_pieces_shimmying_left),
+      jsonBool(snapshot.tower_pieces_shimmying_right),
+      jsonBool(snapshot.tower_pieces_back_line_detected));
 
   writer.append(",\"motors\":{");
   appendMotor(writer, "front_left", snapshot.front_left, true);
@@ -371,10 +492,11 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 jsonBool(snapshot.esp1.side_line_sensor_configured),
                 jsonBool(snapshot.esp1.side_line_sensor_high));
 
-  writer.append(",\"claws\":{\"rotation_deg\":%d,", snapshot.claws.rotation_deg);
+  writer.append(",\"claws\":{");
   appendClaw(writer, "claw_1", snapshot.claws.claw_1, true);
   appendClaw(writer, "claw_2", snapshot.claws.claw_2, true);
-  appendClaw(writer, "claw_3", snapshot.claws.claw_3, false);
+  appendClaw(writer, "claw_3", snapshot.claws.claw_3, true);
+  appendClaw(writer, "winch", snapshot.claws.winch, false);
   writer.append("}");
 
   writer.append(",\"selectedBeaconFrequencyHz\":%u,"

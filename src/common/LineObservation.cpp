@@ -88,6 +88,16 @@ LineObservation observeDigitalLineSensorLevels(
                                    previous_last_known_side, timestamp_ms);
 }
 
+LineObservation observeRearLineSensorsForReverseTravel(
+    const bool back_left_black, const bool back_right_black,
+    const std::int8_t previous_last_known_side,
+    const Milliseconds timestamp_ms) {
+  // In the reverse travel frame, the physical back-right sensor is on the
+  // traveler's left and the physical back-left sensor is on its right.
+  return observeDigitalLineSensors(back_right_black, back_left_black,
+                                   previous_last_known_side, timestamp_ms);
+}
+
 LineObservation observeFrontLine(const FrontLineSensorSnapshot& snapshot) {
   if (!snapshot.valid || snapshot.left == LineSample::Unknown ||
       snapshot.right == LineSample::Unknown) {

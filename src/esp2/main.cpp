@@ -21,10 +21,12 @@
 #include "common/LineSensor.h"
 #include "common/MotorOutput.h"
 #include "common/RearDriveCommand.h"
+#include "common/RearLineSensor.h"
 #include "common/RobotCommandValidation.h"
 #include "common/RobotTestModeManager.h"
 #include "common/SolarPanelAutonomy.h"
 #include "common/TelemetrySnapshot.h"
+#include "common/TowerPiecesAutonomy.h"
 #include "common/UartProtocol.h"
 #include "esp2/MechanismControllers.h"
 #include "esp2/PinConfig.h"
@@ -45,16 +47,18 @@ constexpr BaseType_t kTaskCore = 1;
 constexpr std::size_t kSerialCommandBufferSize = 128U;
 constexpr std::size_t kJsonBufferSize = 8192U;
 constexpr std::size_t kClawServoCount = 3U;
+constexpr std::size_t kMechanismServoCount = 4U;
+constexpr std::size_t kWinchServoIndex = 3U;
 constexpr int kClawServoUnsetAngleDeg = -1;
-constexpr int kClawServoRotationDeg = 90;
+constexpr int kLegacyClawServoRotationDeg = 90;
 
 // Solar-panel first-stage tuning. TEMPORARY DEFAULTS: tune with the real
 // beacon, sensor, lighting, and motors running before driving at speed.
 constexpr std::uint32_t kIrBeaconFrequency1Khz = 1000U;
 constexpr std::uint32_t kIrBeaconFrequency10Khz = 10000U;
 constexpr std::uint16_t IR_BEACON_DETECT_THRESHOLD_1KHZ = 15U;
-constexpr std::uint16_t IR_BEACON_RELEASE_THRESHOLD_1KHZ = 8U;
-constexpr std::uint16_t IR_BEACON_DETECT_THRESHOLD_10KHZ = 10U;
+constexpr std::uint16_t IR_BEACON_RELEASE_THRESHOLD_1KHZ = 10U;
+constexpr std::uint16_t IR_BEACON_DETECT_THRESHOLD_10KHZ = 12U;
 constexpr std::uint16_t IR_BEACON_RELEASE_THRESHOLD_10KHZ = 6U;
 constexpr robot::Milliseconds IR_BEACON_CONFIRM_TIME_MS = 50U;
 constexpr float IR_FILTER_ALPHA = 0.5F;
@@ -62,17 +66,23 @@ constexpr robot::Milliseconds IR_IGNORE_AFTER_START_MS = 7000U;
 constexpr robot::Milliseconds SOLAR_SEARCH_TIMEOUT_MS = 13000U;
 constexpr float SOLAR_START_BASE_DUTY = 0.3F;
 constexpr robot::Milliseconds SOLAR_SLOW_AFTER_MS = 7500U;
-constexpr float SOLAR_SLOW_BASE_DUTY = 0.1F;
+constexpr float SOLAR_SLOW_BASE_DUTY = 0.12F;
 constexpr robot::Milliseconds SOLAR_CONTACT_TIMEOUT_MS =
     SOLAR_SEARCH_TIMEOUT_MS;
 constexpr float SOLAR_CONTACT_STRAFE_DUTY = SOLAR_SLOW_BASE_DUTY;
 constexpr robot::Milliseconds SOLAR_STRAFE_START_DELAY_MS = 300U;
 // TODO(team): tune both adjustment durations on the real robot. Zero keeps the
 // new motion phases disabled until values are applied through telemetry.
-constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_LEFT_DURATION_MS = 0U;
-constexpr robot::Milliseconds SOLAR_RETRY_FORWARD_DURATION_MS = 0U;
+constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_LEFT_DURATION_MS = 300U;
+constexpr robot::Milliseconds SOLAR_RETRY_FORWARD_DURATION_MS = 150U;
 constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_TIMEOUT_MS =
     SOLAR_CONTACT_TIMEOUT_MS;
+constexpr robot::Milliseconds SOLAR_POST_CONTACT_FORWARD_DURATION_MS = 1300U;
+constexpr float SOLAR_LINE_REACQUIRE_STRAFE_DUTY =
+    SOLAR_CONTACT_STRAFE_DUTY;
+constexpr robot::Milliseconds SOLAR_POST_CONTACT_FORWARD_START_DELAY_MS = 500U;
+constexpr robot::Milliseconds SOLAR_LINE_REACQUIRE_STRAFE_START_DELAY_MS = 500U;
+constexpr float SOLAR_POST_CONTACT_FORWARD_DUTY = SOLAR_CONTACT_STRAFE_DUTY;
 // Team wiring report: raw HIGH means the solar side switch has been hit.
 constexpr bool SOLAR_LIMIT_SWITCH_HIT_WHEN_HIGH = true;
 constexpr robot::SolarPanelAutonomyConfig kSolarPanelAutonomyConfig{
@@ -85,7 +95,12 @@ constexpr robot::SolarPanelContactConfig kSolarPanelContactConfig{
     SOLAR_STRAFE_START_DELAY_MS,
     SOLAR_RETRY_STRAFE_LEFT_DURATION_MS,
     SOLAR_RETRY_FORWARD_DURATION_MS,
-    SOLAR_RETRY_STRAFE_TIMEOUT_MS};
+    SOLAR_RETRY_STRAFE_TIMEOUT_MS,
+    SOLAR_POST_CONTACT_FORWARD_DURATION_MS,
+    SOLAR_LINE_REACQUIRE_STRAFE_DUTY,
+    SOLAR_POST_CONTACT_FORWARD_START_DELAY_MS,
+    SOLAR_LINE_REACQUIRE_STRAFE_START_DELAY_MS,
+    SOLAR_POST_CONTACT_FORWARD_DUTY};
 
 static_assert(IR_BEACON_RELEASE_THRESHOLD_1KHZ <=
                   IR_BEACON_DETECT_THRESHOLD_1KHZ,
@@ -111,6 +126,12 @@ static_assert(SOLAR_STRAFE_START_DELAY_MS > 0U,
               "solar strafe start delay must be nonzero");
 static_assert(SOLAR_RETRY_STRAFE_TIMEOUT_MS > 0U,
               "solar retry strafe timeout must be nonzero");
+static_assert(SOLAR_LINE_REACQUIRE_STRAFE_DUTY >= 0.0F &&
+                  SOLAR_LINE_REACQUIRE_STRAFE_DUTY <= 1.0F,
+              "solar line-reacquire strafe duty must be in [0, 1]");
+static_assert(SOLAR_POST_CONTACT_FORWARD_DUTY >= 0.0F &&
+                  SOLAR_POST_CONTACT_FORWARD_DUTY <= 1.0F,
+              "solar post-contact forward duty must be in [0, 1]");
 
 WebServer g_server{80};
 char g_json_buffer[kJsonBufferSize]{};
@@ -465,11 +486,32 @@ class RearCommandLink {
       const robot::UartFrameParserStatus status =
           parser_.push(static_cast<std::uint8_t>(Serial1.read()), packet);
       if (status == robot::UartFrameParserStatus::PacketReady) {
-        robot::Esp1StatusReport report{};
-        if (robot::decodeEsp1StatusPacket(packet, report)) {
-          latest_status_ = report;
-          last_status_received_at_ms_ = now_ms;
-          status_available_ = true;
+        if (packet.header.message_type ==
+            robot::UartMessageType::HealthReport) {
+          robot::Esp1StatusReport report{};
+          if (robot::decodeEsp1StatusPacket(packet, report)) {
+            latest_status_ = report;
+            last_status_received_at_ms_ = now_ms;
+            status_available_ = true;
+          } else {
+            ++packet_error_count_;
+          }
+        } else if (packet.header.message_type ==
+                   robot::UartMessageType::SensorSnapshot) {
+          robot::RearLineSensorSnapshot snapshot{};
+          if (robot::decodeRearLineSensorPacket(packet, snapshot)) {
+            if (rear_line_snapshot_available_ &&
+                packet.header.sequence == last_rear_line_sequence_) {
+              ++packet_error_count_;
+            } else {
+              latest_rear_line_snapshot_ = snapshot;
+              last_rear_line_sequence_ = packet.header.sequence;
+              last_rear_line_received_at_ms_ = now_ms;
+              rear_line_snapshot_available_ = true;
+            }
+          } else {
+            ++packet_error_count_;
+          }
         } else {
           ++packet_error_count_;
         }
@@ -500,6 +542,23 @@ class RearCommandLink {
   const robot::Esp1StatusReport& latestStatus() const {
     return latest_status_;
   }
+  bool rearLineSnapshotAvailable() const {
+    return rear_line_snapshot_available_;
+  }
+  bool rearLineSnapshotFresh(const robot::Milliseconds now_ms,
+                             const robot::Milliseconds timeout_ms) const {
+    return configured_ && rear_line_snapshot_available_ &&
+           elapsedSince(now_ms, last_rear_line_received_at_ms_) <= timeout_ms;
+  }
+  const robot::RearLineSensorSnapshot& latestRearLineSnapshot() const {
+    return latest_rear_line_snapshot_;
+  }
+  robot::Milliseconds lastRearLineReceivedAtMs() const {
+    return last_rear_line_received_at_ms_;
+  }
+  std::uint16_t lastRearLineSequence() const {
+    return last_rear_line_sequence_;
+  }
 
  private:
   const robot::esp2::UartConfig& config_;
@@ -509,10 +568,14 @@ class RearCommandLink {
   bool configured_{false};
   bool healthy_{false};
   bool status_available_{false};
+  bool rear_line_snapshot_available_{false};
   robot::Milliseconds last_rear_sent_at_ms_{0};
   robot::Milliseconds last_status_received_at_ms_{0};
+  robot::Milliseconds last_rear_line_received_at_ms_{0};
   std::uint32_t packet_error_count_{0};
+  std::uint16_t last_rear_line_sequence_{0};
   robot::Esp1StatusReport latest_status_{};
+  robot::RearLineSensorSnapshot latest_rear_line_snapshot_{};
 };
 
 enum class ClawServoPositionRequest : std::uint8_t {
@@ -524,48 +587,51 @@ enum class ClawServoCommandResult : std::uint8_t {
   Accepted = 0,
   InvalidClaw = 1,
   HardwareUnconfigured = 2,
-  StartAngleUnset = 3,
-  StartAngleOutOfRange = 4,
-  DirectionInvalid = 5,
-  OpenAngleOutOfRange = 6,
+  OpenAngleUnset = 3,
+  ClosedAngleUnset = 4,
+  OpenAngleOutOfRange = 5,
+  ClosedAngleOutOfRange = 6,
 };
 
 struct ClawServoSettings {
-  std::array<int, kClawServoCount> start_angle_deg{
+  std::array<int, kMechanismServoCount> open_angle_deg{
       {kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg,
-       kClawServoUnsetAngleDeg}};
-  std::array<int, kClawServoCount> open_direction{{1, 1, 1}};
+       kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg}};
+  std::array<int, kMechanismServoCount> closed_angle_deg{
+      {kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg,
+       kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg}};
 };
 
 const char* clawServoResultReason(const ClawServoCommandResult result) {
   switch (result) {
     case ClawServoCommandResult::Accepted:
-      return "claw command accepted";
+      return "servo command accepted";
     case ClawServoCommandResult::InvalidClaw:
-      return "invalid claw id";
+      return "invalid servo id";
     case ClawServoCommandResult::HardwareUnconfigured:
-      return "claw PWM hardware is not configured";
-    case ClawServoCommandResult::StartAngleUnset:
-      return "claw start angle is not set";
-    case ClawServoCommandResult::StartAngleOutOfRange:
-      return "claw start angle must be 0..180 degrees";
-    case ClawServoCommandResult::DirectionInvalid:
-      return "claw direction must be 1 or -1";
+      return "servo PWM hardware is not configured";
+    case ClawServoCommandResult::OpenAngleUnset:
+      return "servo open angle is not set";
+    case ClawServoCommandResult::ClosedAngleUnset:
+      return "servo closed angle is not set";
     case ClawServoCommandResult::OpenAngleOutOfRange:
-      return "claw open angle must stay within 0..180 degrees";
+      return "servo open angle must be 0..180 degrees";
+    case ClawServoCommandResult::ClosedAngleOutOfRange:
+      return "servo closed angle must be 0..180 degrees";
   }
-  return "claw command rejected";
+  return "servo command rejected";
 }
 
 class ClawServoBank {
  public:
   ClawServoBank(const robot::esp2::ServoOutputConfig& claw_1,
                 const robot::esp2::ServoOutputConfig& claw_2,
-                const robot::esp2::ServoOutputConfig& claw_3)
-      : configs_{{&claw_1, &claw_2, &claw_3}} {}
+                const robot::esp2::ServoOutputConfig& claw_3,
+                const robot::esp2::ServoOutputConfig& winch)
+      : configs_{{&claw_1, &claw_2, &claw_3, &winch}} {}
 
   void initializeDisabled() {
-    for (std::size_t index = 0U; index < kClawServoCount; ++index) {
+    for (std::size_t index = 0U; index < kMechanismServoCount; ++index) {
       hardware_configured_[index] =
           servoOutputConfigComplete(*configs_[index]);
       if (hardware_configured_[index]) {
@@ -579,7 +645,7 @@ class ClawServoBank {
   }
 
   void disable() {
-    for (std::size_t index = 0U; index < kClawServoCount; ++index) {
+    for (std::size_t index = 0U; index < kMechanismServoCount; ++index) {
       disableOutput(index);
     }
   }
@@ -631,10 +697,10 @@ class ClawServoBank {
 
   void fillTelemetry(robot::ServoClawBankTelemetry& output) const {
     output = {};
-    output.rotation_deg = kClawServoRotationDeg;
     fillClawTelemetry(output.claw_1, 0U);
     fillClawTelemetry(output.claw_2, 1U);
     fillClawTelemetry(output.claw_3, 2U);
+    fillClawTelemetry(output.winch, kWinchServoIndex);
   }
 
  private:
@@ -646,30 +712,17 @@ class ClawServoBank {
     return angle_deg >= 0 && angle_deg <= 180;
   }
 
-  static bool directionValid(const int direction) {
-    return direction == 1 || direction == -1;
-  }
-
-  static int openAngle(const int start_angle_deg, const int direction) {
-    return start_angle_deg + (direction * kClawServoRotationDeg);
-  }
-
   static ClawServoCommandResult validateSettings(
       const ClawServoSettings& settings) {
-    for (std::size_t index = 0U; index < kClawServoCount; ++index) {
-      const int start_angle_deg = settings.start_angle_deg[index];
-      const int direction = settings.open_direction[index];
-      if (!directionValid(direction)) {
-        return ClawServoCommandResult::DirectionInvalid;
-      }
-      if (!angleConfigured(start_angle_deg)) {
-        continue;
-      }
-      if (!angleInRange(start_angle_deg)) {
-        return ClawServoCommandResult::StartAngleOutOfRange;
-      }
-      if (!angleInRange(openAngle(start_angle_deg, direction))) {
+    for (std::size_t index = 0U; index < kMechanismServoCount; ++index) {
+      const int open_angle_deg = settings.open_angle_deg[index];
+      const int closed_angle_deg = settings.closed_angle_deg[index];
+      if (angleConfigured(open_angle_deg) && !angleInRange(open_angle_deg)) {
         return ClawServoCommandResult::OpenAngleOutOfRange;
+      }
+      if (angleConfigured(closed_angle_deg) &&
+          !angleInRange(closed_angle_deg)) {
+        return ClawServoCommandResult::ClosedAngleOutOfRange;
       }
     }
     return ClawServoCommandResult::Accepted;
@@ -678,22 +731,25 @@ class ClawServoBank {
   ClawServoCommandResult targetAngle(
       const std::size_t index, const ClawServoPositionRequest request,
       int& target_angle_deg) const {
-    if (index >= kClawServoCount) {
+    if (index >= kMechanismServoCount) {
       return ClawServoCommandResult::InvalidClaw;
     }
     if (!hardware_configured_[index]) {
       return ClawServoCommandResult::HardwareUnconfigured;
     }
-    const int start_angle_deg = settings_.start_angle_deg[index];
-    if (!angleConfigured(start_angle_deg)) {
-      return ClawServoCommandResult::StartAngleUnset;
-    }
     target_angle_deg =
         request == ClawServoPositionRequest::Closed
-            ? start_angle_deg
-            : openAngle(start_angle_deg, settings_.open_direction[index]);
+            ? settings_.closed_angle_deg[index]
+            : settings_.open_angle_deg[index];
+    if (!angleConfigured(target_angle_deg)) {
+      return request == ClawServoPositionRequest::Closed
+                 ? ClawServoCommandResult::ClosedAngleUnset
+                 : ClawServoCommandResult::OpenAngleUnset;
+    }
     if (!angleInRange(target_angle_deg)) {
-      return ClawServoCommandResult::OpenAngleOutOfRange;
+      return request == ClawServoPositionRequest::Closed
+                 ? ClawServoCommandResult::ClosedAngleOutOfRange
+                 : ClawServoCommandResult::OpenAngleOutOfRange;
     }
     return ClawServoCommandResult::Accepted;
   }
@@ -731,7 +787,7 @@ class ClawServoBank {
   }
 
   void disableOutput(const std::size_t index) {
-    if (index >= kClawServoCount) {
+    if (index >= kMechanismServoCount) {
       return;
     }
     if (hardware_configured_[index]) {
@@ -746,28 +802,30 @@ class ClawServoBank {
 
   void fillClawTelemetry(robot::ServoClawTelemetry& output,
                          const std::size_t index) const {
-    const int start_angle_deg = settings_.start_angle_deg[index];
+    const int open_angle_deg = settings_.open_angle_deg[index];
+    const int closed_angle_deg = settings_.closed_angle_deg[index];
     output.hardware_configured = hardware_configured_[index];
-    output.start_configured = angleConfigured(start_angle_deg);
+    output.open_configured = angleConfigured(open_angle_deg);
+    output.closed_configured = angleConfigured(closed_angle_deg);
     output.output_enabled = output_enabled_[index];
-    output.start_angle_deg = start_angle_deg;
-    output.open_angle_deg =
-        output.start_configured
-            ? openAngle(start_angle_deg, settings_.open_direction[index])
-            : kClawServoUnsetAngleDeg;
-    output.open_direction = settings_.open_direction[index];
+    output.open_angle_deg = open_angle_deg;
+    output.closed_angle_deg = closed_angle_deg;
     output.commanded_angle_deg = commanded_angle_deg_[index];
     output.commanded_open = commanded_open_[index];
   }
 
-  std::array<const robot::esp2::ServoOutputConfig*, kClawServoCount> configs_;
+  std::array<const robot::esp2::ServoOutputConfig*, kMechanismServoCount>
+      configs_;
   ClawServoSettings settings_{};
-  std::array<bool, kClawServoCount> hardware_configured_{{false, false, false}};
-  std::array<bool, kClawServoCount> output_enabled_{{false, false, false}};
-  std::array<int, kClawServoCount> commanded_angle_deg_{
+  std::array<bool, kMechanismServoCount> hardware_configured_{
+      {false, false, false, false}};
+  std::array<bool, kMechanismServoCount> output_enabled_{
+      {false, false, false, false}};
+  std::array<int, kMechanismServoCount> commanded_angle_deg_{
       {kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg,
-       kClawServoUnsetAngleDeg}};
-  std::array<bool, kClawServoCount> commanded_open_{{false, false, false}};
+       kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg}};
+  std::array<bool, kMechanismServoCount> commanded_open_{
+      {false, false, false, false}};
 };
 
 struct SolarIrThresholds {
@@ -785,6 +843,7 @@ struct SolarLineFollowSpeedConfig {
 
 struct RuntimeContext {
   robot::LineFollowerConfig config{};
+  robot::LineFollowerConfig rear_config{};
   robot::LineFollowerState follower_state{};
   robot::RobotTestModeManager modes{};
   robot::EventLog events{};
@@ -792,7 +851,9 @@ struct RuntimeContext {
   robot::FourWheelCommand last_commanded_wheels{};
   robot::MotorCommand requested_funnel_command{};
   robot::LineFollowerUpdate last_update{};
+  robot::LineFollowerUpdate last_rear_update{};
   robot::LineObservation last_line_observation{};
+  robot::LineObservation last_rear_line_observation{};
   robot::SolarPanelAutonomyConfig solar_config{kSolarPanelAutonomyConfig};
   SolarIrThresholds solar_thresholds{};
   SolarLineFollowSpeedConfig solar_speed_config{};
@@ -804,6 +865,8 @@ struct RuntimeContext {
       robot::SolarPanelAutonomyState::WaitForStart};
   robot::SolarPanelFaultReason autonomous_fault_reason{
       robot::SolarPanelFaultReason::None};
+  robot::TowerPiecesConfig tower_pieces_config{};
+  robot::TowerPiecesAutonomy tower_pieces{};
   robot::Milliseconds autonomous_state_entered_at_ms{0};
   char command_buffer[kSerialCommandBufferSize]{};
   std::size_t command_length{0};
@@ -811,8 +874,10 @@ struct RuntimeContext {
   robot::Milliseconds mode_expires_at_ms{0};
   robot::Milliseconds last_command_ms{0};
   std::int8_t line_sensor_last_known_side{0};
+  std::int8_t rear_line_sensor_last_known_side{0};
   bool command_deadman_armed{false};
   bool solar_start_requested{false};
+  bool tower_pieces_start_requested{false};
   bool fault_active{false};
   robot::FaultCode fault_code{robot::FaultCode::None};
   char fault_message[robot::kTelemetryFaultMessageSize]{};
@@ -838,6 +903,23 @@ float hardwareDutyCap() {
 
 float activeMotionDutyCap(const RuntimeContext& context) {
   return clampFloat(context.config.maxDuty, 0.0F, hardwareDutyCap());
+}
+
+float rearMotionDutyCap(const RuntimeContext& context) {
+  return clampFloat(context.rear_config.maxDuty, 0.0F, hardwareDutyCap());
+}
+
+robot::LineFollowerConfig reverseRearLineFollowerConfig(
+    const RuntimeContext& context) {
+  return robot::makeReverseTravelLineFollowerConfig(context.rear_config);
+}
+
+robot::LineFollowerConfig towerPiecesLineFollowerConfig(
+    const RuntimeContext& context) {
+  robot::LineFollowerConfig config = context.rear_config;
+  config.baseDuty = clampFloat(context.tower_pieces_config.reverse_line_duty,
+                               0.0F, rearMotionDutyCap(context));
+  return robot::makeReverseTravelLineFollowerConfig(config);
 }
 
 robot::Milliseconds remoteStatusTimeoutMs(
@@ -960,6 +1042,12 @@ void resetSolarPanelAutonomy(RuntimeContext& context,
   context.solar_start_requested = false;
 }
 
+void resetTowerPieces(RuntimeContext& context,
+                      const robot::Milliseconds now_ms) {
+  robot::resetTowerPiecesAutonomy(context.tower_pieces, now_ms);
+  context.tower_pieces_start_requested = false;
+}
+
 void enterSolarPanelAutonomyState(
     RuntimeContext& context,
     const robot::SolarPanelAutonomyState state,
@@ -995,6 +1083,47 @@ robot::FourWheelCommand makeSolarStrafeRightCommand(
                                    context.config.remoteCommandTimeoutMs);
 }
 
+robot::FourWheelCommand makeTowerPiecesStrafeRightCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.tower_pieces_config.strafe_right_duty, 0.0F,
+                 rearMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(
+      1.0F, 0.0F, 0.0F, duty, now_ms,
+      context.rear_config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeTowerPiecesClockwiseRotationCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.tower_pieces_config.clockwise_rotation_duty, 0.0F,
+                 rearMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(
+      0.0F, 0.0F, 1.0F, duty, now_ms,
+      context.rear_config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeTowerPiecesBackwardCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.tower_pieces_config.reverse_duty, 0.0F,
+                 rearMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(
+      0.0F, -1.0F, 0.0F, duty, now_ms,
+      context.rear_config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeTowerPiecesShimmyCommand(
+    const RuntimeContext& context, const bool strafe_right,
+    const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.tower_pieces_config.shimmy_duty, 0.0F,
+                 rearMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(
+      strafe_right ? 1.0F : -1.0F, 0.0F, 0.0F, duty, now_ms,
+      context.rear_config.remoteCommandTimeoutMs);
+}
+
 robot::FourWheelCommand makeSolarStrafeLeftCommand(
     const RuntimeContext& context, const robot::Milliseconds now_ms) {
   const float duty =
@@ -1004,11 +1133,29 @@ robot::FourWheelCommand makeSolarStrafeLeftCommand(
                                    context.config.remoteCommandTimeoutMs);
 }
 
+robot::FourWheelCommand makeSolarLineReacquireStrafeLeftCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.solar_contact_config.line_reacquire_strafe_duty,
+                 0.0F, activeMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(-1.0F, 0.0F, 0.0F, duty, now_ms,
+                                   context.config.remoteCommandTimeoutMs);
+}
+
 robot::FourWheelCommand makeSolarForwardCommand(
     const RuntimeContext& context, const robot::Milliseconds now_ms) {
   const float duty =
       clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
                  activeMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(0.0F, 1.0F, 0.0F, duty, now_ms,
+                                   context.config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeSolarPostContactForwardCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const float duty =
+      clampFloat(context.solar_contact_config.post_contact_forward_duty,
+                 0.0F, activeMotionDutyCap(context));
   return robot::mixOpenLoopMecanum(0.0F, 1.0F, 0.0F, duty, now_ms,
                                    context.config.remoteCommandTimeoutMs);
 }
@@ -1078,6 +1225,7 @@ void emergencyStop(RuntimeContext& context, robot::IMotorOutput& front_left,
   context.modes.emergencyStop(now_ms);
   if (g_runtime.stepper != nullptr) g_runtime.stepper->stop();
   resetSolarPanelAutonomy(context, now_ms);
+  resetTowerPieces(context, now_ms);
   setFault(context, robot::FaultCode::None, "");
   logEvent(context, now_ms, robot::EventSeverity::Warn, source,
            "emergency stop requested");
@@ -1117,6 +1265,35 @@ bool startRequirementsMet(const DigitalFrontLineSensorReader& sensors,
          context.config.maxDuty > 0.0F && hardwareDutyCap() > 0.0F;
 }
 
+bool rearLineStartRequirementsMet(
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  return front_left.configured() && front_right.configured() &&
+         rear_link.configured() &&
+         rear_link.remoteStatusFresh(
+             now_ms, remoteStatusTimeoutMs(context.rear_config)) &&
+         rear_link.rearLineSnapshotFresh(
+             now_ms, context.rear_config.remoteCommandTimeoutMs) &&
+         rear_link.latestRearLineSnapshot().configured &&
+         context.rear_config.maxDuty > 0.0F && hardwareDutyCap() > 0.0F;
+}
+
+bool towerPiecesStartRequirementsMet(
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  return rearLineStartRequirementsMet(front_left, front_right, rear_link,
+                                      now_ms, context) &&
+         rear_link.latestRearLineSnapshot().side_configured &&
+         robot::towerPiecesConfigValid(context.tower_pieces_config,
+                                       rearMotionDutyCap(context));
+}
+
 bool solarPanelStartRequirementsMet(
     const DigitalFrontLineSensorReader& sensors,
     const DualPwmMotorOutput& front_left,
@@ -1126,7 +1303,10 @@ bool solarPanelStartRequirementsMet(
     const RuntimeContext& context) {
   return startRequirementsMet(sensors, front_left, front_right, rear_link,
                               now_ms, context) &&
-         solarPanelLimitSwitchesReady(rear_link, now_ms, context);
+         solarPanelLimitSwitchesReady(rear_link, now_ms, context) &&
+         rear_link.rearLineSnapshotFresh(
+             now_ms, context.rear_config.remoteCommandTimeoutMs) &&
+         rear_link.latestRearLineSnapshot().configured;
 }
 
 bool sendRearWheelCommand(RearCommandLink& rear_link,
@@ -1147,17 +1327,22 @@ bool applyWheelCommand(RuntimeContext& context,
                        robot::IMotorOutput& front_right,
                        RearCommandLink& rear_link,
                        const robot::FourWheelCommand& wheels,
+                       const robot::LineFollowerConfig& command_config,
                        const robot::Milliseconds now_ms) {
   context.last_commanded_wheels = wheels;
   front_left.apply(wheels.front_left);
   front_right.apply(wheels.front_right);
-  return sendRearWheelCommand(rear_link, wheels, context.config, now_ms);
+  return sendRearWheelCommand(rear_link, wheels, command_config, now_ms);
 }
 
 void printTelemetry(RuntimeContext& context,
                     const DigitalFrontLineSensorReader& sensors,
                     const RearCommandLink& rear_link,
                     robot::Milliseconds now_ms);
+
+void printRearTelemetry(RuntimeContext& context,
+                        const RearCommandLink& rear_link,
+                        robot::Milliseconds now_ms);
 
 void requestSolarPanelAutonomyStart(RuntimeContext& context,
                                     robot::IMotorOutput& front_left,
@@ -1172,6 +1357,307 @@ void requestSolarPanelAutonomyStart(RuntimeContext& context,
   clearFault(context);
   logEvent(context, now_ms, robot::EventSeverity::Info, source,
            "solar autonomy start requested");
+}
+
+void requestTowerPiecesStart(RuntimeContext& context,
+                             robot::IMotorOutput& front_left,
+                             robot::IMotorOutput& front_right,
+                             RearCommandLink& rear_link,
+                             const robot::Milliseconds now_ms,
+                             const robot::EventSource source) {
+  disableActuators(context, front_left, front_right, rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::AutonomousTowerPieces, now_ms);
+  resetSolarPanelAutonomy(context, now_ms);
+  resetTowerPieces(context, now_ms);
+  context.tower_pieces_start_requested = true;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info, source,
+           "tower pieces start requested");
+}
+
+void enterTowerPiecesFault(
+    RuntimeContext& context, robot::IMotorOutput& front_left,
+    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const robot::TowerPiecesFaultReason reason,
+    const robot::FaultCode fault_code, const char* message,
+    const robot::EventSource source) {
+  disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  robot::failTowerPiecesAutonomy(context.tower_pieces, reason, now_ms);
+  setFault(context, fault_code, message);
+  logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
+}
+
+void runTowerPiecesAutonomy(RuntimeContext& context,
+                            DualPwmMotorOutput& front_left,
+                            DualPwmMotorOutput& front_right,
+                            RearCommandLink& rear_link,
+                            const robot::Milliseconds now_ms) {
+  switch (context.tower_pieces.state) {
+    case robot::TowerPiecesState::WaitForStart:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      if (!context.tower_pieces_start_requested) {
+        return;
+      }
+      context.tower_pieces_start_requested = false;
+      if (!towerPiecesStartRequirementsMet(front_left, front_right, rear_link,
+                                           now_ms, context)) {
+        enterTowerPiecesFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::TowerPiecesFaultReason::HardwareNotReady,
+            robot::FaultCode::HardwareNotConfigured,
+            "tower pieces start rejected: configure motion, rear/side sensors, motors, and link",
+            robot::EventSource::System);
+        return;
+      }
+      robot::startTowerPiecesAutonomy(
+          context.tower_pieces,
+          rear_link.latestRearLineSnapshot().side_electrical_high, now_ms);
+      robot::startLineFollower(context.follower_state, now_ms);
+      context.last_command_ms = now_ms;
+      context.command_deadman_armed = true;
+      context.mode_expires_at_ms = 0U;
+      clearFault(context);
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Line,
+               "tower pieces reverse line follow started");
+      return;
+
+    case robot::TowerPiecesState::ReverseLineFollow:
+    case robot::TowerPiecesState::PostLineDelay:
+    case robot::TowerPiecesState::StrafeRight:
+    case robot::TowerPiecesState::PostStrafePause:
+    case robot::TowerPiecesState::RotateClockwise:
+    case robot::TowerPiecesState::PostRotationPause:
+    case robot::TowerPiecesState::ReverseTimed:
+    case robot::TowerPiecesState::ShimmyLeft:
+    case robot::TowerPiecesState::ShimmyRight:
+      break;
+    case robot::TowerPiecesState::Complete:
+    case robot::TowerPiecesState::Fault:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      return;
+  }
+
+  if (!rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.rear_config))) {
+    enterTowerPiecesFault(
+        context, front_left, front_right, rear_link, now_ms,
+        robot::TowerPiecesFaultReason::RearLinkStale,
+        robot::FaultCode::CommunicationStale,
+        "tower pieces stopped: ESP1 status stale",
+        robot::EventSource::Uart);
+    return;
+  }
+  if (!rear_link.rearLineSnapshotFresh(
+          now_ms, context.rear_config.remoteCommandTimeoutMs)) {
+    enterTowerPiecesFault(
+        context, front_left, front_right, rear_link, now_ms,
+        robot::TowerPiecesFaultReason::RearLinkStale,
+        robot::FaultCode::CommunicationStale,
+        "tower pieces stopped: rear line sensor data stale",
+        robot::EventSource::Uart);
+    return;
+  }
+
+  const robot::Esp1StatusReport& esp1 = rear_link.latestStatus();
+  const robot::RearLineSensorSnapshot& line_sensors =
+      rear_link.latestRearLineSnapshot();
+  if (!rear_link.configured() || !line_sensors.configured ||
+      !line_sensors.side_configured) {
+    enterTowerPiecesFault(
+        context, front_left, front_right, rear_link, now_ms,
+        robot::TowerPiecesFaultReason::HardwareNotReady,
+        robot::FaultCode::HardwareNotConfigured,
+        "tower pieces stopped: rear or side line sensor unavailable",
+        robot::EventSource::Line);
+    return;
+  }
+  if (esp1.fault_active &&
+      esp1.fault_code == robot::FaultCode::CommunicationStale) {
+    enterTowerPiecesFault(
+        context, front_left, front_right, rear_link, now_ms,
+        robot::TowerPiecesFaultReason::RearLinkStale,
+        robot::FaultCode::CommunicationStale,
+        "tower pieces stopped: ESP1 reported stale commands",
+        robot::EventSource::Uart);
+    return;
+  }
+
+  const robot::TowerPiecesState previous_state = context.tower_pieces.state;
+  const robot::TowerPiecesUpdate tower_update =
+      robot::updateTowerPiecesAutonomy(
+          context.tower_pieces, line_sensors.side_electrical_high,
+          line_sensors.left_electrical_high,
+          line_sensors.right_electrical_high,
+          context.tower_pieces_config, now_ms);
+  if (tower_update.side_line_rising_edge) {
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::Line,
+             tower_update.side_line_count >=
+                     robot::kTowerPiecesTargetSideLineCount
+                 ? "tower pieces side line count: 2"
+                 : "tower pieces side line count: 1");
+  }
+  if (tower_update.state != previous_state) {
+    switch (tower_update.state) {
+      case robot::TowerPiecesState::PostLineDelay:
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::Line,
+                 "tower pieces stopped on second side line; delay started");
+        break;
+      case robot::TowerPiecesState::StrafeRight:
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::Motor,
+                 "tower pieces right strafe started");
+        break;
+      case robot::TowerPiecesState::PostStrafePause:
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::Motor,
+                 "tower pieces right strafe complete; pause started");
+        break;
+      case robot::TowerPiecesState::RotateClockwise:
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::Motor,
+                 "tower pieces clockwise rotation started");
+        break;
+      case robot::TowerPiecesState::PostRotationPause:
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::Motor,
+                 "tower pieces rotation complete; pause started");
+        break;
+      case robot::TowerPiecesState::ReverseTimed:
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::Motor,
+                 "tower pieces timed reverse started");
+        break;
+      case robot::TowerPiecesState::ShimmyLeft:
+        break;
+      case robot::TowerPiecesState::ShimmyRight:
+        if (previous_state == robot::TowerPiecesState::ReverseTimed) {
+          logEvent(context, now_ms, robot::EventSeverity::Info,
+                   robot::EventSource::Motor,
+                   "tower pieces shimmy search started right");
+        }
+        break;
+      case robot::TowerPiecesState::WaitForStart:
+      case robot::TowerPiecesState::ReverseLineFollow:
+      case robot::TowerPiecesState::Complete:
+      case robot::TowerPiecesState::Fault:
+        break;
+    }
+  }
+
+  switch (tower_update.state) {
+    case robot::TowerPiecesState::ReverseLineFollow: {
+      const robot::LineFollowerConfig reverse_config =
+          towerPiecesLineFollowerConfig(context);
+      context.last_rear_update = robot::updateLineFollower(
+          context.follower_state,
+          context.last_rear_line_observation.left_black,
+          context.last_rear_line_observation.right_black, reverse_config,
+          now_ms);
+      if (!context.follower_state.enabled &&
+          !context.last_rear_update.observation.safe_to_drive) {
+        enterTowerPiecesFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::TowerPiecesFaultReason::LineLost,
+            robot::FaultCode::InvalidCommand,
+            "tower pieces stopped: rear line lost without history",
+            robot::EventSource::Line);
+        return;
+      }
+      if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                             context.last_rear_update.wheel_command,
+                             reverse_config, now_ms)) {
+        enterTowerPiecesFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::TowerPiecesFaultReason::RearCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "tower pieces stopped: rear command send failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      break;
+    }
+
+    case robot::TowerPiecesState::PostLineDelay:
+    case robot::TowerPiecesState::PostStrafePause:
+    case robot::TowerPiecesState::PostRotationPause:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      return;
+
+    case robot::TowerPiecesState::StrafeRight:
+    case robot::TowerPiecesState::RotateClockwise:
+    case robot::TowerPiecesState::ReverseTimed:
+    case robot::TowerPiecesState::ShimmyLeft:
+    case robot::TowerPiecesState::ShimmyRight: {
+      robot::stopLineFollower(context.follower_state);
+      robot::FourWheelCommand wheels{};
+      if (tower_update.should_initial_strafe_right) {
+        wheels = makeTowerPiecesStrafeRightCommand(context, now_ms);
+      } else if (tower_update.should_rotate_clockwise) {
+        wheels = makeTowerPiecesClockwiseRotationCommand(context, now_ms);
+      } else if (tower_update.should_drive_backward) {
+        wheels = makeTowerPiecesBackwardCommand(context, now_ms);
+      } else {
+        wheels = makeTowerPiecesShimmyCommand(
+            context, tower_update.should_shimmy_right, now_ms);
+      }
+      if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                             wheels, context.rear_config, now_ms)) {
+        enterTowerPiecesFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::TowerPiecesFaultReason::RearCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "tower pieces stopped: rear command send failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      break;
+    }
+
+    case robot::TowerPiecesState::Complete:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      clearFault(context);
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Line,
+               "tower pieces complete: back line detected during shimmy");
+      return;
+
+    case robot::TowerPiecesState::Fault:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      if (tower_update.fault_reason ==
+          robot::TowerPiecesFaultReason::ShimmyTimeout) {
+        setFault(context, robot::FaultCode::SearchTimeout,
+                 "tower pieces shimmy timeout without back line");
+        logEvent(context, now_ms, robot::EventSeverity::Fault,
+                 robot::EventSource::Line,
+                 "tower pieces shimmy timeout without back line");
+      } else {
+        setFault(context, robot::FaultCode::SearchTimeout,
+                 "tower pieces timeout before second side line");
+        logEvent(context, now_ms, robot::EventSeverity::Fault,
+                 robot::EventSource::Line,
+                 "tower pieces timeout before second side line");
+      }
+      return;
+
+    case robot::TowerPiecesState::WaitForStart:
+      disableMotionActuators(context, front_left, front_right, rear_link,
+                             now_ms);
+      return;
+  }
+
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = true;
+  context.mode_expires_at_ms = 0U;
+  printRearTelemetry(context, rear_link, now_ms);
 }
 
 void enterSolarPanelAligned(RuntimeContext& context,
@@ -1199,6 +1685,20 @@ void enterSolarPanelContacted(RuntimeContext& context,
   logEvent(context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::System,
            "solar panel limit switches contacted");
+}
+
+void enterSolarRearLineReacquired(RuntimeContext& context,
+                                  robot::IMotorOutput& front_left,
+                                  robot::IMotorOutput& front_right,
+                                  RearCommandLink& rear_link,
+                                  const robot::Milliseconds now_ms) {
+  disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  enterSolarPanelAutonomyState(
+      context, robot::SolarPanelAutonomyState::RearLineReacquired, now_ms);
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Line,
+           "solar run complete: rear line reacquired");
 }
 
 void enterSolarPanelSearchFault(
@@ -1241,7 +1741,7 @@ void runSolarPanelAutonomy(RuntimeContext& context,
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::HardwareNotReady,
             robot::FaultCode::HardwareNotConfigured,
-            "solar start rejected: hardware or limit switches incomplete",
+            "solar start rejected: hardware, rear line sensors, or limit switches incomplete",
             robot::EventSource::System);
         return;
       }
@@ -1321,7 +1821,8 @@ void runSolarPanelAutonomy(RuntimeContext& context,
           context.follower_state, left_black, right_black, active_line_config,
           now_ms);
       if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                             context.last_update.wheel_command, now_ms)) {
+                             context.last_update.wheel_command,
+                             active_line_config, now_ms)) {
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::RearLinkStale,
@@ -1378,7 +1879,12 @@ void runSolarPanelAutonomy(RuntimeContext& context,
     case robot::SolarPanelAutonomyState::StrafeRightToSolarPanel:
     case robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry:
     case robot::SolarPanelAutonomyState::MoveForwardForSolarRetry:
-    case robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel: {
+    case robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel:
+    case robot::SolarPanelAutonomyState::SolarPanelContacted:
+    case robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact:
+    case robot::SolarPanelAutonomyState::
+        WaitBeforeStrafeLeftToRearLine:
+    case robot::SolarPanelAutonomyState::StrafeLeftToRearLine: {
       if (!rear_link.remoteStatusFresh(now_ms,
                                        remoteStatusTimeoutMs(context.config))) {
         enterSolarPanelSearchFault(
@@ -1409,6 +1915,25 @@ void runSolarPanelAutonomy(RuntimeContext& context,
             robot::EventSource::System);
         return;
       }
+      if (!rear_link.rearLineSnapshotFresh(
+              now_ms, context.rear_config.remoteCommandTimeoutMs)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar contact stopped: rear line sensor data stale",
+            robot::EventSource::Uart);
+        return;
+      }
+      if (!rear_link.latestRearLineSnapshot().configured) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::HardwareNotReady,
+            robot::FaultCode::HardwareNotConfigured,
+            "solar contact stopped: rear line sensors not configured",
+            robot::EventSource::Line);
+        return;
+      }
 
       const bool back_hit =
           solarPanelLimitSwitchHit(esp1.solar_limit_back_right_high);
@@ -1417,11 +1942,21 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       const robot::SolarPanelContactSequenceUpdate sequence_update =
           robot::updateSolarPanelContactSequence(
               context.autonomous_state, front_hit, back_hit,
+              context.last_rear_line_observation.left_black ||
+                  context.last_rear_line_observation.right_black,
               time_in_state_ms, context.solar_contact_config);
       if (sequence_update.next_state ==
-          robot::SolarPanelAutonomyState::SolarPanelContacted) {
+              robot::SolarPanelAutonomyState::SolarPanelContacted &&
+          context.autonomous_state !=
+              robot::SolarPanelAutonomyState::SolarPanelContacted) {
         enterSolarPanelContacted(context, front_left, front_right, rear_link,
                                  now_ms);
+        return;
+      }
+      if (sequence_update.next_state ==
+          robot::SolarPanelAutonomyState::RearLineReacquired) {
+        enterSolarRearLineReacquired(context, front_left, front_right,
+                                     rear_link, now_ms);
         return;
       }
       if (sequence_update.next_state ==
@@ -1456,6 +1991,17 @@ void runSolarPanelAutonomy(RuntimeContext& context,
                    robot::SolarPanelAutonomyState::
                        RetryStrafeRightToSolarPanel) {
           message = "solar panel right strafe retry started";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::
+                       MoveForwardAfterSolarContact) {
+          message = "solar post-contact forward motion started";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::StrafeLeftToRearLine) {
+          message = "solar rear-line reacquisition strafe started";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::
+                       WaitBeforeStrafeLeftToRearLine) {
+          message = "solar post-forward left-strafe delay started";
         }
         logEvent(context, now_ms, robot::EventSeverity::Info,
                  robot::EventSource::System, message);
@@ -1466,7 +2012,12 @@ void runSolarPanelAutonomy(RuntimeContext& context,
                  0U) ||
             (context.autonomous_state ==
                  robot::SolarPanelAutonomyState::MoveForwardForSolarRetry &&
-             context.solar_contact_config.retry_forward_duration_ms == 0U);
+             context.solar_contact_config.retry_forward_duration_ms == 0U) ||
+            (context.autonomous_state ==
+                 robot::SolarPanelAutonomyState::
+                     MoveForwardAfterSolarContact &&
+             context.solar_contact_config.post_contact_forward_duration_ms ==
+                 0U);
         if (zero_duration_adjustment) {
           printTelemetry(context, sensors, rear_link, now_ms);
           return;
@@ -1475,11 +2026,22 @@ void runSolarPanelAutonomy(RuntimeContext& context,
 
       robot::FourWheelCommand wheels{};
       switch (context.autonomous_state) {
+        case robot::SolarPanelAutonomyState::SolarPanelContacted:
+        case robot::SolarPanelAutonomyState::
+            WaitBeforeStrafeLeftToRearLine:
+          wheels = robot::disabledFourWheelCommand();
+          break;
         case robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry:
           wheels = makeSolarStrafeLeftCommand(context, now_ms);
           break;
+        case robot::SolarPanelAutonomyState::StrafeLeftToRearLine:
+          wheels = makeSolarLineReacquireStrafeLeftCommand(context, now_ms);
+          break;
         case robot::SolarPanelAutonomyState::MoveForwardForSolarRetry:
           wheels = makeSolarForwardCommand(context, now_ms);
+          break;
+        case robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact:
+          wheels = makeSolarPostContactForwardCommand(context, now_ms);
           break;
         case robot::SolarPanelAutonomyState::StrafeRightToSolarPanel:
         case robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel:
@@ -1490,7 +2052,7 @@ void runSolarPanelAutonomy(RuntimeContext& context,
           break;
       }
       if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                             wheels, now_ms)) {
+                             wheels, context.config, now_ms)) {
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::RearLinkStale,
@@ -1506,7 +2068,7 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       return;
     }
 
-    case robot::SolarPanelAutonomyState::SolarPanelContacted:
+    case robot::SolarPanelAutonomyState::RearLineReacquired:
     case robot::SolarPanelAutonomyState::SolarSearchFault:
       disableMotionActuators(context, front_left, front_right, rear_link,
                              now_ms);
@@ -1537,6 +2099,29 @@ void refreshLineObservation(RuntimeContext& context,
       left_black, right_black, context.line_sensor_last_known_side, now_ms);
   context.line_sensor_last_known_side =
       context.last_line_observation.last_known_side;
+}
+
+void refreshRearLineObservation(RuntimeContext& context,
+                                const RearCommandLink& rear_link,
+                                const robot::Milliseconds now_ms) {
+  if (!rear_link.rearLineSnapshotFresh(
+          now_ms, context.rear_config.remoteCommandTimeoutMs) ||
+      !rear_link.latestRearLineSnapshot().configured) {
+    context.last_rear_line_observation = {};
+    context.last_rear_line_observation.timestampMs = now_ms;
+    context.last_rear_line_observation.timestamp_ms = now_ms;
+    context.last_rear_line_observation.observed_at_ms = now_ms;
+    return;
+  }
+
+  const robot::RearLineSensorSnapshot& snapshot =
+      rear_link.latestRearLineSnapshot();
+  context.last_rear_line_observation =
+      robot::observeRearLineSensorsForReverseTravel(
+          snapshot.left_electrical_high, snapshot.right_electrical_high,
+          context.rear_line_sensor_last_known_side, now_ms);
+  context.rear_line_sensor_last_known_side =
+      context.last_rear_line_observation.last_known_side;
 }
 
 void fillMotorTelemetry(robot::MotorTelemetry& output,
@@ -1583,10 +2168,17 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   copyText(snapshot.reset_reason, sizeof(snapshot.reset_reason),
            resetReasonName(esp_reset_reason()));
 
+  const bool rear_line_following =
+      (context.modes.currentMode() ==
+           robot::RobotTestMode::RearLineFollowTest ||
+       context.modes.currentMode() ==
+           robot::RobotTestMode::AutonomousTowerPieces) &&
+      context.follower_state.enabled;
+  const bool front_line_following =
+      context.follower_state.enabled && !rear_line_following;
   const robot::LineObservation& observation =
-      context.follower_state.enabled
-          ? context.last_update.observation
-          : context.last_line_observation;
+      front_line_following ? context.last_update.observation
+                           : context.last_line_observation;
   snapshot.lsfl_raw_level = sensors.lastLeftLevel();
   snapshot.lsfr_raw_level = sensors.lastRightLevel();
   snapshot.lsfl_black = observation.left_black;
@@ -1595,7 +2187,63 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.line_visible = observation.line_visible;
   snapshot.line_has_history = observation.hasHistory;
   snapshot.last_known_line_side = observation.last_known_side;
-  snapshot.line_follower_enabled = context.follower_state.enabled;
+  snapshot.line_follower_enabled = front_line_following;
+
+  const robot::LineObservation& rear_observation =
+      rear_line_following ? context.last_rear_update.observation
+                          : context.last_rear_line_observation;
+  snapshot.rear_line_data_fresh = rear_link.rearLineSnapshotFresh(
+      now_ms, context.rear_config.remoteCommandTimeoutMs);
+  if (rear_link.rearLineSnapshotAvailable()) {
+    const robot::RearLineSensorSnapshot& rear_snapshot =
+        rear_link.latestRearLineSnapshot();
+    snapshot.rear_line_configured = rear_snapshot.configured;
+    snapshot.rear_line_sequence = rear_link.lastRearLineSequence();
+    snapshot.rear_line_sample_age_ms =
+        elapsedSince(now_ms, rear_link.lastRearLineReceivedAtMs());
+    snapshot.rear_line_captured_at_ms = rear_snapshot.captured_at_ms;
+    if (snapshot.rear_line_data_fresh && rear_snapshot.configured) {
+      snapshot.lsbl_raw_level = rear_snapshot.left_electrical_high ? 1 : 0;
+      snapshot.lsbr_raw_level = rear_snapshot.right_electrical_high ? 1 : 0;
+      snapshot.lsbl_black = rear_snapshot.left_electrical_high;
+      snapshot.lsbr_black = rear_snapshot.right_electrical_high;
+    }
+  }
+  snapshot.rear_line_error = rear_observation.error;
+  snapshot.rear_line_visible = rear_observation.line_visible;
+  snapshot.rear_line_has_history = rear_observation.hasHistory;
+  snapshot.rear_last_known_line_side = rear_observation.last_known_side;
+  snapshot.rear_line_follower_enabled = rear_line_following;
+  snapshot.rear_logical_left_black = rear_observation.left_black;
+  snapshot.rear_logical_right_black = rear_observation.right_black;
+
+  const robot::LineFollowerConfig reverse_config =
+      reverseRearLineFollowerConfig(context);
+  snapshot.rear_kp = context.rear_config.kp;
+  snapshot.rear_ki = context.rear_config.ki;
+  snapshot.rear_kd = context.rear_config.kd;
+  snapshot.rear_base_duty = std::fabs(context.rear_config.baseDuty);
+  snapshot.rear_effective_base_duty = reverse_config.baseDuty;
+  snapshot.rear_maximum_duty = context.rear_config.maxDuty;
+  snapshot.rear_maximum_correction = context.rear_config.maxCorrection;
+  snapshot.rear_integral_limit = context.rear_config.integralLimit;
+  snapshot.rear_derivative_limit = context.rear_config.derivativeLimit;
+  snapshot.rear_derivative_filter_alpha =
+      context.rear_config.derivativeFilterAlpha;
+  snapshot.rear_steering_polarity = context.rear_config.steeringPolarity;
+  snapshot.rear_control_period_ms = context.rear_config.controlPeriodMs;
+  snapshot.rear_remote_command_timeout_ms =
+      context.rear_config.remoteCommandTimeoutMs;
+  snapshot.rear_line_telemetry_enabled =
+      context.rear_config.telemetryEnabled;
+  snapshot.rear_pid_p_term =
+      context.last_rear_update.pid_terms.proportional_term;
+  snapshot.rear_pid_i_term =
+      context.last_rear_update.pid_terms.integral_term;
+  snapshot.rear_pid_d_term =
+      context.last_rear_update.pid_terms.derivative_term;
+  snapshot.rear_pid_correction =
+      context.last_rear_update.pid_terms.correction;
 
   snapshot.kp = context.config.kp;
   snapshot.ki = context.config.ki;
@@ -1673,6 +2321,83 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.solar_contact_config.retry_forward_duration_ms;
   snapshot.solar_retry_strafe_timeout_ms =
       context.solar_contact_config.retry_strafe_timeout_ms;
+  snapshot.solar_post_contact_forward_duration_ms =
+      context.solar_contact_config.post_contact_forward_duration_ms;
+  snapshot.solar_line_reacquire_strafe_duty =
+      context.solar_contact_config.line_reacquire_strafe_duty;
+  snapshot.solar_post_contact_forward_start_delay_ms =
+      context.solar_contact_config.post_contact_forward_start_delay_ms;
+  snapshot.solar_line_reacquire_strafe_start_delay_ms =
+      context.solar_contact_config.line_reacquire_strafe_start_delay_ms;
+  snapshot.solar_post_contact_forward_duty =
+      context.solar_contact_config.post_contact_forward_duty;
+
+  snapshot.tower_pieces_state = context.tower_pieces.state;
+  snapshot.tower_pieces_fault_reason =
+      context.tower_pieces.fault_reason;
+  snapshot.tower_pieces_time_in_state_ms =
+      elapsedSince(now_ms, context.tower_pieces.state_entered_at_ms);
+  snapshot.tower_pieces_reverse_line_duty =
+      context.tower_pieces_config.reverse_line_duty;
+  snapshot.tower_pieces_side_line_timeout_ms =
+      context.tower_pieces_config.side_line_timeout_ms;
+  snapshot.tower_pieces_post_line_delay_ms =
+      context.tower_pieces_config.post_line_delay_ms;
+  snapshot.tower_pieces_strafe_right_duty =
+      context.tower_pieces_config.strafe_right_duty;
+  snapshot.tower_pieces_strafe_right_duration_ms =
+      context.tower_pieces_config.strafe_right_duration_ms;
+  snapshot.tower_pieces_post_strafe_pause_ms =
+      context.tower_pieces_config.post_strafe_pause_ms;
+  snapshot.tower_pieces_clockwise_rotation_duty =
+      context.tower_pieces_config.clockwise_rotation_duty;
+  snapshot.tower_pieces_clockwise_rotation_duration_ms =
+      context.tower_pieces_config.clockwise_rotation_duration_ms;
+  snapshot.tower_pieces_post_rotation_pause_ms =
+      context.tower_pieces_config.post_rotation_pause_ms;
+  snapshot.tower_pieces_reverse_duty =
+      context.tower_pieces_config.reverse_duty;
+  snapshot.tower_pieces_reverse_duration_ms =
+      context.tower_pieces_config.reverse_duration_ms;
+  snapshot.tower_pieces_shimmy_duty =
+      context.tower_pieces_config.shimmy_duty;
+  snapshot.tower_pieces_shimmy_right_duration_ms =
+      context.tower_pieces_config.shimmy_right_duration_ms;
+  snapshot.tower_pieces_shimmy_left_duration_ms =
+      context.tower_pieces_config.shimmy_left_duration_ms;
+  snapshot.tower_pieces_shimmy_timeout_ms =
+      context.tower_pieces_config.shimmy_timeout_ms;
+  snapshot.tower_pieces_side_line_count =
+      context.tower_pieces.side_line_count;
+  snapshot.tower_pieces_target_side_line_count =
+      robot::kTowerPiecesTargetSideLineCount;
+  snapshot.tower_pieces_line_following =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces &&
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::ReverseLineFollow &&
+      context.follower_state.enabled;
+  snapshot.tower_pieces_strafing_right =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces &&
+      context.tower_pieces.state == robot::TowerPiecesState::StrafeRight;
+  snapshot.tower_pieces_rotating_clockwise =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces &&
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::RotateClockwise;
+  snapshot.tower_pieces_driving_backward =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces &&
+      context.tower_pieces.state == robot::TowerPiecesState::ReverseTimed;
+  snapshot.tower_pieces_shimmying_left =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces &&
+      context.tower_pieces.state == robot::TowerPiecesState::ShimmyLeft;
+  snapshot.tower_pieces_shimmying_right =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces &&
+      context.tower_pieces.state == robot::TowerPiecesState::ShimmyRight;
 
   fillMotorTelemetry(snapshot.front_left, front_left);
   fillMotorTelemetry(snapshot.front_right, front_right);
@@ -1686,6 +2411,8 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       snapshot.claws.claw_2.commanded_angle_deg;
   snapshot.servo_claw_3_position =
       snapshot.claws.claw_3.commanded_angle_deg;
+  snapshot.servo_winch_position =
+      snapshot.claws.winch.commanded_angle_deg;
   snapshot.rear.back_left_desired_command_milli =
       context.last_commanded_wheels.back_left.duty_command_milli;
   snapshot.rear.back_right_desired_command_milli =
@@ -1732,11 +2459,6 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
         esp1.side_line_sensor_configured;
     snapshot.esp1.side_line_sensor_high =
         esp1.side_line_sensor_high;
-    snapshot.lss_configured = esp1.side_line_sensor_configured;
-    if (snapshot.rear.esp1_link_healthy && snapshot.lss_configured) {
-      snapshot.lss_raw_level = esp1.side_line_sensor_high ? 1 : 0;
-      snapshot.lss_black = esp1.side_line_sensor_high;
-    }
     snapshot.solar_panel_limit_switches_configured =
         esp1.solar_panel_limit_switches_configured;
     snapshot.solar_limit_back_right_high =
@@ -1772,6 +2494,24 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
     snapshot.ir_consecutive_detection_count =
         esp1.ir_consecutive_detection_count;
     snapshot.ir_adc_sample_rate_hz = esp1.ir_adc_sample_rate_hz;
+  }
+  if (snapshot.rear_line_data_fresh &&
+      rear_link.rearLineSnapshotAvailable()) {
+    const robot::RearLineSensorSnapshot& line_sensors =
+        rear_link.latestRearLineSnapshot();
+    snapshot.tower_pieces_side_line_sensor_configured =
+        line_sensors.side_configured;
+    snapshot.tower_pieces_side_line_sensor_high =
+        line_sensors.side_electrical_high;
+    snapshot.tower_pieces_back_line_detected =
+        line_sensors.left_electrical_high ||
+        line_sensors.right_electrical_high;
+    snapshot.lss_configured = line_sensors.side_configured;
+    if (line_sensors.side_configured) {
+      snapshot.lss_raw_level =
+          line_sensors.side_electrical_high ? 1 : 0;
+      snapshot.lss_black = line_sensors.side_electrical_high;
+    }
   }
 }
 
@@ -1865,13 +2605,20 @@ void handleMotor();
 void handleInvert();
 void handleSensors();
 void handleLine();
+void handleRearLine();
 void handleAutonomousSolarStart();
 void handleAutonomousSolarConfig();
+void handleTowerPiecesStart();
+void handleTowerPiecesConfig();
 void handleLineFollowStart();
 void handleLineFollowStop();
 void handleLineFollowConfig();
+void handleRearLineFollowConfig();
+void handleRearLineFollowStart();
+void handleRearLineFollowStop();
 void handleClaw();
 void handleClawsAll();
+void handleWinch();
 void handleClawsConfig();
 void handleClawsSave();
 void handleFunnel();
@@ -1963,6 +2710,11 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Retry left strafe ms <input id="solarRetryLeftMs" type="number" min="0" step="50"></label>
       <label>Retry forward ms <input id="solarRetryForwardMs" type="number" min="0" step="50"></label>
       <label>Retry right timeout ms <input id="solarRetryStrafeTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Post-contact forward ms <input id="solarPostContactForwardMs" type="number" min="0" step="50"></label>
+      <label>Post-contact forward duty <input id="solarPostContactForwardDuty" type="number" min="0" max="1" step="0.01"></label>
+      <label>Rear-line reacquire left duty <input id="solarLineReacquireDuty" type="number" min="0" max="1" step="0.01"></label>
+      <label>Post-contact forward delay ms <input id="solarPostContactForwardDelayMs" type="number" min="0" step="50"></label>
+      <label>Post-forward rear-line delay ms <input id="solarPostForwardStrafeDelayMs" type="number" min="0" step="50"></label>
     </div>
     <div class="row">
       <button class="run" onclick="autoSolarStart()">Start</button>
@@ -1984,6 +2736,49 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Retry left</span><span id="solarRetryLeft" class="mono"></span>
       <span>Retry forward</span><span id="solarRetryForward" class="mono"></span>
       <span>Retry right timeout</span><span id="solarRetryTimeout" class="mono"></span>
+      <span>Post-contact forward</span><span id="solarPostContactForward" class="mono"></span>
+      <span>Post-contact forward duty</span><span id="solarPostContactForwardDutyStatus" class="mono"></span>
+      <span>Rear-line reacquire left duty</span><span id="solarLineReacquireDutyStatus" class="mono"></span>
+      <span>Post-contact forward delay</span><span id="solarPostContactForwardDelay" class="mono"></span>
+      <span>Post-forward rear-line delay</span><span id="solarPostForwardStrafeDelay" class="mono"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tower Pieces</h2>
+    <div class="muted">After the initial right strafe: timed clockwise rotation, pause, timed reverse, then alternate right/left strafes until either back sensor sees black.</div>
+    <div class="kv">
+      <span>State</span><span id="towerState" class="mono"></span>
+      <span>Fault</span><span id="towerFault" class="mono"></span>
+      <span>Time</span><span id="towerTime" class="mono"></span>
+      <span>Line following</span><span id="towerFollowing" class="mono"></span>
+      <span>Side sensor</span><span id="towerSideSensor" class="mono"></span>
+      <span>Side-line count</span><span id="towerSideCount" class="mono"></span>
+      <span>Back line detected</span><span id="towerBackLineDetected" class="mono"></span>
+      <span>Last command</span><span id="towerCommand" class="mono"></span>
+    </div>
+    <div class="two">
+      <label>Reverse line-follow duty cycle <input id="towerDuty" type="number" min="0.01" max="1" step="0.01"></label>
+      <label>Second-line timeout ms <input id="towerTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Delay after second line ms <input id="towerPostLineDelayMs" type="number" min="1" step="100"></label>
+      <label>Right strafe duty cycle <input id="towerStrafeDuty" type="number" min="0.01" max="1" step="0.01"></label>
+      <label>Right strafe duration ms <input id="towerStrafeDurationMs" type="number" min="1" step="100"></label>
+      <label>Pause after strafe ms <input id="towerPostStrafePauseMs" type="number" min="1" step="100"></label>
+      <label>Clockwise rotation duty cycle <input id="towerRotationDuty" type="number" min="0.01" max="1" step="0.01"></label>
+      <label>Clockwise rotation duration ms <input id="towerRotationDurationMs" type="number" min="1" step="100"></label>
+      <label>Pause after rotation ms <input id="towerPostRotationPauseMs" type="number" min="1" step="100"></label>
+      <label>Timed backward duty cycle <input id="towerReverseDuty" type="number" min="0.01" max="1" step="0.01"></label>
+      <label>Timed backward duration ms <input id="towerReverseDurationMs" type="number" min="1" step="100"></label>
+      <label>Shimmy duty cycle <input id="towerShimmyDuty" type="number" min="0.01" max="1" step="0.01"></label>
+      <label>Shimmy right duration ms <input id="towerShimmyRightMs" type="number" min="1" step="100"></label>
+      <label>Shimmy left duration ms <input id="towerShimmyLeftMs" type="number" min="1" step="100"></label>
+      <label>Shimmy search timeout ms <input id="towerShimmyTimeoutMs" type="number" min="1" step="500"></label>
+    </div>
+    <div class="row">
+      <button class="run" onclick="towerStart()">Start</button>
+      <button onclick="towerApply()">Apply</button>
+      <button onclick="towerSave()">Save</button>
+      <button class="stop" onclick="stopAll()">Stop</button>
     </div>
   </section>
 
@@ -1999,7 +2794,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
   </section>
 
   <section>
-    <h2>Line Sensors</h2>
+    <h2>Front Line Following</h2>
     <div class="kv">
       <span>Enabled</span><span id="lfEnabled" class="mono"></span>
       <span>LSFL</span><span id="lsfl" class="mono"></span>
@@ -2028,6 +2823,42 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <button class="stop" onclick="lfStop()">Stop</button>
       <button onclick="lfApply()">Apply</button>
       <button onclick="lfSave()">Save</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Reverse Rear Line Following</h2>
+    <div class="muted">Reverse travel: LSBR is logical left; LSBL is logical right.</div>
+    <div class="kv">
+      <span>Enabled</span><span id="rlfEnabled" class="mono"></span>
+      <span>LSBL (physical)</span><span id="lsbl" class="mono"></span>
+      <span>LSBR (physical)</span><span id="lsbr" class="mono"></span>
+      <span>Travel mapping</span><span id="rlfMapping" class="mono"></span>
+      <span>Sensor stream</span><span id="rearLineStream" class="mono"></span>
+      <span>Error</span><span id="rlfError" class="mono"></span>
+      <span>PID</span><span id="rlfPid" class="mono"></span>
+      <span>Effective base</span><span id="rlfEffectiveBase" class="mono"></span>
+    </div>
+    <div class="two">
+      <label>Kp <input id="rlfKp" type="number" step="0.01"></label>
+      <label>Ki <input id="rlfKi" type="number" step="0.01"></label>
+      <label>Kd <input id="rlfKd" type="number" step="0.01"></label>
+      <label>Base magnitude (reverse) <input id="rlfBase" type="number" min="0" step="0.01"></label>
+      <label>Max Duty <input id="rlfMaxDuty" type="number" step="0.01"></label>
+      <label>Max Corr <input id="rlfMaxCorrection" type="number" step="0.01"></label>
+      <label>I Limit <input id="rlfIntegralLimit" type="number" step="0.01"></label>
+      <label>D Limit <input id="rlfDerivativeLimit" type="number" step="0.1"></label>
+      <label>D Alpha <input id="rlfDerivativeAlpha" type="number" step="0.01"></label>
+      <label>Polarity <select id="rlfPolarity"><option value="1">+1</option><option value="-1">-1</option></select></label>
+      <label>Duration ms <input id="rlfDuration" type="number" min="1" max="5000" step="100" value="5000"></label>
+      <label>Telemetry <select id="rlfTelemetry"><option value="on">on</option><option value="off">off</option></select></label>
+    </div>
+    <div class="row">
+      <button onclick="rearLineSensorMode()">Rear Sensor Test</button>
+      <button class="run" onclick="rlfStart()">Start Reverse</button>
+      <button class="stop" onclick="rlfStop()">Stop</button>
+      <button onclick="rlfApply()">Apply</button>
+      <button onclick="rlfSave()">Save</button>
     </div>
   </section>
 
@@ -2062,44 +2893,41 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Motion</span><span id="stepperMotion" class="mono"></span>
       <span>Speed</span><span id="stepperSpeedNow" class="mono"></span>
       <span>Driver</span><span id="stepperSleep" class="mono"></span>
-      <span>Lower limit</span><span id="stepperLimit" class="mono"></span>
-      <span>Homed</span><span id="stepperHomed" class="mono"></span>
+      <span>Bottom limit</span><span id="stepperBottomLimit" class="mono"></span>
+      <span>Top limit</span><span id="stepperTopLimit" class="mono"></span>
     </div>
     <div class="two">
-      <label>Speed steps/s <input id="stepperSpeed" type="number" min="1" value="800"></label>
-      <label>Acceleration steps/s² <input id="stepperAcceleration" type="number" min="1" value="1200"></label>
-      <label>Maximum position <input id="stepperMaximum" type="number" min="1" placeholder="REQUIRED"></label>
-      <label>Jog microsteps <input id="stepperJog" type="number" min="1" value="100"></label>
-      <label>Absolute target <input id="stepperTarget" type="number" min="0" value="0"></label>
+      <label>Up/down speed (µsteps/s) <input id="stepperSpeed" type="number" min="1" max="200000" value="800" oninput="stepperSpeedsDirty()"></label>
+      <label>Go-to-limit speed (µsteps/s) <input id="stepperLimitSpeed" type="number" min="1" max="200000" value="200" oninput="stepperSpeedsDirty()"></label>
     </div>
     <div class="row">
-      <button class="run" onpointerdown="stepperHold('up')" onpointerup="stepperRelease()" onpointerleave="stepperRelease()" onpointercancel="stepperRelease()">Hold Up</button>
-      <button class="run" onpointerdown="stepperHold('down')" onpointerup="stepperRelease()" onpointerleave="stepperRelease()" onpointercancel="stepperRelease()">Hold Down</button>
+      <button class="run" style="touch-action:none" onpointerdown="stepperHold('up')" onpointerup="stepperRelease()" onpointerleave="stepperRelease()" onpointercancel="stepperRelease()">Hold Up</button>
+      <button class="run" style="touch-action:none" onpointerdown="stepperHold('down')" onpointerup="stepperRelease()" onpointerleave="stepperRelease()" onpointercancel="stepperRelease()">Hold Down</button>
+      <button onclick="stepperCommand('bottom')">Go to Bottom</button>
+      <button onclick="stepperCommand('top')">Go to Top</button>
       <button class="stop" onclick="stepperCommand('stop')">Stop</button>
-      <button onclick="stepperCommand('wake')">Wake</button>
-      <button onclick="stepperCommand('sleep')">Sleep</button>
-      <button class="warn" onclick="stepperCommand('home')">Home</button>
-      <button class="warn" title="Debug only: changes software position without moving" onclick="stepperCommand('zero')">Set Zero (DEBUG)</button>
-    </div>
-    <div class="row">
-      <button onclick="stepperJog(1)">Jog Up</button><button onclick="stepperJog(-1)">Jog Down</button>
-      <button onclick="stepperMove()">Move Absolute</button><button onclick="stepperConfig()">Apply Config</button>
+      <button onclick="stepperApplySpeeds()">Apply Speeds</button>
+      <span id="stepperSpeedStatus" class="mono muted"></span>
     </div>
   </section>
 
 	  <section>
-	    <h2>Claws</h2>
+	    <h2>Servos</h2>
     <div class="kv">
-      <span>Hardware</span><span id="clawHardware" class="mono"></span>
-      <span>Commanded</span><span id="clawCommanded" class="mono"></span>
+      <span>Claw hardware</span><span id="clawHardware" class="mono"></span>
+      <span>Claw commands</span><span id="clawCommanded" class="mono"></span>
+      <span>Winch hardware</span><span id="winchHardware" class="mono"></span>
+      <span>Winch command</span><span id="winchCommanded" class="mono"></span>
     </div>
     <div class="two">
-      <label>Claw 1 start <input id="claw1Start" type="number" min="0" max="180" step="1"></label>
-      <label>Claw 1 dir <select id="claw1Dir"><option value="1">+90</option><option value="-1">-90</option></select></label>
-      <label>Claw 2 start <input id="claw2Start" type="number" min="0" max="180" step="1"></label>
-      <label>Claw 2 dir <select id="claw2Dir"><option value="1">+90</option><option value="-1">-90</option></select></label>
-      <label>Claw 3 start <input id="claw3Start" type="number" min="0" max="180" step="1"></label>
-      <label>Claw 3 dir <select id="claw3Dir"><option value="1">+90</option><option value="-1">-90</option></select></label>
+      <label>Claw 1 open angle <input id="claw1Open" type="number" min="0" max="180" step="1"></label>
+      <label>Claw 1 closed angle <input id="claw1Closed" type="number" min="0" max="180" step="1"></label>
+      <label>Claw 2 open angle <input id="claw2Open" type="number" min="0" max="180" step="1"></label>
+      <label>Claw 2 closed angle <input id="claw2Closed" type="number" min="0" max="180" step="1"></label>
+      <label>Claw 3 open angle <input id="claw3Open" type="number" min="0" max="180" step="1"></label>
+      <label>Claw 3 closed angle <input id="claw3Closed" type="number" min="0" max="180" step="1"></label>
+      <label>Winch open angle <input id="winchOpen" type="number" min="0" max="180" step="1"></label>
+      <label>Winch closed angle <input id="winchClosed" type="number" min="0" max="180" step="1"></label>
     </div>
     <div class="row">
       <button onclick="clawsApply()">Apply</button>
@@ -2111,6 +2939,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Claw 1</span><button onclick="claw(1,'close')">Close</button><button class="run" onclick="claw(1,'open')">Open</button>
       <span>Claw 2</span><button onclick="claw(2,'close')">Close</button><button class="run" onclick="claw(2,'open')">Open</button>
       <span>Claw 3</span><button onclick="claw(3,'close')">Close</button><button class="run" onclick="claw(3,'open')">Open</button>
+      <span>Winch</span><button onclick="winch('close')">Close</button><button class="run" onclick="winch('open')">Open</button>
     </div>
 	    <pre id="claws"></pre>
 	  </section>
@@ -2140,12 +2969,15 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 <script>
 let holdTimer = null;
 let lfLoaded = false;
+let rlfLoaded = false;
 let clawsLoaded = false;
 let solarLoaded = false;
+let towerLoaded = false;
 function qs(id){ return document.getElementById(id); }
 function api(path){ return fetch(path).then(r => r.json().catch(() => ({})).then(j => ({ok:r.ok, status:r.status, json:j}))); }
 function stepperCommand(command, extra=''){ return api(`/api/stepper/command?command=${command}${extra}`); }
 let stepperHeartbeat = null;
+let stepperSettingsLoaded = false;
 function stepperHold(direction){
   stepperRelease(false);
   stepperCommand(direction);
@@ -2155,23 +2987,43 @@ function stepperRelease(sendStop=true){
   if(stepperHeartbeat){ clearInterval(stepperHeartbeat); stepperHeartbeat=null; }
   if(sendStop) stepperCommand('stop');
 }
-function stepperJog(sign){ const n=Math.abs(Number(qs('stepperJog').value)); return stepperCommand('jog',`&steps=${sign*n}`); }
-function stepperMove(){ return stepperCommand('move',`&steps=${qs('stepperTarget').value}`); }
-function stepperConfig(){
-  const p=new URLSearchParams({command:'config',speed:qs('stepperSpeed').value,acceleration:qs('stepperAcceleration').value});
-  if(qs('stepperMaximum').value) p.set('maximum',qs('stepperMaximum').value);
-  return api(`/api/stepper/command?${p.toString()}`);
+function stepperSpeedsDirty(){
+  stepperSettingsLoaded=true;
+  qs('stepperSpeedStatus').textContent='not applied';
+  qs('stepperSpeedStatus').className='mono muted';
+}
+async function stepperApplySpeeds(){
+  const p=new URLSearchParams({
+    command:'config',
+    speed:qs('stepperSpeed').value,
+    limitSpeed:qs('stepperLimitSpeed').value
+  });
+  const result=await api(`/api/stepper/command?${p.toString()}`);
+  const status=qs('stepperSpeedStatus');
+  if(result.ok){
+    status.textContent='applied';
+    status.className='mono good';
+    stepperSettingsLoaded=true;
+  }else{
+    status.textContent=result.json.error || `rejected (${result.status})`;
+    status.className='mono bad';
+  }
+  return result;
 }
 function updateStepper(){ fetch('/api/stepper').then(r=>r.json()).then(s=>{
   qs('stepperPosition').textContent=`${s.positionSteps} µsteps`;
   qs('stepperMotion').textContent=s.motionState;
   qs('stepperSpeedNow').textContent=`${s.speedStepsPerSecond} µsteps/s`;
   qs('stepperSleep').textContent=s.sleeping?'asleep':'awake / holding';
-  qs('stepperLimit').textContent=s.lowerLimitActive?'PRESSED':'released';
-  qs('stepperLimit').className=s.lowerLimitActive?'mono bad':'mono good';
-  qs('stepperHomed').textContent=yn(s.homed);
-  qs('stepperHomed').className=s.homed?'mono good':'mono bad';
-  if(document.activeElement!==qs('stepperMaximum') && s.maximumPositionSteps>0) qs('stepperMaximum').value=s.maximumPositionSteps;
+  qs('stepperBottomLimit').textContent=s.lowerLimitActive?'PRESSED':'released';
+  qs('stepperBottomLimit').className=s.lowerLimitActive?'mono bad':'mono good';
+  qs('stepperTopLimit').textContent=s.upperLimitActive?'PRESSED':'released';
+  qs('stepperTopLimit').className=s.upperLimitActive?'mono bad':'mono good';
+  if(!stepperSettingsLoaded){
+    qs('stepperSpeed').value=s.configuredSpeedStepsPerSecond;
+    qs('stepperLimitSpeed').value=s.limitSearchSpeedStepsPerSecond;
+    stepperSettingsLoaded=true;
+  }
 }).catch(()=>{ qs('stepperMotion').textContent='disconnected'; }); }
 function stopAll(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; api('/api/stop'); }
 function drive(vx,vy,wz){
@@ -2210,6 +3062,21 @@ function loadLfControls(j){
   setLfValue('lfTelemetry', j.pid.telemetryEnabled ? 'on' : 'off');
   lfLoaded = true;
 }
+function loadRlfControls(j){
+  if (rlfLoaded || !j.rear_pid) return;
+  setLfValue('rlfKp', j.rear_pid.kp);
+  setLfValue('rlfKi', j.rear_pid.ki);
+  setLfValue('rlfKd', j.rear_pid.kd);
+  setLfValue('rlfBase', j.rear_pid.baseDuty);
+  setLfValue('rlfMaxDuty', j.rear_pid.maxDuty ?? j.rear_pid.maximumDuty);
+  setLfValue('rlfMaxCorrection', j.rear_pid.maxCorrection ?? j.rear_pid.maximumCorrection);
+  setLfValue('rlfIntegralLimit', j.rear_pid.integralLimit);
+  setLfValue('rlfDerivativeLimit', j.rear_pid.derivativeLimit);
+  setLfValue('rlfDerivativeAlpha', j.rear_pid.derivativeFilterAlpha);
+  setLfValue('rlfPolarity', j.rear_pid.steeringPolarity);
+  setLfValue('rlfTelemetry', j.rear_pid.telemetryEnabled ? 'on' : 'off');
+  rlfLoaded = true;
+}
 function lfParams(){
   const p = new URLSearchParams();
   function add(name, id){ const v = qs(id).value; if (v !== '') p.set(name, v); }
@@ -2230,8 +3097,75 @@ function lfApply(){ return api(`/api/line-follow/config?${lfParams().toString()}
 function lfStart(){ lfApply().then(() => api(`/api/line-follow/start?ms=${qs('lfDuration').value || 5000}`)); }
 function lfStop(){ api('/api/line-follow/stop'); }
 function lfSave(){ lfApply().then(() => api('/api/config/save')); }
+function rlfParams(){
+  const p = new URLSearchParams();
+  function add(name, id){ const v = qs(id).value; if (v !== '') p.set(name, v); }
+  add('kp', 'rlfKp');
+  add('ki', 'rlfKi');
+  add('kd', 'rlfKd');
+  add('base', 'rlfBase');
+  add('max-duty', 'rlfMaxDuty');
+  add('max-correction', 'rlfMaxCorrection');
+  add('integral-limit', 'rlfIntegralLimit');
+  add('derivative-limit', 'rlfDerivativeLimit');
+  add('derivative-alpha', 'rlfDerivativeAlpha');
+  add('polarity', 'rlfPolarity');
+  add('telemetry', 'rlfTelemetry');
+  return p;
+}
+function rlfApply(){ return api(`/api/rear-line-follow/config?${rlfParams().toString()}`); }
+function rlfStart(){ rlfApply().then(() => api(`/api/rear-line-follow/start?ms=${qs('rlfDuration').value || 5000}`)); }
+function rlfStop(){ api('/api/rear-line-follow/stop'); }
+function rlfSave(){ rlfApply().then(() => api('/api/config/save')); }
 function lineSensorMode(){ api('/api/mode?mode=line-sensor'); }
+function rearLineSensorMode(){ api('/api/mode?mode=rear-line-sensor'); }
 function autoSolarStart(){ api('/api/autonomous/solar/start'); }
+function loadTowerControls(j){
+  if (towerLoaded || !j.tower_pieces) return;
+  setLfValue('towerDuty', j.tower_pieces.reverse_line_duty);
+  setLfValue('towerTimeoutMs', j.tower_pieces.side_line_timeout_ms);
+  setLfValue('towerPostLineDelayMs', j.tower_pieces.post_line_delay_ms);
+  setLfValue('towerStrafeDuty', j.tower_pieces.strafe_right_duty);
+  setLfValue('towerStrafeDurationMs', j.tower_pieces.strafe_right_duration_ms);
+  setLfValue('towerPostStrafePauseMs', j.tower_pieces.post_strafe_pause_ms);
+  setLfValue('towerRotationDuty', j.tower_pieces.clockwise_rotation_duty);
+  setLfValue('towerRotationDurationMs', j.tower_pieces.clockwise_rotation_duration_ms);
+  setLfValue('towerPostRotationPauseMs', j.tower_pieces.post_rotation_pause_ms);
+  setLfValue('towerReverseDuty', j.tower_pieces.reverse_duty);
+  setLfValue('towerReverseDurationMs', j.tower_pieces.reverse_duration_ms);
+  setLfValue('towerShimmyDuty', j.tower_pieces.shimmy_duty);
+  setLfValue('towerShimmyRightMs', j.tower_pieces.shimmy_right_duration_ms);
+  setLfValue('towerShimmyLeftMs', j.tower_pieces.shimmy_left_duration_ms);
+  setLfValue('towerShimmyTimeoutMs', j.tower_pieces.shimmy_timeout_ms);
+  towerLoaded = true;
+}
+function towerParams(){
+  const p = new URLSearchParams();
+  p.set('duty', qs('towerDuty').value);
+  p.set('timeout-ms', qs('towerTimeoutMs').value);
+  p.set('post-line-delay-ms', qs('towerPostLineDelayMs').value);
+  p.set('strafe-duty', qs('towerStrafeDuty').value);
+  p.set('strafe-duration-ms', qs('towerStrafeDurationMs').value);
+  p.set('post-strafe-pause-ms', qs('towerPostStrafePauseMs').value);
+  p.set('rotation-duty', qs('towerRotationDuty').value);
+  p.set('rotation-duration-ms', qs('towerRotationDurationMs').value);
+  p.set('post-rotation-pause-ms', qs('towerPostRotationPauseMs').value);
+  p.set('reverse-duty', qs('towerReverseDuty').value);
+  p.set('reverse-duration-ms', qs('towerReverseDurationMs').value);
+  p.set('shimmy-duty', qs('towerShimmyDuty').value);
+  p.set('shimmy-right-ms', qs('towerShimmyRightMs').value);
+  p.set('shimmy-left-ms', qs('towerShimmyLeftMs').value);
+  p.set('shimmy-timeout-ms', qs('towerShimmyTimeoutMs').value);
+  return p;
+}
+function towerResult(r){
+  qs('towerCommand').textContent = r.ok ? (r.json.message || 'ok') : (r.json.error || `HTTP ${r.status}`);
+  qs('towerCommand').className = r.ok ? 'mono good' : 'mono bad';
+  return r;
+}
+function towerApply(){ return api(`/api/autonomous/tower-pieces/config?${towerParams().toString()}`).then(towerResult); }
+function towerStart(){ towerApply().then(r => { if (r.ok) api('/api/autonomous/tower-pieces/start').then(towerResult); }); }
+function towerSave(){ towerApply().then(r => { if (r.ok) api('/api/config/save').then(towerResult); }); }
 function loadSolarControls(j){
   if (solarLoaded || !j.autonomous) return;
   const a = j.autonomous;
@@ -2252,6 +3186,11 @@ function loadSolarControls(j){
   setLfValue('solarRetryLeftMs', a.retry_strafe_left_duration_ms);
   setLfValue('solarRetryForwardMs', a.retry_forward_duration_ms);
   setLfValue('solarRetryStrafeTimeoutMs', a.retry_strafe_timeout_ms);
+  setLfValue('solarPostContactForwardMs', a.post_contact_forward_duration_ms);
+  setLfValue('solarPostContactForwardDuty', a.post_contact_forward_duty);
+  setLfValue('solarLineReacquireDuty', a.line_reacquire_strafe_duty);
+  setLfValue('solarPostContactForwardDelayMs', a.post_contact_forward_start_delay_ms);
+  setLfValue('solarPostForwardStrafeDelayMs', a.line_reacquire_strafe_start_delay_ms);
   solarLoaded = true;
 }
 function solarParams(){
@@ -2274,11 +3213,16 @@ function solarParams(){
   add('retry-left-ms', 'solarRetryLeftMs');
   add('retry-forward-ms', 'solarRetryForwardMs');
   add('retry-strafe-timeout-ms', 'solarRetryStrafeTimeoutMs');
+  add('post-contact-forward-ms', 'solarPostContactForwardMs');
+  add('post-contact-forward-duty', 'solarPostContactForwardDuty');
+  add('line-reacquire-duty', 'solarLineReacquireDuty');
+  add('post-contact-forward-delay-ms', 'solarPostContactForwardDelayMs');
+  add('post-forward-strafe-delay-ms', 'solarPostForwardStrafeDelayMs');
   return p;
 }
 function autoSolarApply(){ return api(`/api/autonomous/solar/config?${solarParams().toString()}`); }
 function autoSolarSave(){ autoSolarApply().then(r => { if (r.ok) api('/api/config/save'); }); }
-function setClawStart(id, value){
+function setClawAngle(id, value){
   const el = qs(id);
   if (!el || document.activeElement === el) return;
   el.value = value >= 0 ? value : '';
@@ -2288,29 +3232,39 @@ function loadClawControls(j){
   const claws = [j.claws.claw_1, j.claws.claw_2, j.claws.claw_3];
   claws.forEach((claw, index) => {
     const n = index + 1;
-    setClawStart(`claw${n}Start`, claw.startAngleDeg);
-    setLfValue(`claw${n}Dir`, claw.openDirection);
+    setClawAngle(`claw${n}Open`, claw.openAngleDeg);
+    setClawAngle(`claw${n}Closed`, claw.closedAngleDeg);
   });
+  const winchServo = j.claws.winch || {};
+  setClawAngle('winchOpen', winchServo.openAngleDeg ?? -1);
+  setClawAngle('winchClosed', winchServo.closedAngleDeg ?? -1);
   clawsLoaded = true;
 }
 function clawParams(){
   const p = new URLSearchParams();
   for (let n = 1; n <= 3; n++) {
-    const start = qs(`claw${n}Start`).value;
-    if (start !== '') p.set(`claw${n}-start`, start);
-    p.set(`claw${n}-dir`, qs(`claw${n}Dir`).value);
+    const open = qs(`claw${n}Open`).value;
+    const closed = qs(`claw${n}Closed`).value;
+    if (open !== '') p.set(`claw${n}-open`, open);
+    if (closed !== '') p.set(`claw${n}-closed`, closed);
   }
+  const winchOpen = qs('winchOpen').value;
+  const winchClosed = qs('winchClosed').value;
+  if (winchOpen !== '') p.set('winch-open', winchOpen);
+  if (winchClosed !== '') p.set('winch-closed', winchClosed);
   return p;
 }
 function clawsApply(){ return api(`/api/claws/config?${clawParams().toString()}`); }
 function clawsSave(){ clawsApply().then(r => { if (r.ok) api('/api/claws/save'); }); }
 function claw(id,state){ clawsApply().then(r => { if (r.ok) api(`/api/claw?id=${id}&state=${state}`); }); }
 function clawAll(state){ clawsApply().then(r => { if (r.ok) api(`/api/claws?state=${state}`); }); }
+function winch(state){ clawsApply().then(r => { if (r.ok) api(`/api/winch?state=${state}`); }); }
 function clawSummary(c){
   if (!c) return 'n/a';
-  const start = c.startConfigured ? c.startAngleDeg : 'unset';
+  const open = c.openConfigured ? c.openAngleDeg : 'unset';
+  const closed = c.closedConfigured ? c.closedAngleDeg : 'unset';
   const target = c.outputEnabled ? c.commandedAngleDeg : 'off';
-  return `start=${start} open=${c.openAngleDeg} target=${target}`;
+  return `open=${open} closed=${closed} target=${target}`;
 }
 function yn(v){ return v ? 'yes' : 'no'; }
 function level(v){ return v ? 'HIGH' : 'LOW'; }
@@ -2344,15 +3298,44 @@ function update(){
     qs('solarRetryLeft').textContent = `${a.retry_strafe_left_duration_ms ?? 0} ms`;
     qs('solarRetryForward').textContent = `${a.retry_forward_duration_ms ?? 0} ms`;
     qs('solarRetryTimeout').textContent = `${a.retry_strafe_timeout_ms ?? 0} ms`;
+    qs('solarPostContactForward').textContent = `${a.post_contact_forward_duration_ms ?? 0} ms`;
+    qs('solarPostContactForwardDutyStatus').textContent = a.post_contact_forward_duty ?? 0;
+    qs('solarLineReacquireDutyStatus').textContent = a.line_reacquire_strafe_duty ?? 0;
+    qs('solarPostContactForwardDelay').textContent = `${a.post_contact_forward_start_delay_ms ?? 0} ms`;
+    qs('solarPostForwardStrafeDelay').textContent = `${a.line_reacquire_strafe_start_delay_ms ?? 0} ms`;
+    const tower = j.tower_pieces || {};
+    qs('towerState').textContent = tower.state || 'WAIT_FOR_START';
+    qs('towerFault').textContent = tower.fault_reason || 'NONE';
+    qs('towerFault').className = tower.fault_reason && tower.fault_reason !== 'NONE' ? 'mono bad' : 'mono good';
+    qs('towerTime').textContent = `${tower.time_in_state_ms ?? 0} ms`;
+    qs('towerFollowing').textContent = yn(tower.line_following);
+    qs('towerSideSensor').textContent = `${level(tower.side_line_sensor_high)} configured=${yn(tower.side_line_sensor_configured)}`;
+    qs('towerSideSensor').className = tower.side_line_sensor_configured ? 'mono good' : 'mono bad';
+    qs('towerSideCount').textContent = `${tower.side_line_count ?? 0} / ${tower.target_side_line_count ?? 2}`;
+    qs('towerSideCount').className = (tower.side_line_count ?? 0) >= (tower.target_side_line_count ?? 2) ? 'mono good' : 'mono';
+    qs('towerBackLineDetected').textContent = yn(tower.back_line_detected);
+    qs('towerBackLineDetected').className = tower.back_line_detected ? 'mono good' : 'mono';
+    loadTowerControls(j);
     loadSolarControls(j);
     loadLfControls(j);
+    loadRlfControls(j);
     loadClawControls(j);
     qs('lfEnabled').textContent = yn(j.line.line_follower_enabled);
     qs('lsfl').textContent = `${j.line.lsfl_level} black=${yn(j.line.lsfl_black)}`;
     qs('lsfr').textContent = `${j.line.lsfr_level} black=${yn(j.line.lsfr_black)}`;
     qs('lss').textContent = `${j.line.lss_level} black=${yn(j.line.lss_black)} configured=${yn(j.line.lss_configured)}`;
     qs('lfError').textContent = `${j.line.line_error}, side=${j.line.last_known_line_side}, visible=${yn(j.line.line_visible)}, hist=${yn(j.line.has_history)}`;
+    const rearLine = j.rear_line || {};
+    qs('rlfEnabled').textContent = yn(rearLine.line_follower_enabled);
+    qs('lsbl').textContent = `${rearLine.lsbl_level || 'UNKNOWN'} black=${yn(rearLine.lsbl_black)}`;
+    qs('lsbr').textContent = `${rearLine.lsbr_level || 'UNKNOWN'} black=${yn(rearLine.lsbr_black)}`;
+    qs('rlfMapping').textContent = `${rearLine.logical_left_source || 'LSBR'}=${yn(rearLine.logical_left_black)} / ${rearLine.logical_right_source || 'LSBL'}=${yn(rearLine.logical_right_black)}`;
+    qs('rearLineStream').textContent = `configured=${yn(rearLine.configured)} fresh=${yn(rearLine.data_fresh)} seq=${rearLine.sequence ?? 0} age=${rearLine.sample_age_ms ?? 0} ms`;
+    qs('rlfError').textContent = `${rearLine.line_error ?? 0}, side=${rearLine.last_known_line_side ?? 0}, visible=${yn(rearLine.line_visible)}, hist=${yn(rearLine.has_history)}`;
     qs('lfPid').textContent = `P=${j.pid.p_term.toFixed(3)} I=${j.pid.i_term.toFixed(3)} D=${j.pid.d_term.toFixed(3)} C=${j.pid.correction.toFixed(3)}`;
+    const rearPid = j.rear_pid || {};
+    qs('rlfPid').textContent = `P=${(rearPid.p_term ?? 0).toFixed(3)} I=${(rearPid.i_term ?? 0).toFixed(3)} D=${(rearPid.d_term ?? 0).toFixed(3)} C=${(rearPid.correction ?? 0).toFixed(3)}`;
+    qs('rlfEffectiveBase').textContent = `${rearPid.effectiveBaseDuty ?? 0} (reverse)`;
     qs('irSelectedHz').textContent = j.selectedBeaconFrequencyHz ?? 0;
     qs('irAmp').textContent = j.ir_amplitude_pp ?? 0;
     qs('ir1k').textContent = j.ir_1khz_goertzel_amplitude ?? 0;
@@ -2369,6 +3352,9 @@ function update(){
     const clawList = [claws.claw_1, claws.claw_2, claws.claw_3];
     qs('clawHardware').textContent = clawList.map(c => yn(c && c.hardwareConfigured)).join(' / ');
     qs('clawCommanded').textContent = clawList.map(clawSummary).join(' | ');
+    qs('winchHardware').textContent = yn(claws.winch && claws.winch.hardwareConfigured);
+    qs('winchHardware').className = claws.winch && claws.winch.hardwareConfigured ? 'mono good' : 'mono bad';
+    qs('winchCommanded').textContent = clawSummary(claws.winch);
     qs('claws').textContent = JSON.stringify(claws, null, 2);
   }).catch(() => { qs('fault').textContent = 'telemetry disconnected'; qs('fault').className = 'mono bad'; });
   fetch('/api/events').then(r => r.json()).then(j => { qs('events').textContent = JSON.stringify(j.events, null, 2); });
@@ -2441,6 +3427,7 @@ void handleMode() {
                    *g_runtime.front_right, *g_runtime.rear_link, now_ms);
   g_runtime.context->modes.setMode(mode, now_ms);
   resetSolarPanelAutonomy(*g_runtime.context, now_ms);
+  resetTowerPieces(*g_runtime.context, now_ms);
   clearFault(*g_runtime.context);
   logEvent(*g_runtime.context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Web, "mode changed");
@@ -2706,6 +3693,38 @@ void handleLine() {
   g_server.send(200, "application/json", g_json_buffer);
 }
 
+void handleRearLine() {
+  const robot::TelemetrySnapshot snapshot = currentSnapshot();
+  std::snprintf(
+      g_json_buffer, sizeof(g_json_buffer),
+      "{\"LSBL\":%d,\"LSBR\":%d,\"LSBLLevel\":\"%s\","
+      "\"LSBRLevel\":\"%s\",\"leftBlack\":%s,\"rightBlack\":%s,"
+      "\"configured\":%s,\"dataFresh\":%s,\"sequence\":%u,"
+      "\"sampleAgeMs\":%u,\"capturedAtMs\":%u,\"error\":%d,"
+      "\"lastKnownSide\":%d,\"lineVisible\":%s,\"hasHistory\":%s,"
+      "\"travelDirection\":\"REVERSE\","
+      "\"logicalLeftSource\":\"LSBR\","
+      "\"logicalRightSource\":\"LSBL\","
+      "\"logicalLeftBlack\":%s,\"logicalRightBlack\":%s}",
+      snapshot.lsbl_raw_level, snapshot.lsbr_raw_level,
+      digitalLevelName(snapshot.lsbl_raw_level),
+      digitalLevelName(snapshot.lsbr_raw_level),
+      snapshot.lsbl_black ? "true" : "false",
+      snapshot.lsbr_black ? "true" : "false",
+      snapshot.rear_line_configured ? "true" : "false",
+      snapshot.rear_line_data_fresh ? "true" : "false",
+      static_cast<unsigned>(snapshot.rear_line_sequence),
+      static_cast<unsigned>(snapshot.rear_line_sample_age_ms),
+      static_cast<unsigned>(snapshot.rear_line_captured_at_ms),
+      static_cast<int>(snapshot.rear_line_error),
+      static_cast<int>(snapshot.rear_last_known_line_side),
+      snapshot.rear_line_visible ? "true" : "false",
+      snapshot.rear_line_has_history ? "true" : "false",
+      snapshot.rear_logical_left_black ? "true" : "false",
+      snapshot.rear_logical_right_black ? "true" : "false");
+  g_server.send(200, "application/json", g_json_buffer);
+}
+
 void handleAutonomousSolarStart() {
   if (!runtimeReady()) {
     sendErrorJson(503, "runtime not ready");
@@ -2879,6 +3898,48 @@ void handleAutonomousSolarConfig() {
     }
     next_contact.retry_strafe_timeout_ms = milliseconds_value;
   }
+  if (g_server.hasArg("post-contact-forward-ms")) {
+    if (!argUnsigned("post-contact-forward-ms", milliseconds_value,
+                     next_contact.post_contact_forward_duration_ms, true)) {
+      sendErrorJson(400, "malformed post-contact-forward-ms");
+      return;
+    }
+    next_contact.post_contact_forward_duration_ms = milliseconds_value;
+  }
+  if (g_server.hasArg("post-contact-forward-duty")) {
+    if (!argFloat("post-contact-forward-duty", float_value,
+                  next_contact.post_contact_forward_duty, true)) {
+      sendErrorJson(400, "malformed post-contact-forward-duty");
+      return;
+    }
+    next_contact.post_contact_forward_duty = float_value;
+  }
+  if (g_server.hasArg("line-reacquire-duty")) {
+    if (!argFloat("line-reacquire-duty", float_value,
+                  next_contact.line_reacquire_strafe_duty, true)) {
+      sendErrorJson(400, "malformed line-reacquire-duty");
+      return;
+    }
+    next_contact.line_reacquire_strafe_duty = float_value;
+  }
+  if (g_server.hasArg("post-contact-forward-delay-ms")) {
+    if (!argUnsigned(
+            "post-contact-forward-delay-ms", milliseconds_value,
+            next_contact.post_contact_forward_start_delay_ms, true)) {
+      sendErrorJson(400, "malformed post-contact-forward-delay-ms");
+      return;
+    }
+    next_contact.post_contact_forward_start_delay_ms = milliseconds_value;
+  }
+  if (g_server.hasArg("post-forward-strafe-delay-ms")) {
+    if (!argUnsigned(
+            "post-forward-strafe-delay-ms", milliseconds_value,
+            next_contact.line_reacquire_strafe_start_delay_ms, true)) {
+      sendErrorJson(400, "malformed post-forward-strafe-delay-ms");
+      return;
+    }
+    next_contact.line_reacquire_strafe_start_delay_ms = milliseconds_value;
+  }
 
   robot::SolarPanelAutonomyConfig validate_1khz = next_config;
   validate_1khz.detection_threshold = next_thresholds.detect_1khz;
@@ -2907,6 +3968,173 @@ void handleAutonomousSolarConfig() {
            robot::EventSeverity::Info, robot::EventSource::Web,
            "solar autonomy config updated");
   sendOkJson("solar autonomy config updated");
+}
+
+void handleTowerPiecesStart() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  requestTowerPiecesStart(*g_runtime.context, *g_runtime.front_left,
+                          *g_runtime.front_right, *g_runtime.rear_link,
+                          now_ms, robot::EventSource::Web);
+  sendOkJson("tower pieces start requested");
+}
+
+void handleTowerPiecesConfig() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  robot::TowerPiecesConfig next = context.tower_pieces_config;
+  float duty = next.reverse_line_duty;
+  robot::Milliseconds timeout_ms = next.side_line_timeout_ms;
+  robot::Milliseconds post_line_delay_ms = next.post_line_delay_ms;
+  float strafe_duty = next.strafe_right_duty;
+  robot::Milliseconds strafe_duration_ms =
+      next.strafe_right_duration_ms;
+  robot::Milliseconds post_strafe_pause_ms =
+      next.post_strafe_pause_ms;
+  float rotation_duty = next.clockwise_rotation_duty;
+  robot::Milliseconds rotation_duration_ms =
+      next.clockwise_rotation_duration_ms;
+  robot::Milliseconds post_rotation_pause_ms =
+      next.post_rotation_pause_ms;
+  float reverse_duty = next.reverse_duty;
+  robot::Milliseconds reverse_duration_ms = next.reverse_duration_ms;
+  float shimmy_duty = next.shimmy_duty;
+  robot::Milliseconds shimmy_right_ms = next.shimmy_right_duration_ms;
+  robot::Milliseconds shimmy_left_ms = next.shimmy_left_duration_ms;
+  robot::Milliseconds shimmy_timeout_ms = next.shimmy_timeout_ms;
+  if (g_server.hasArg("duty") &&
+      !argFloat("duty", duty, next.reverse_line_duty, true)) {
+    sendErrorJson(400, "malformed duty");
+    return;
+  }
+  if (g_server.hasArg("timeout-ms") &&
+      !argUnsigned("timeout-ms", timeout_ms,
+                   next.side_line_timeout_ms, true)) {
+    sendErrorJson(400, "malformed timeout-ms");
+    return;
+  }
+  if (g_server.hasArg("post-line-delay-ms") &&
+      !argUnsigned("post-line-delay-ms", post_line_delay_ms,
+                   next.post_line_delay_ms, true)) {
+    sendErrorJson(400, "malformed post-line-delay-ms");
+    return;
+  }
+  if (g_server.hasArg("strafe-duty") &&
+      !argFloat("strafe-duty", strafe_duty,
+                next.strafe_right_duty, true)) {
+    sendErrorJson(400, "malformed strafe-duty");
+    return;
+  }
+  if (g_server.hasArg("strafe-duration-ms") &&
+      !argUnsigned("strafe-duration-ms", strafe_duration_ms,
+                   next.strafe_right_duration_ms, true)) {
+    sendErrorJson(400, "malformed strafe-duration-ms");
+    return;
+  }
+  if (g_server.hasArg("post-strafe-pause-ms") &&
+      !argUnsigned("post-strafe-pause-ms", post_strafe_pause_ms,
+                   next.post_strafe_pause_ms, true)) {
+    sendErrorJson(400, "malformed post-strafe-pause-ms");
+    return;
+  }
+  if (g_server.hasArg("rotation-duty") &&
+      !argFloat("rotation-duty", rotation_duty,
+                next.clockwise_rotation_duty, true)) {
+    sendErrorJson(400, "malformed rotation-duty");
+    return;
+  }
+  if (g_server.hasArg("rotation-duration-ms") &&
+      !argUnsigned("rotation-duration-ms", rotation_duration_ms,
+                   next.clockwise_rotation_duration_ms, true)) {
+    sendErrorJson(400, "malformed rotation-duration-ms");
+    return;
+  }
+  if (g_server.hasArg("post-rotation-pause-ms") &&
+      !argUnsigned("post-rotation-pause-ms", post_rotation_pause_ms,
+                   next.post_rotation_pause_ms, true)) {
+    sendErrorJson(400, "malformed post-rotation-pause-ms");
+    return;
+  }
+  if (g_server.hasArg("reverse-duty") &&
+      !argFloat("reverse-duty", reverse_duty, next.reverse_duty, true)) {
+    sendErrorJson(400, "malformed reverse-duty");
+    return;
+  }
+  if (g_server.hasArg("reverse-duration-ms") &&
+      !argUnsigned("reverse-duration-ms", reverse_duration_ms,
+                   next.reverse_duration_ms, true)) {
+    sendErrorJson(400, "malformed reverse-duration-ms");
+    return;
+  }
+  if (g_server.hasArg("shimmy-duty") &&
+      !argFloat("shimmy-duty", shimmy_duty, next.shimmy_duty, true)) {
+    sendErrorJson(400, "malformed shimmy-duty");
+    return;
+  }
+  if (g_server.hasArg("shimmy-direction-ms")) {
+    robot::Milliseconds shared_shimmy_ms = shimmy_right_ms;
+    if (!argUnsigned("shimmy-direction-ms", shared_shimmy_ms,
+                     shimmy_right_ms, true)) {
+      sendErrorJson(400, "malformed shimmy-direction-ms");
+      return;
+    }
+    shimmy_right_ms = shared_shimmy_ms;
+    shimmy_left_ms = shared_shimmy_ms;
+  }
+  if (g_server.hasArg("shimmy-right-ms") &&
+      !argUnsigned("shimmy-right-ms", shimmy_right_ms,
+                   next.shimmy_right_duration_ms, true)) {
+    sendErrorJson(400, "malformed shimmy-right-ms");
+    return;
+  }
+  if (g_server.hasArg("shimmy-left-ms") &&
+      !argUnsigned("shimmy-left-ms", shimmy_left_ms,
+                   next.shimmy_left_duration_ms, true)) {
+    sendErrorJson(400, "malformed shimmy-left-ms");
+    return;
+  }
+  if (g_server.hasArg("shimmy-timeout-ms") &&
+      !argUnsigned("shimmy-timeout-ms", shimmy_timeout_ms,
+                   next.shimmy_timeout_ms, true)) {
+    sendErrorJson(400, "malformed shimmy-timeout-ms");
+    return;
+  }
+  next.reverse_line_duty = duty;
+  next.side_line_timeout_ms = timeout_ms;
+  next.post_line_delay_ms = post_line_delay_ms;
+  next.strafe_right_duty = strafe_duty;
+  next.strafe_right_duration_ms = strafe_duration_ms;
+  next.post_strafe_pause_ms = post_strafe_pause_ms;
+  next.clockwise_rotation_duty = rotation_duty;
+  next.clockwise_rotation_duration_ms = rotation_duration_ms;
+  next.post_rotation_pause_ms = post_rotation_pause_ms;
+  next.reverse_duty = reverse_duty;
+  next.reverse_duration_ms = reverse_duration_ms;
+  next.shimmy_duty = shimmy_duty;
+  next.shimmy_right_duration_ms = shimmy_right_ms;
+  next.shimmy_left_duration_ms = shimmy_left_ms;
+  next.shimmy_timeout_ms = shimmy_timeout_ms;
+  if (!robot::towerPiecesConfigValid(next, rearMotionDutyCap(context))) {
+    sendErrorJson(
+        409,
+        "tower pieces config requires all duties > 0 within rear max duty and all timings > 0");
+    return;
+  }
+
+  context.tower_pieces_config = next;
+  clearFault(context);
+  logEvent(context, static_cast<robot::Milliseconds>(millis()),
+           robot::EventSeverity::Info, robot::EventSource::Web,
+           "tower pieces config updated");
+  sendOkJson("tower pieces config updated");
 }
 
 bool parseClawId(std::size_t& claw_index) {
@@ -2960,49 +4188,96 @@ bool readOptionalClawInt(const char* primary_name, const char* alternate_name,
 }
 
 bool parseClawSettings(ClawServoSettings& settings) {
-  int value = 0;
+  constexpr const char* kOpenNames[kClawServoCount][2] = {
+      {"claw1-open", "claw1Open"},
+      {"claw2-open", "claw2Open"},
+      {"claw3-open", "claw3Open"},
+  };
+  constexpr const char* kClosedNames[kClawServoCount][2] = {
+      {"claw1-closed", "claw1Closed"},
+      {"claw2-closed", "claw2Closed"},
+      {"claw3-closed", "claw3Closed"},
+  };
+  constexpr const char* kLegacyStartNames[kClawServoCount][2] = {
+      {"claw1-start", "claw1Start"},
+      {"claw2-start", "claw2Start"},
+      {"claw3-start", "claw3Start"},
+  };
+  constexpr const char* kLegacyDirectionNames[kClawServoCount][2] = {
+      {"claw1-dir", "claw1Direction"},
+      {"claw2-dir", "claw2Direction"},
+      {"claw3-dir", "claw3Direction"},
+  };
 
-  value = settings.start_angle_deg[0];
-  if (!readOptionalClawInt("claw1-start", "claw1Start", value,
-                           "malformed claw1 start angle")) {
+  for (std::size_t index = 0U; index < kClawServoCount; ++index) {
+    const bool has_open = g_server.hasArg(kOpenNames[index][0]) ||
+                          g_server.hasArg(kOpenNames[index][1]);
+    const bool has_closed = g_server.hasArg(kClosedNames[index][0]) ||
+                            g_server.hasArg(kClosedNames[index][1]);
+    const bool has_legacy_start =
+        g_server.hasArg(kLegacyStartNames[index][0]) ||
+        g_server.hasArg(kLegacyStartNames[index][1]);
+    const bool has_legacy_direction =
+        g_server.hasArg(kLegacyDirectionNames[index][0]) ||
+        g_server.hasArg(kLegacyDirectionNames[index][1]);
+
+    int value = settings.open_angle_deg[index];
+    if (!readOptionalClawInt(kOpenNames[index][0], kOpenNames[index][1],
+                             value, "malformed claw open angle")) {
+      return false;
+    }
+    settings.open_angle_deg[index] = value;
+
+    value = settings.closed_angle_deg[index];
+    if (!readOptionalClawInt(kClosedNames[index][0], kClosedNames[index][1],
+                             value, "malformed claw closed angle")) {
+      return false;
+    }
+    settings.closed_angle_deg[index] = value;
+
+    // Backward compatibility for the previous start + direction API. Start
+    // represented closed, and open was derived as start +/- 90 degrees.
+    if (!has_closed && has_legacy_start) {
+      value = settings.closed_angle_deg[index];
+      if (!readOptionalClawInt(kLegacyStartNames[index][0],
+                               kLegacyStartNames[index][1], value,
+                               "malformed legacy claw start angle")) {
+        return false;
+      }
+      settings.closed_angle_deg[index] = value;
+    }
+    if (!has_open && (has_legacy_start || has_legacy_direction)) {
+      int direction = 1;
+      if (!readOptionalClawInt(kLegacyDirectionNames[index][0],
+                               kLegacyDirectionNames[index][1], direction,
+                               "malformed legacy claw direction")) {
+        return false;
+      }
+      if (direction != 1 && direction != -1) {
+        sendErrorJson(400, "legacy claw direction must be 1 or -1");
+        return false;
+      }
+      if (settings.closed_angle_deg[index] != kClawServoUnsetAngleDeg) {
+        settings.open_angle_deg[index] =
+            settings.closed_angle_deg[index] +
+            (direction * kLegacyClawServoRotationDeg);
+      }
+    }
+  }
+
+  int value = settings.open_angle_deg[kWinchServoIndex];
+  if (!readOptionalClawInt("winch-open", "winchOpen", value,
+                           "malformed winch open angle")) {
     return false;
   }
-  settings.start_angle_deg[0] = value;
+  settings.open_angle_deg[kWinchServoIndex] = value;
 
-  value = settings.start_angle_deg[1];
-  if (!readOptionalClawInt("claw2-start", "claw2Start", value,
-                           "malformed claw2 start angle")) {
+  value = settings.closed_angle_deg[kWinchServoIndex];
+  if (!readOptionalClawInt("winch-closed", "winchClosed", value,
+                           "malformed winch closed angle")) {
     return false;
   }
-  settings.start_angle_deg[1] = value;
-
-  value = settings.start_angle_deg[2];
-  if (!readOptionalClawInt("claw3-start", "claw3Start", value,
-                           "malformed claw3 start angle")) {
-    return false;
-  }
-  settings.start_angle_deg[2] = value;
-
-  value = settings.open_direction[0];
-  if (!readOptionalClawInt("claw1-dir", "claw1Direction", value,
-                           "malformed claw1 direction")) {
-    return false;
-  }
-  settings.open_direction[0] = value;
-
-  value = settings.open_direction[1];
-  if (!readOptionalClawInt("claw2-dir", "claw2Direction", value,
-                           "malformed claw2 direction")) {
-    return false;
-  }
-  settings.open_direction[1] = value;
-
-  value = settings.open_direction[2];
-  if (!readOptionalClawInt("claw3-dir", "claw3Direction", value,
-                           "malformed claw3 direction")) {
-    return false;
-  }
-  settings.open_direction[2] = value;
+  settings.closed_angle_deg[kWinchServoIndex] = value;
   return true;
 }
 
@@ -3040,8 +4315,8 @@ void handleClawsConfig() {
   clearFault(context);
   logEvent(context, static_cast<robot::Milliseconds>(millis()),
            robot::EventSeverity::Info, robot::EventSource::Web,
-           "claw settings updated");
-  sendOkJson("claw settings updated");
+           "servo settings updated");
+  sendOkJson("servo settings updated");
 }
 
 void handleClaw() {
@@ -3108,6 +4383,39 @@ void handleClawsAll() {
   logEvent(context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Web, "all claw command accepted");
   sendOkJson("all claw command accepted");
+}
+
+void handleWinch() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  ClawServoPositionRequest request{};
+  if (!parseClawRequest(request)) {
+    sendErrorJson(400, "malformed winch command");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  enterMechanismTestIfNeeded(context, now_ms);
+  const ClawServoCommandResult result =
+      g_runtime.claws->command(kWinchServoIndex, request);
+  if (result != ClawServoCommandResult::Accepted) {
+    const char* reason = clawServoResultReason(result);
+    setFault(context, clawFaultCode(result), reason);
+    logEvent(context, now_ms, robot::EventSeverity::Warn,
+             robot::EventSource::Web, reason);
+    sendErrorJson(409, reason);
+    return;
+  }
+
+  context.last_command_ms = now_ms;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web, "winch command accepted");
+  sendOkJson("winch command accepted");
 }
 
 void handleFunnel() {
@@ -3188,13 +4496,17 @@ void handleClawsSave() {
     return;
   }
   const ClawServoSettings& settings = g_runtime.claws->settings();
-  g_runtime.preferences->putInt("c1start", settings.start_angle_deg[0]);
-  g_runtime.preferences->putInt("c2start", settings.start_angle_deg[1]);
-  g_runtime.preferences->putInt("c3start", settings.start_angle_deg[2]);
-  g_runtime.preferences->putInt("c1dir", settings.open_direction[0]);
-  g_runtime.preferences->putInt("c2dir", settings.open_direction[1]);
-  g_runtime.preferences->putInt("c3dir", settings.open_direction[2]);
-  sendOkJson("claw settings saved");
+  g_runtime.preferences->putInt("c1open", settings.open_angle_deg[0]);
+  g_runtime.preferences->putInt("c2open", settings.open_angle_deg[1]);
+  g_runtime.preferences->putInt("c3open", settings.open_angle_deg[2]);
+  g_runtime.preferences->putInt("c1closed", settings.closed_angle_deg[0]);
+  g_runtime.preferences->putInt("c2closed", settings.closed_angle_deg[1]);
+  g_runtime.preferences->putInt("c3closed", settings.closed_angle_deg[2]);
+  g_runtime.preferences->putInt(
+      "wopen", settings.open_angle_deg[kWinchServoIndex]);
+  g_runtime.preferences->putInt(
+      "wclosed", settings.closed_angle_deg[kWinchServoIndex]);
+  sendOkJson("servo settings saved");
 }
 
 void handleLineFollowStart() {
@@ -3259,13 +4571,78 @@ void handleLineFollowStop() {
   sendOkJson("line follower stopped");
 }
 
-void handleLineFollowConfig() {
+void handleRearLineFollowStart() {
   if (!runtimeReady()) {
     sendErrorJson(503, "runtime not ready");
     return;
   }
   RuntimeContext& context = *g_runtime.context;
-  robot::LineFollowerConfig next = context.config;
+  robot::Milliseconds duration_ms = kMaxTimedTestDurationMs;
+  if (!argUnsigned("ms", duration_ms, kMaxTimedTestDurationMs, false)) {
+    sendErrorJson(400, "malformed duration");
+    return;
+  }
+  const robot::CommandValidationResult duration_validation =
+      robot::validateTimedDuration(duration_ms, kMaxTimedTestDurationMs);
+  if (!duration_validation.accepted) {
+    sendErrorJson(409, duration_validation.reason);
+    return;
+  }
+
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  if (context.modes.currentMode() !=
+      robot::RobotTestMode::RearLineFollowTest) {
+    disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
+                     *g_runtime.rear_link, now_ms);
+    context.modes.setMode(robot::RobotTestMode::RearLineFollowTest, now_ms);
+  }
+  if (!rearLineStartRequirementsMet(
+          *g_runtime.front_left, *g_runtime.front_right,
+          *g_runtime.rear_link, now_ms, context)) {
+    setFault(context, robot::FaultCode::HardwareNotConfigured,
+             "rear line follower hardware or sensor stream is incomplete");
+    logEvent(context, now_ms, robot::EventSeverity::Fault,
+             robot::EventSource::Line,
+             "rear line follower start rejected: hardware or data incomplete");
+    sendErrorJson(
+        409,
+        "configure rear sensors, motors, UART, fresh ESP1 data, max-duty, hardware cap");
+    return;
+  }
+
+  robot::startLineFollower(context.follower_state, now_ms);
+  context.last_command_ms = now_ms;
+  context.mode_expires_at_ms = now_ms + duration_ms;
+  context.command_deadman_armed = true;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web, "rear line follower started");
+  sendOkJson("rear line follower started");
+}
+
+void handleRearLineFollowStop() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  disableActuators(*g_runtime.context, *g_runtime.front_left,
+                   *g_runtime.front_right, *g_runtime.rear_link, now_ms);
+  logEvent(*g_runtime.context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web, "rear line follower stopped");
+  sendOkJson("rear line follower stopped");
+}
+
+void handleLineFollowConfigImpl(const bool rear) {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  robot::LineFollowerConfig next =
+      rear ? context.rear_config : context.config;
   float value = 0.0F;
   robot::Milliseconds milliseconds_value = 0U;
   int polarity_value = next.steeringPolarity;
@@ -3437,6 +4814,9 @@ void handleLineFollowConfig() {
     next.steeringPolarity = polarity_value;
   }
 
+  if (rear) {
+    next.baseDuty = std::fabs(next.baseDuty);
+  }
   const robot::CommandValidationResult validation =
       robot::validateLineFollowerConfig(next, hardwareDutyCap());
   if (!validation.accepted) {
@@ -3448,12 +4828,26 @@ void handleLineFollowConfig() {
     return;
   }
 
-  context.config = next;
+  if (rear) {
+    context.rear_config = next;
+  } else {
+    context.config = next;
+  }
   clearFault(context);
   logEvent(context, static_cast<robot::Milliseconds>(millis()),
            robot::EventSeverity::Info, robot::EventSource::Web,
-           "line follower config updated");
-  sendOkJson("line follower config updated");
+           rear ? "rear line follower config updated"
+                : "line follower config updated");
+  sendOkJson(rear ? "rear line follower config updated"
+                  : "line follower config updated");
+}
+
+void handleLineFollowConfig() {
+  handleLineFollowConfigImpl(false);
+}
+
+void handleRearLineFollowConfig() {
+  handleLineFollowConfigImpl(true);
 }
 
 void handleConfig() {
@@ -3499,6 +4893,58 @@ void handleConfigSave() {
                                  context.config.remoteCommandTimeoutMs);
   g_runtime.preferences->putBool("lftele", context.config.telemetryEnabled);
   g_runtime.preferences->putInt("pol", context.config.steeringPolarity);
+  g_runtime.preferences->putFloat("rkp", context.rear_config.kp);
+  g_runtime.preferences->putFloat("rki", context.rear_config.ki);
+  g_runtime.preferences->putFloat("rkd", context.rear_config.kd);
+  g_runtime.preferences->putFloat(
+      "rbase", std::fabs(context.rear_config.baseDuty));
+  g_runtime.preferences->putFloat("rmax", context.rear_config.maxDuty);
+  g_runtime.preferences->putFloat("rcorr",
+                                  context.rear_config.maxCorrection);
+  g_runtime.preferences->putFloat("rilim",
+                                  context.rear_config.integralLimit);
+  g_runtime.preferences->putFloat("rdlim",
+                                  context.rear_config.derivativeLimit);
+  g_runtime.preferences->putFloat(
+      "rdalpha", context.rear_config.derivativeFilterAlpha);
+  g_runtime.preferences->putUInt("rperiod",
+                                 context.rear_config.controlPeriodMs);
+  g_runtime.preferences->putUInt(
+      "rrto", context.rear_config.remoteCommandTimeoutMs);
+  g_runtime.preferences->putBool(
+      "rlftele", context.rear_config.telemetryEnabled);
+  g_runtime.preferences->putInt("rpol",
+                                context.rear_config.steeringPolarity);
+  g_runtime.preferences->putFloat(
+      "tpduty", context.tower_pieces_config.reverse_line_duty);
+  g_runtime.preferences->putUInt(
+      "tptmo", context.tower_pieces_config.side_line_timeout_ms);
+  g_runtime.preferences->putUInt(
+      "tpdelay", context.tower_pieces_config.post_line_delay_ms);
+  g_runtime.preferences->putFloat(
+      "tpsduty", context.tower_pieces_config.strafe_right_duty);
+  g_runtime.preferences->putUInt(
+      "tpsdur", context.tower_pieces_config.strafe_right_duration_ms);
+  g_runtime.preferences->putUInt(
+      "tppause", context.tower_pieces_config.post_strafe_pause_ms);
+  g_runtime.preferences->putFloat(
+      "tprduty", context.tower_pieces_config.clockwise_rotation_duty);
+  g_runtime.preferences->putUInt(
+      "tprdur", context.tower_pieces_config.clockwise_rotation_duration_ms);
+  g_runtime.preferences->putUInt(
+      "tprpause", context.tower_pieces_config.post_rotation_pause_ms);
+  g_runtime.preferences->putFloat(
+      "tpbkduty", context.tower_pieces_config.reverse_duty);
+  g_runtime.preferences->putUInt(
+      "tpbkdur", context.tower_pieces_config.reverse_duration_ms);
+  g_runtime.preferences->putFloat(
+      "tpshduty", context.tower_pieces_config.shimmy_duty);
+  g_runtime.preferences->putUInt(
+      "tpshrdur", context.tower_pieces_config.shimmy_right_duration_ms);
+  g_runtime.preferences->putUInt(
+      "tpshldur", context.tower_pieces_config.shimmy_left_duration_ms);
+  g_runtime.preferences->putUInt(
+      "tpshtmo", context.tower_pieces_config.shimmy_timeout_ms);
   g_runtime.preferences->putUInt("sdet1", context.solar_thresholds.detect_1khz);
   g_runtime.preferences->putUInt("srel1",
                                  context.solar_thresholds.release_1khz);
@@ -3534,6 +4980,19 @@ void handleConfigSave() {
       "srfwd", context.solar_contact_config.retry_forward_duration_ms);
   g_runtime.preferences->putUInt(
       "srtmo", context.solar_contact_config.retry_strafe_timeout_ms);
+  g_runtime.preferences->putUInt(
+      "spcfwd",
+      context.solar_contact_config.post_contact_forward_duration_ms);
+  g_runtime.preferences->putFloat(
+      "spcfduty", context.solar_contact_config.post_contact_forward_duty);
+  g_runtime.preferences->putFloat(
+      "slrduty", context.solar_contact_config.line_reacquire_strafe_duty);
+  g_runtime.preferences->putUInt(
+      "sfdly",
+      context.solar_contact_config.post_contact_forward_start_delay_ms);
+  g_runtime.preferences->putUInt(
+      "slfdly",
+      context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
   sendOkJson("config saved");
 }
 
@@ -3555,24 +5014,17 @@ void handleStepperStatus() {
   const auto& axis = *g_runtime.stepper;
   std::snprintf(g_json_buffer, sizeof(g_json_buffer),
       "{\"positionSteps\":%lld,\"motionState\":\"%s\",\"speedStepsPerSecond\":%u,"
-      "\"configuredSpeedStepsPerSecond\":%u,\"accelerationStepsPerSecond2\":%u,"
-      "\"sleeping\":%s,\"lowerLimitActive\":%s,\"homed\":%s,\"busy\":%s,"
+      "\"configuredSpeedStepsPerSecond\":%u,\"limitSearchSpeedStepsPerSecond\":%u,\"accelerationStepsPerSecond2\":%u,"
+      "\"sleeping\":%s,\"lowerLimitActive\":%s,\"upperLimitActive\":%s,\"homed\":%s,\"busy\":%s,"
       "\"maximumPositionSteps\":%lld,\"microstepsPerRevolution\":1600}",
       static_cast<long long>(axis.positionSteps()), axis.motionStateName(),
       axis.speedStepsPerSecond(), axis.configuredSpeedStepsPerSecond(),
-      axis.accelerationStepsPerSecond2(), axis.sleeping() ? "true" : "false",
-      axis.lowerLimitActive() ? "true" : "false", axis.isHomed() ? "true" : "false",
+      axis.limitSearchSpeedStepsPerSecond(), axis.accelerationStepsPerSecond2(),
+      axis.sleeping() ? "true" : "false",
+      axis.lowerLimitActive() ? "true" : "false",
+      axis.upperLimitActive() ? "true" : "false", axis.isHomed() ? "true" : "false",
       axis.isBusy() ? "true" : "false", static_cast<long long>(axis.maximumPositionSteps()));
   g_server.send(200, "application/json", g_json_buffer);
-}
-
-bool stepperInt64Arg(const char* name, std::int64_t& value) {
-  if (!g_server.hasArg(name)) return false;
-  char* end = nullptr;
-  const String text = g_server.arg(name);
-  const long long parsed = strtoll(text.c_str(), &end, 10);
-  if (end == text.c_str() || *end != '\0') return false;
-  value = static_cast<std::int64_t>(parsed); return true;
 }
 
 void handleStepperCommand() {
@@ -3581,22 +5033,32 @@ void handleStepperCommand() {
   const String command = g_server.arg("command");
   bool accepted = true;
   if (command == "stop") axis.stop();
-  else if (command == "wake") accepted = axis.wake();
-  else if (command == "sleep") axis.sleep();
-  else if (command == "home") accepted = axis.home();
-  else if (command == "zero") axis.setZeroDebug();
   else if (command == "up" || command == "down") accepted = axis.moveContinuous(command == "up" ? robot::esp2::StepperDirection::Up : robot::esp2::StepperDirection::Down);
   else if (command == "hold") axis.refreshHoldCommand();
-  else if (command == "jog") { std::int64_t value; accepted = stepperInt64Arg("steps", value) && axis.jogSteps(value); }
-  else if (command == "move") { std::int64_t value; accepted = stepperInt64Arg("steps", value) && axis.moveToSteps(value); }
+  else if (command == "bottom") accepted = axis.moveToLowerLimit();
+  else if (command == "top") accepted = axis.moveToUpperLimit();
   else if (command == "config") {
-    std::int64_t value;
-    if (stepperInt64Arg("speed", value)) accepted = value > 0 && value <= UINT32_MAX && axis.setSpeed(static_cast<std::uint32_t>(value));
-    if (accepted && stepperInt64Arg("acceleration", value)) accepted = value > 0 && value <= UINT32_MAX && axis.setAcceleration(static_cast<std::uint32_t>(value));
-    if (accepted && stepperInt64Arg("maximum", value)) accepted = axis.setMaximumPositionSteps(value);
-  } else accepted = false;
+    if (!g_server.hasArg("speed") || !g_server.hasArg("limitSpeed")) {
+      accepted = false;
+    } else {
+      char* speed_end = nullptr;
+      char* limit_speed_end = nullptr;
+      const String speed_text = g_server.arg("speed");
+      const String limit_speed_text = g_server.arg("limitSpeed");
+      const unsigned long speed = strtoul(speed_text.c_str(), &speed_end, 10);
+      const unsigned long limit_speed =
+          strtoul(limit_speed_text.c_str(), &limit_speed_end, 10);
+      accepted = speed_end != speed_text.c_str() && *speed_end == '\0' &&
+                 limit_speed_end != limit_speed_text.c_str() &&
+                 *limit_speed_end == '\0' && speed <= UINT32_MAX &&
+                 limit_speed <= UINT32_MAX && axis.setMotionSpeeds(
+                     static_cast<std::uint32_t>(speed),
+                     static_cast<std::uint32_t>(limit_speed));
+    }
+  }
+  else accepted = false;
   if (!accepted) { sendErrorJson(409, "stepper command rejected by limits or state"); return; }
-  sendOkJson(command == "zero" ? "debug software zero set" : "stepper command accepted");
+  sendOkJson("stepper command accepted");
 }
 
 void setupWebHandlers() {
@@ -3610,15 +5072,27 @@ void setupWebHandlers() {
   g_server.on("/api/invert", HTTP_ANY, handleInvert);
   g_server.on("/api/sensors", HTTP_GET, handleSensors);
   g_server.on("/api/line", HTTP_GET, handleLine);
+  g_server.on("/api/rear-line", HTTP_GET, handleRearLine);
   g_server.on("/api/autonomous/solar/start", HTTP_ANY,
               handleAutonomousSolarStart);
   g_server.on("/api/autonomous/solar/config", HTTP_ANY,
               handleAutonomousSolarConfig);
+  g_server.on("/api/autonomous/tower-pieces/start", HTTP_ANY,
+              handleTowerPiecesStart);
+  g_server.on("/api/autonomous/tower-pieces/config", HTTP_ANY,
+              handleTowerPiecesConfig);
   g_server.on("/api/line-follow/start", HTTP_ANY, handleLineFollowStart);
   g_server.on("/api/line-follow/stop", HTTP_ANY, handleLineFollowStop);
   g_server.on("/api/line-follow/config", HTTP_ANY, handleLineFollowConfig);
+  g_server.on("/api/rear-line-follow/start", HTTP_ANY,
+              handleRearLineFollowStart);
+  g_server.on("/api/rear-line-follow/stop", HTTP_ANY,
+              handleRearLineFollowStop);
+  g_server.on("/api/rear-line-follow/config", HTTP_ANY,
+              handleRearLineFollowConfig);
   g_server.on("/api/claw", HTTP_ANY, handleClaw);
   g_server.on("/api/claws", HTTP_ANY, handleClawsAll);
+  g_server.on("/api/winch", HTTP_ANY, handleWinch);
   g_server.on("/api/claws/config", HTTP_ANY, handleClawsConfig);
   g_server.on("/api/claws/save", HTTP_ANY, handleClawsSave);
   g_server.on("/api/funnel", HTTP_ANY, handleFunnel);
@@ -3710,6 +5184,19 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
   Serial.print(context.solar_contact_config.retry_forward_duration_ms);
   Serial.print(", solar-retry-strafe-timeout-ms=");
   Serial.print(context.solar_contact_config.retry_strafe_timeout_ms);
+  Serial.print(", solar-post-contact-forward-ms=");
+  Serial.print(
+      context.solar_contact_config.post_contact_forward_duration_ms);
+  Serial.print(", solar-post-contact-forward-duty=");
+  Serial.print(context.solar_contact_config.post_contact_forward_duty, 4);
+  Serial.print(", solar-line-reacquire-duty=");
+  Serial.print(context.solar_contact_config.line_reacquire_strafe_duty, 4);
+  Serial.print(", solar-post-contact-forward-delay-ms=");
+  Serial.print(
+      context.solar_contact_config.post_contact_forward_start_delay_ms);
+  Serial.print(", solar-post-forward-strafe-delay-ms=");
+  Serial.print(
+      context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
   if (rear_link.statusAvailable()) {
     const robot::Esp1StatusReport& esp1 = rear_link.latestStatus();
     Serial.print(", solar-limit-configured=");
@@ -3719,6 +5206,18 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
     Serial.print(", solar-limit-fr-high=");
     Serial.print(esp1.solar_limit_front_right_high ? 1 : 0);
   }
+  Serial.print(", rear-line-configured=");
+  Serial.print(rear_link.rearLineSnapshotAvailable() &&
+                       rear_link.latestRearLineSnapshot().configured
+                   ? 1
+                   : 0);
+  Serial.print(", rear-line-fresh=");
+  Serial.print(rear_link.rearLineSnapshotFresh(
+                   now_ms, context.rear_config.remoteCommandTimeoutMs)
+                   ? 1
+                   : 0);
+  Serial.print(", rear-line-sequence=");
+  Serial.print(rear_link.lastRearLineSequence());
   Serial.print(", sensors-configured=");
   Serial.print(sensors.configured() ? 1 : 0);
   Serial.print(", front-left-configured=");
@@ -3741,11 +5240,16 @@ void printCommands() {
   Serial.println("  drive fwd|back|left|right|cw|ccw <duty> <ms>");
   Serial.println("  motor invert FL|FR|BL|BR");
   Serial.println("  mode ..., sensor status, line status");
+  Serial.println("  rear-line status");
   Serial.println("  auto solar|status");
   Serial.println("  lf start|stop|status|reset");
   Serial.println("  lf kp|ki|kd|base|max-duty|max-correction <value>");
   Serial.println("  lf integral-limit|derivative-limit|derivative-alpha <value>");
   Serial.println("  lf polarity <1|-1> | lf telemetry on|off");
+  Serial.println("  rlf start|stop|status|reset (independent reverse tuning)");
+  Serial.println("  rlf kp|ki|kd|base|max-duty|max-correction <value>");
+  Serial.println("  rlf integral-limit|derivative-limit|derivative-alpha <value>");
+  Serial.println("  rlf polarity <1|-1> | rlf telemetry on|off");
 }
 
 bool serialSetMode(RuntimeContext& context, const char* mode_text,
@@ -3763,6 +5267,7 @@ bool serialSetMode(RuntimeContext& context, const char* mode_text,
   disableActuators(context, front_left, front_right, rear_link, now_ms);
   context.modes.setMode(mode, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetTowerPieces(context, now_ms);
   clearFault(context);
   logEvent(context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Serial, "mode changed");
@@ -3771,8 +5276,9 @@ bool serialSetMode(RuntimeContext& context, const char* mode_text,
 }
 
 bool updateTuningValue(RuntimeContext& context, const char* name,
-                       const char* value_text) {
-  robot::LineFollowerConfig next = context.config;
+                       const char* value_text, const bool rear) {
+  robot::LineFollowerConfig next =
+      rear ? context.rear_config : context.config;
   if (std::strcmp(name, "kp") == 0) {
     float value = 0.0F;
     if (!parseFloat(value_text, value)) {
@@ -3862,13 +5368,20 @@ bool updateTuningValue(RuntimeContext& context, const char* name,
     return false;
   }
 
+  if (rear) {
+    next.baseDuty = std::fabs(next.baseDuty);
+  }
   const robot::CommandValidationResult validation =
       robot::validateLineFollowerConfig(next, hardwareDutyCap());
   if (!validation.accepted) {
     printRejected(validation.reason);
     return true;
   }
-  context.config = next;
+  if (rear) {
+    context.rear_config = next;
+  } else {
+    context.config = next;
+  }
   printOk(name);
   return true;
 }
@@ -4005,6 +5518,77 @@ void printLineStatus(const RuntimeContext& context,
   Serial.println(observation.last_known_side);
 }
 
+void printRearLineStatus(const RuntimeContext& context,
+                         const RearCommandLink& rear_link,
+                         const robot::Milliseconds now_ms) {
+  const robot::LineObservation& observation =
+      context.last_rear_line_observation;
+  const bool available = rear_link.rearLineSnapshotAvailable();
+  const bool fresh = rear_link.rearLineSnapshotFresh(
+      now_ms, context.rear_config.remoteCommandTimeoutMs);
+  const robot::RearLineSensorSnapshot snapshot =
+      available ? rear_link.latestRearLineSnapshot()
+                : robot::RearLineSensorSnapshot{};
+  Serial.print("rear-line LSBL=");
+  Serial.print(available && fresh && snapshot.configured
+                   ? (snapshot.left_electrical_high ? "black" : "white")
+                   : "UNKNOWN");
+  Serial.print("(raw=");
+  Serial.print(available && fresh && snapshot.configured
+                   ? digitalLevelName(snapshot.left_electrical_high ? HIGH
+                                                                    : LOW)
+                   : "UNKNOWN");
+  Serial.print("), LSBR=");
+  Serial.print(available && fresh && snapshot.configured
+                   ? (snapshot.right_electrical_high ? "black" : "white")
+                   : "UNKNOWN");
+  Serial.print("(raw=");
+  Serial.print(available && fresh && snapshot.configured
+                   ? digitalLevelName(snapshot.right_electrical_high ? HIGH
+                                                                     : LOW)
+                   : "UNKNOWN");
+  Serial.print("), configured=");
+  Serial.print(available && snapshot.configured ? 1 : 0);
+  Serial.print(", fresh=");
+  Serial.print(fresh ? 1 : 0);
+  Serial.print(", sequence=");
+  Serial.print(rear_link.lastRearLineSequence());
+  Serial.print(", age-ms=");
+  Serial.print(available
+                   ? elapsedSince(now_ms,
+                                  rear_link.lastRearLineReceivedAtMs())
+                   : 0U);
+  Serial.print(", error=");
+  Serial.print(observation.error);
+  Serial.print(", logical-left=LSBR(");
+  Serial.print(observation.left_black ? "black" : "white");
+  Serial.print("), logical-right=LSBL(");
+  Serial.print(observation.right_black ? "black" : "white");
+  Serial.print(')');
+  Serial.print(", visible=");
+  Serial.print(observation.line_visible ? 1 : 0);
+  Serial.print(", has-history=");
+  Serial.print(observation.hasHistory ? 1 : 0);
+  Serial.print(", last-side=");
+  Serial.print(observation.last_known_side);
+  Serial.print(", reverse-kp=");
+  Serial.print(context.rear_config.kp, 4);
+  Serial.print(", reverse-ki=");
+  Serial.print(context.rear_config.ki, 4);
+  Serial.print(", reverse-kd=");
+  Serial.print(context.rear_config.kd, 4);
+  Serial.print(", base-magnitude=");
+  Serial.print(context.rear_config.baseDuty, 4);
+  Serial.print(", effective-base=");
+  Serial.print(-std::fabs(context.rear_config.baseDuty), 4);
+  Serial.print(", max-duty=");
+  Serial.print(context.rear_config.maxDuty, 4);
+  Serial.print(", max-correction=");
+  Serial.print(context.rear_config.maxCorrection, 4);
+  Serial.print(", polarity=");
+  Serial.println(context.rear_config.steeringPolarity);
+}
+
 void processCommand(RuntimeContext& context, char* line,
                     DigitalFrontLineSensorReader& sensors,
                     DualPwmMotorOutput& front_left,
@@ -4072,6 +5656,15 @@ void processCommand(RuntimeContext& context, char* line,
     }
     return;
   }
+  if (std::strcmp(token, "rear-line") == 0) {
+    char* command = strtok(nullptr, " \t\r\n");
+    if (command != nullptr && std::strcmp(command, "status") == 0) {
+      printRearLineStatus(context, rear_link, now_ms);
+    } else {
+      printRejected("rear-line status");
+    }
+    return;
+  }
   if (std::strcmp(token, "motor") == 0) {
     char* command = strtok(nullptr, " \t\r\n");
     if (command != nullptr && std::strcmp(command, "test") == 0) {
@@ -4114,7 +5707,9 @@ void processCommand(RuntimeContext& context, char* line,
     requestSerialDrive(context, direction, duty_text, duration_text, now_ms);
     return;
   }
-  if (std::strcmp(token, "lf") == 0) {
+  if (std::strcmp(token, "lf") == 0 ||
+      std::strcmp(token, "rlf") == 0) {
+    const bool rear_line_command = std::strcmp(token, "rlf") == 0;
     char* command = strtok(nullptr, " \t\r\n");
     if (command == nullptr) {
       printCommands();
@@ -4134,42 +5729,66 @@ void processCommand(RuntimeContext& context, char* line,
         printRejected(duration_validation.reason);
         return;
       }
-      if (context.modes.currentMode() !=
-          robot::RobotTestMode::LineFollowTest) {
+      const robot::RobotTestMode requested_mode =
+          rear_line_command ? robot::RobotTestMode::RearLineFollowTest
+                            : robot::RobotTestMode::LineFollowTest;
+      if (context.modes.currentMode() != requested_mode) {
         disableActuators(context, front_left, front_right, rear_link, now_ms);
-        context.modes.setMode(robot::RobotTestMode::LineFollowTest, now_ms);
+        context.modes.setMode(requested_mode, now_ms);
       }
-      if (!startRequirementsMet(sensors, front_left, front_right, rear_link,
-                                now_ms, context)) {
+      const bool requirements_met =
+          rear_line_command
+              ? rearLineStartRequirementsMet(front_left, front_right,
+                                             rear_link, now_ms, context)
+              : startRequirementsMet(sensors, front_left, front_right,
+                                     rear_link, now_ms, context);
+      if (!requirements_met) {
         setFault(context, robot::FaultCode::HardwareNotConfigured,
-                 "line follower hardware requirements are incomplete");
+                 rear_line_command
+                     ? "rear line follower hardware or sensor stream is incomplete"
+                     : "line follower hardware requirements are incomplete");
         printRejected(
-            "configure sensors, motors, UART, ESP1 status, max-duty, hardware cap");
+            rear_line_command
+                ? "configure rear sensors, motors, UART, fresh ESP1 data, max-duty, hardware cap"
+                : "configure sensors, motors, UART, ESP1 status, max-duty, hardware cap");
         return;
       }
       robot::startLineFollower(context.follower_state, now_ms);
       context.last_command_ms = now_ms;
       context.mode_expires_at_ms = now_ms + duration_ms;
       context.command_deadman_armed = true;
-      printOk("line follower started");
+      printOk(rear_line_command ? "rear line follower started"
+                                : "line follower started");
       return;
     }
     if (std::strcmp(command, "stop") == 0) {
       disableActuators(context, front_left, front_right, rear_link, now_ms);
-      printOk("line follower stopped");
+      printOk(rear_line_command ? "rear line follower stopped"
+                                : "line follower stopped");
       return;
     }
     if (std::strcmp(command, "status") == 0) {
-      printStatus(context, rear_link, sensors, front_left, front_right,
-                  now_ms);
+      if (rear_line_command) {
+        printRearLineStatus(context, rear_link, now_ms);
+      } else {
+        printStatus(context, rear_link, sensors, front_left, front_right,
+                    now_ms);
+      }
       return;
     }
     if (std::strcmp(command, "reset") == 0) {
       disableActuators(context, front_left, front_right, rear_link, now_ms);
-      context.last_update = {};
-      context.last_line_observation = {};
-      context.line_sensor_last_known_side = 0;
-      printOk("line follower reset");
+      if (rear_line_command) {
+        context.last_rear_update = {};
+        context.last_rear_line_observation = {};
+        context.rear_line_sensor_last_known_side = 0;
+      } else {
+        context.last_update = {};
+        context.last_line_observation = {};
+        context.line_sensor_last_known_side = 0;
+      }
+      printOk(rear_line_command ? "rear line follower reset"
+                                : "line follower reset");
       return;
     }
     if (std::strcmp(command, "telemetry") == 0) {
@@ -4179,14 +5798,20 @@ void processCommand(RuntimeContext& context, char* line,
         printRejected("telemetry must be on or off");
         return;
       }
-      context.config.telemetryEnabled = telemetry_enabled;
+      if (rear_line_command) {
+        context.rear_config.telemetryEnabled = telemetry_enabled;
+      } else {
+        context.config.telemetryEnabled = telemetry_enabled;
+      }
       printOk("telemetry");
       return;
     }
-    if (updateTuningValue(context, command, strtok(nullptr, " \t\r\n"))) {
+    if (updateTuningValue(context, command, strtok(nullptr, " \t\r\n"),
+                          rear_line_command)) {
       return;
     }
-    printRejected("unknown lf command");
+    printRejected(rear_line_command ? "unknown rlf command"
+                                    : "unknown lf command");
     return;
   }
 
@@ -4352,6 +5977,151 @@ void runSensorOnlyTelemetry(RuntimeContext& context,
   Serial.println(observation.line_visible ? 1 : 0);
 }
 
+void printRearTelemetry(RuntimeContext& context,
+                        const RearCommandLink& rear_link,
+                        const robot::Milliseconds now_ms) {
+  if (!context.rear_config.telemetryEnabled ||
+      now_ms - context.last_telemetry_at_ms < kTelemetryPeriodMs ||
+      Serial.availableForWrite() < 160) {
+    return;
+  }
+  context.last_telemetry_at_ms = now_ms;
+
+  const robot::LineFollowerUpdate& update = context.last_rear_update;
+  const robot::LineObservation& observation = update.observation;
+  const robot::FourWheelCommand& wheels = update.wheel_command;
+  const robot::RearLineSensorSnapshot& sensors =
+      rear_link.latestRearLineSnapshot();
+  const robot::Milliseconds rear_command_age =
+      rear_link.lastSentAtMs() == 0U
+          ? 0U
+          : elapsedSince(now_ms, rear_link.lastSentAtMs());
+  const robot::Milliseconds sensor_age =
+      rear_link.lastRearLineReceivedAtMs() == 0U
+          ? 0U
+          : elapsedSince(now_ms, rear_link.lastRearLineReceivedAtMs());
+  const bool status_fresh = rear_link.remoteStatusFresh(
+      now_ms, remoteStatusTimeoutMs(context.rear_config));
+  const bool sensor_fresh = rear_link.rearLineSnapshotFresh(
+      now_ms, context.rear_config.remoteCommandTimeoutMs);
+
+  Serial.print("rlf_csv,");
+  Serial.print(now_ms);
+  Serial.print(',');
+  Serial.print(robot::robotTestModeName(context.modes.currentMode()));
+  Serial.print(',');
+  Serial.print(context.follower_state.enabled ? 1 : 0);
+  Serial.print(',');
+  Serial.print(sensors.left_electrical_high ? HIGH : LOW);
+  Serial.print(',');
+  Serial.print(sensors.right_electrical_high ? HIGH : LOW);
+  Serial.print(',');
+  Serial.print(observation.left_black ? 1 : 0);
+  Serial.print(',');
+  Serial.print(observation.right_black ? 1 : 0);
+  Serial.print(',');
+  Serial.print(observation.error);
+  Serial.print(',');
+  Serial.print(observation.last_known_side);
+  Serial.print(',');
+  Serial.print(observation.line_visible ? 1 : 0);
+  Serial.print(',');
+  Serial.print(observation.hasHistory ? 1 : 0);
+  Serial.print(',');
+  Serial.print(context.rear_config.kp, 4);
+  Serial.print(',');
+  Serial.print(context.rear_config.ki, 4);
+  Serial.print(',');
+  Serial.print(context.rear_config.kd, 4);
+  Serial.print(',');
+  Serial.print(update.pid_terms.proportional_term, 4);
+  Serial.print(',');
+  Serial.print(update.pid_terms.integral_term, 4);
+  Serial.print(',');
+  Serial.print(update.pid_terms.derivative_term, 4);
+  Serial.print(',');
+  Serial.print(update.pid_terms.correction, 4);
+  Serial.print(',');
+  Serial.print(context.rear_config.steeringPolarity);
+  Serial.print(',');
+  Serial.print(-std::fabs(context.rear_config.baseDuty), 4);
+  Serial.print(',');
+  Serial.print(context.rear_config.maxDuty, 4);
+  Serial.print(',');
+  Serial.print(context.rear_config.maxCorrection, 4);
+  Serial.print(',');
+  Serial.print(wheels.front_left.duty_command_milli);
+  Serial.print(',');
+  Serial.print(wheels.front_right.duty_command_milli);
+  Serial.print(',');
+  Serial.print(wheels.back_left.duty_command_milli);
+  Serial.print(',');
+  Serial.print(wheels.back_right.duty_command_milli);
+  Serial.print(',');
+  Serial.print(status_fresh ? 1 : 0);
+  Serial.print(',');
+  Serial.print(rear_link.lastSequenceSent());
+  Serial.print(',');
+  Serial.print(rear_command_age);
+  Serial.print(',');
+  Serial.print(sensors.configured ? 1 : 0);
+  Serial.print(',');
+  Serial.print(sensor_fresh ? 1 : 0);
+  Serial.print(',');
+  Serial.print(rear_link.lastRearLineSequence());
+  Serial.print(',');
+  Serial.println(sensor_age);
+}
+
+void runRearSensorOnlyTelemetry(RuntimeContext& context,
+                                const RearCommandLink& rear_link,
+                                const robot::Milliseconds now_ms) {
+  if (now_ms - context.last_telemetry_at_ms < kTelemetryPeriodMs ||
+      Serial.availableForWrite() < 96) {
+    return;
+  }
+  context.last_telemetry_at_ms = now_ms;
+  const bool available = rear_link.rearLineSnapshotAvailable();
+  const bool fresh = rear_link.rearLineSnapshotFresh(
+      now_ms, context.rear_config.remoteCommandTimeoutMs);
+  const robot::RearLineSensorSnapshot snapshot =
+      available ? rear_link.latestRearLineSnapshot()
+                : robot::RearLineSensorSnapshot{};
+  const robot::LineObservation& observation =
+      context.last_rear_line_observation;
+  Serial.print("rear_sensor,");
+  Serial.print(now_ms);
+  Serial.print(',');
+  Serial.print(available && fresh && snapshot.configured
+                   ? digitalLevelName(snapshot.left_electrical_high ? HIGH
+                                                                    : LOW)
+                   : "UNKNOWN");
+  Serial.print(',');
+  Serial.print(available && fresh && snapshot.configured
+                   ? digitalLevelName(snapshot.right_electrical_high ? HIGH
+                                                                     : LOW)
+                   : "UNKNOWN");
+  Serial.print(',');
+  Serial.print(observation.left_black ? 1 : 0);
+  Serial.print(',');
+  Serial.print(observation.right_black ? 1 : 0);
+  Serial.print(',');
+  Serial.print(observation.error);
+  Serial.print(',');
+  Serial.print(observation.line_visible ? 1 : 0);
+  Serial.print(',');
+  Serial.print(snapshot.configured ? 1 : 0);
+  Serial.print(',');
+  Serial.print(fresh ? 1 : 0);
+  Serial.print(',');
+  Serial.print(rear_link.lastRearLineSequence());
+  Serial.print(',');
+  Serial.println(available
+                     ? elapsedSince(now_ms,
+                                    rear_link.lastRearLineReceivedAtMs())
+                     : 0U);
+}
+
 void loadPreferences(Preferences& preferences, RuntimeContext& context,
                      DualPwmMotorOutput& front_left,
                      DualPwmMotorOutput& front_right,
@@ -4381,6 +6151,87 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       preferences.getBool("lftele", context.config.telemetryEnabled);
   context.config.steeringPolarity =
       preferences.getInt("pol", context.config.steeringPolarity) < 0 ? -1 : 1;
+  // First-time rear settings inherit the current front settings, then become
+  // independently persistent under their own NVS keys.
+  context.rear_config = context.config;
+  context.rear_config.kp =
+      preferences.getFloat("rkp", context.rear_config.kp);
+  context.rear_config.ki =
+      preferences.getFloat("rki", context.rear_config.ki);
+  context.rear_config.kd =
+      preferences.getFloat("rkd", context.rear_config.kd);
+  context.rear_config.baseDuty = std::fabs(
+      preferences.getFloat("rbase", context.rear_config.baseDuty));
+  context.rear_config.maxDuty =
+      preferences.getFloat("rmax", context.rear_config.maxDuty);
+  context.rear_config.maxCorrection =
+      preferences.getFloat("rcorr", context.rear_config.maxCorrection);
+  context.rear_config.integralLimit =
+      preferences.getFloat("rilim", context.rear_config.integralLimit);
+  context.rear_config.derivativeLimit =
+      preferences.getFloat("rdlim", context.rear_config.derivativeLimit);
+  context.rear_config.derivativeFilterAlpha = preferences.getFloat(
+      "rdalpha", context.rear_config.derivativeFilterAlpha);
+  context.rear_config.controlPeriodMs =
+      preferences.getUInt("rperiod", context.rear_config.controlPeriodMs);
+  context.rear_config.remoteCommandTimeoutMs = preferences.getUInt(
+      "rrto", context.rear_config.remoteCommandTimeoutMs);
+  context.rear_config.telemetryEnabled =
+      preferences.getBool("rlftele", context.rear_config.telemetryEnabled);
+  context.rear_config.steeringPolarity =
+      preferences.getInt("rpol", context.rear_config.steeringPolarity) < 0
+          ? -1
+          : 1;
+  context.tower_pieces_config.reverse_line_duty = std::fabs(
+      preferences.getFloat("tpduty", context.rear_config.baseDuty));
+  context.tower_pieces_config.side_line_timeout_ms =
+      preferences.getUInt(
+          "tptmo", context.tower_pieces_config.side_line_timeout_ms);
+  context.tower_pieces_config.post_line_delay_ms = preferences.getUInt(
+      "tpdelay", context.tower_pieces_config.post_line_delay_ms);
+  context.tower_pieces_config.strafe_right_duty = std::fabs(
+      preferences.getFloat(
+          "tpsduty", context.tower_pieces_config.strafe_right_duty));
+  context.tower_pieces_config.strafe_right_duration_ms =
+      preferences.getUInt(
+          "tpsdur", context.tower_pieces_config.strafe_right_duration_ms);
+  context.tower_pieces_config.post_strafe_pause_ms = preferences.getUInt(
+      "tppause", context.tower_pieces_config.post_strafe_pause_ms);
+  context.tower_pieces_config.clockwise_rotation_duty = std::fabs(
+      preferences.getFloat(
+          "tprduty", context.tower_pieces_config.clockwise_rotation_duty));
+  context.tower_pieces_config.clockwise_rotation_duration_ms =
+      preferences.getUInt(
+          "tprdur",
+          context.tower_pieces_config.clockwise_rotation_duration_ms);
+  context.tower_pieces_config.post_rotation_pause_ms = preferences.getUInt(
+      "tprpause", context.tower_pieces_config.post_rotation_pause_ms);
+  context.tower_pieces_config.reverse_duty = std::fabs(
+      preferences.getFloat("tpbkduty",
+                           context.tower_pieces_config.reverse_duty));
+  context.tower_pieces_config.reverse_duration_ms = preferences.getUInt(
+      "tpbkdur", context.tower_pieces_config.reverse_duration_ms);
+  context.tower_pieces_config.shimmy_duty = std::fabs(
+      preferences.getFloat("tpshduty",
+                           context.tower_pieces_config.shimmy_duty));
+  const robot::Milliseconds legacy_shimmy_duration_ms =
+      preferences.getUInt("tpshdur", 0U);
+  context.tower_pieces_config.shimmy_right_duration_ms =
+      preferences.getUInt(
+          "tpshrdur",
+          legacy_shimmy_duration_ms > 0U
+              ? legacy_shimmy_duration_ms
+              : context.tower_pieces_config.shimmy_right_duration_ms);
+  context.tower_pieces_config.shimmy_left_duration_ms =
+      preferences.getUInt(
+          "tpshldur",
+          legacy_shimmy_duration_ms > 0U
+              ? legacy_shimmy_duration_ms
+              : context.tower_pieces_config.shimmy_left_duration_ms);
+  context.tower_pieces_config.shimmy_timeout_ms = preferences.getUInt(
+      "tpshtmo",
+      preferences.getUInt(
+          "tprtmo", context.tower_pieces_config.shimmy_timeout_ms));
   context.solar_thresholds.detect_1khz = static_cast<std::uint16_t>(
       preferences.getUInt("sdet1", context.solar_thresholds.detect_1khz));
   context.solar_thresholds.release_1khz = static_cast<std::uint16_t>(
@@ -4426,24 +6277,57 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
           "srfwd", context.solar_contact_config.retry_forward_duration_ms);
   context.solar_contact_config.retry_strafe_timeout_ms =
       preferences.getUInt(
-          "srtmo", context.solar_contact_config.timeout_ms);
+          "srtmo", context.solar_contact_config.retry_strafe_timeout_ms);
+  context.solar_contact_config.post_contact_forward_duration_ms =
+      preferences.getUInt(
+          "spcfwd",
+          context.solar_contact_config.post_contact_forward_duration_ms);
+  context.solar_contact_config.post_contact_forward_duty =
+      preferences.getFloat(
+          "spcfduty",
+          context.solar_contact_config.post_contact_forward_duty);
+  context.solar_contact_config.line_reacquire_strafe_duty =
+      preferences.getFloat(
+          "slrduty",
+          context.solar_contact_config.line_reacquire_strafe_duty);
+  context.solar_contact_config.post_contact_forward_start_delay_ms =
+      preferences.getUInt(
+          "sfdly",
+          context.solar_contact_config.post_contact_forward_start_delay_ms);
+  context.solar_contact_config.line_reacquire_strafe_start_delay_ms =
+      preferences.getUInt(
+          "slfdly",
+          context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
 
   ClawServoSettings claw_settings = claws.settings();
-  claw_settings.start_angle_deg[0] =
-      preferences.getInt("c1start", claw_settings.start_angle_deg[0]);
-  claw_settings.start_angle_deg[1] =
-      preferences.getInt("c2start", claw_settings.start_angle_deg[1]);
-  claw_settings.start_angle_deg[2] =
-      preferences.getInt("c3start", claw_settings.start_angle_deg[2]);
-  claw_settings.open_direction[0] =
-      preferences.getInt("c1dir", claw_settings.open_direction[0]) < 0 ? -1
-                                                                       : 1;
-  claw_settings.open_direction[1] =
-      preferences.getInt("c2dir", claw_settings.open_direction[1]) < 0 ? -1
-                                                                       : 1;
-  claw_settings.open_direction[2] =
-      preferences.getInt("c3dir", claw_settings.open_direction[2]) < 0 ? -1
-                                                                       : 1;
+  constexpr const char* kOpenPreferenceKeys[kClawServoCount] = {
+      "c1open", "c2open", "c3open"};
+  constexpr const char* kClosedPreferenceKeys[kClawServoCount] = {
+      "c1closed", "c2closed", "c3closed"};
+  constexpr const char* kLegacyStartPreferenceKeys[kClawServoCount] = {
+      "c1start", "c2start", "c3start"};
+  constexpr const char* kLegacyDirectionPreferenceKeys[kClawServoCount] = {
+      "c1dir", "c2dir", "c3dir"};
+  for (std::size_t index = 0U; index < kClawServoCount; ++index) {
+    const int legacy_closed_angle_deg = preferences.getInt(
+        kLegacyStartPreferenceKeys[index], kClawServoUnsetAngleDeg);
+    const int legacy_direction =
+        preferences.getInt(kLegacyDirectionPreferenceKeys[index], 1) < 0 ? -1
+                                                                         : 1;
+    const int legacy_open_angle_deg =
+        legacy_closed_angle_deg == kClawServoUnsetAngleDeg
+            ? kClawServoUnsetAngleDeg
+            : legacy_closed_angle_deg +
+                  (legacy_direction * kLegacyClawServoRotationDeg);
+    claw_settings.open_angle_deg[index] = preferences.getInt(
+        kOpenPreferenceKeys[index], legacy_open_angle_deg);
+    claw_settings.closed_angle_deg[index] = preferences.getInt(
+        kClosedPreferenceKeys[index], legacy_closed_angle_deg);
+  }
+  claw_settings.open_angle_deg[kWinchServoIndex] = preferences.getInt(
+      "wopen", claw_settings.open_angle_deg[kWinchServoIndex]);
+  claw_settings.closed_angle_deg[kWinchServoIndex] = preferences.getInt(
+      "wclosed", claw_settings.closed_angle_deg[kWinchServoIndex]);
   claws.applySettings(claw_settings);
 
   const robot::CommandValidationResult validation =
@@ -4454,6 +6338,13 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
     context.config.maxDuty = cap;
     context.config.maxCorrection =
         clampFloat(context.config.maxCorrection, 0.0F, cap);
+  }
+  const robot::CommandValidationResult rear_validation =
+      robot::validateLineFollowerConfig(context.rear_config,
+                                        hardwareDutyCap());
+  if (!rear_validation.accepted) {
+    context.rear_config = context.config;
+    context.rear_config.baseDuty = std::fabs(context.rear_config.baseDuty);
   }
   if (!solarThresholdsValid(context.solar_thresholds) ||
       !robot::solarPanelAutonomyConfigValid(
@@ -4477,6 +6368,8 @@ void motionControlTask(void* parameters) {
   context.config.maxDuty = cap;
   context.config.maxCorrection =
       clampFloat(context.config.maxCorrection, 0.0F, cap);
+  context.rear_config = context.config;
+  context.rear_config.baseDuty = std::fabs(context.config.baseDuty);
 
   DigitalFrontLineSensorReader line_sensor_reader{
       robot::esp2::kHardwareConfig.pins};
@@ -4487,12 +6380,14 @@ void motionControlTask(void* parameters) {
   RearCommandLink rear_link{robot::esp2::kHardwareConfig.uart_to_esp1};
   robot::esp2::StepperAxis stepper{{robot::esp2::kPins.stepper_sleep,
       robot::esp2::kPins.stepper_dir, robot::esp2::kPins.stepper_step,
-      robot::esp2::kPins.limit_switch_stepper_bottom, 800U, 1200U, 200U,
+      robot::esp2::kPins.limit_switch_stepper_bottom,
+      robot::esp2::kPins.limit_switch_stepper_top, 800U, 1200U, 200U,
       3U, 3U, 2000U, 500U, 15U,
-      0, 0U, 0U}};  // Maximum is intentionally unset until supplied from the dashboard.
+      100000, 0U, 0U}};  // Initial vertical-axis software maximum, adjustable from the dashboard.
   ClawServoBank claws{robot::esp2::kHardwareConfig.servo_claw_1,
                       robot::esp2::kHardwareConfig.servo_claw_2,
-                      robot::esp2::kHardwareConfig.servo_claw_3};
+                      robot::esp2::kHardwareConfig.servo_claw_3,
+                      robot::esp2::kHardwareConfig.servo_winch};
   Preferences preferences{};
 
   line_sensor_reader.initialize();
@@ -4506,6 +6401,7 @@ void motionControlTask(void* parameters) {
   loadPreferences(preferences, context, front_left_motor, front_right_motor,
                   claws);
   resetSolarPanelAutonomy(context, static_cast<robot::Milliseconds>(millis()));
+  resetTowerPieces(context, static_cast<robot::Milliseconds>(millis()));
 
   g_runtime = {&context, &line_sensor_reader, &front_left_motor,
                &front_right_motor, &rear_link, &claws, &stepper, &preferences};
@@ -4527,6 +6423,7 @@ void motionControlTask(void* parameters) {
     stepper.update();
     rear_link.pollReceive(now_ms);
     refreshLineObservation(context, line_sensor_reader, now_ms);
+    refreshRearLineObservation(context, rear_link, now_ms);
     pollSerialCommands(context, line_sensor_reader, front_left_motor,
                        front_right_motor, rear_link, now_ms);
 
@@ -4566,16 +6463,26 @@ void motionControlTask(void* parameters) {
             robot::SolarPanelAutonomyState::WaitForStart) {
       resetSolarPanelAutonomy(context, now_ms);
     }
+    if (mode != robot::RobotTestMode::AutonomousTowerPieces &&
+        context.tower_pieces.state !=
+            robot::TowerPiecesState::WaitForStart) {
+      resetTowerPieces(context, now_ms);
+    }
     if (robot::robotTestModeIsSensorOnly(mode)) {
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
                        now_ms);
       if (mode == robot::RobotTestMode::SensorMonitor ||
           mode == robot::RobotTestMode::LineSensorTest) {
         runSensorOnlyTelemetry(context, line_sensor_reader, now_ms);
+      } else if (mode == robot::RobotTestMode::RearLineSensorTest) {
+        runRearSensorOnlyTelemetry(context, rear_link, now_ms);
       }
     } else if (mode == robot::RobotTestMode::AutonomousSolarPanel) {
       runSolarPanelAutonomy(context, line_sensor_reader, front_left_motor,
                             front_right_motor, rear_link, now_ms);
+    } else if (mode == robot::RobotTestMode::AutonomousTowerPieces) {
+      runTowerPiecesAutonomy(context, front_left_motor, front_right_motor,
+                             rear_link, now_ms);
     } else if (mode == robot::RobotTestMode::LineFollowTest &&
                context.follower_state.enabled) {
       const bool left_black = context.last_line_observation.left_black;
@@ -4594,7 +6501,7 @@ void motionControlTask(void* parameters) {
             now_ms);
         applyWheelCommand(context, front_left_motor, front_right_motor,
                           rear_link, context.last_update.wheel_command,
-                          now_ms);
+                          context.config, now_ms);
         if (!context.follower_state.enabled &&
             !context.last_update.observation.safe_to_drive) {
           disableActuators(context, front_left_motor, front_right_motor,
@@ -4616,6 +6523,63 @@ void motionControlTask(void* parameters) {
         }
         printTelemetry(context, line_sensor_reader, rear_link, now_ms);
       }
+    } else if (mode == robot::RobotTestMode::RearLineFollowTest &&
+               context.follower_state.enabled) {
+      const bool rear_sensor_fresh = rear_link.rearLineSnapshotFresh(
+          now_ms, context.rear_config.remoteCommandTimeoutMs);
+      if (!rear_sensor_fresh) {
+        disableActuators(context, front_left_motor, front_right_motor,
+                         rear_link, now_ms);
+        setFault(context, robot::FaultCode::CommunicationStale,
+                 "rear line follower stopped: sensor data stale");
+        logEvent(context, now_ms, robot::EventSeverity::Fault,
+                 robot::EventSource::Uart,
+                 "rear line follower stopped: sensor data stale");
+      } else if (!rear_link.latestRearLineSnapshot().configured ||
+                 !rear_link.configured()) {
+        disableActuators(context, front_left_motor, front_right_motor,
+                         rear_link, now_ms);
+        setFault(context, robot::FaultCode::HardwareNotConfigured,
+                 "rear line follower stopped: sensor or link invalid");
+        logEvent(context, now_ms, robot::EventSeverity::Fault,
+                 robot::EventSource::Line,
+                 "rear line follower stopped: sensor or link invalid");
+      } else {
+        const bool left_black =
+            context.last_rear_line_observation.left_black;
+        const bool right_black =
+            context.last_rear_line_observation.right_black;
+        const robot::LineFollowerConfig reverse_config =
+            reverseRearLineFollowerConfig(context);
+        context.last_rear_update = robot::updateLineFollower(
+            context.follower_state, left_black, right_black, reverse_config,
+            now_ms);
+        applyWheelCommand(context, front_left_motor, front_right_motor,
+                          rear_link,
+                          context.last_rear_update.wheel_command,
+                          reverse_config, now_ms);
+        if (!context.follower_state.enabled &&
+            !context.last_rear_update.observation.safe_to_drive) {
+          disableActuators(context, front_left_motor, front_right_motor,
+                           rear_link, now_ms);
+          setFault(context, robot::FaultCode::InvalidCommand,
+                   "rear line follower stopped: line lost without history");
+          logEvent(
+              context, now_ms, robot::EventSeverity::Fault,
+              robot::EventSource::Line,
+              "rear line follower stopped: line lost without history");
+        } else if (!rear_link.remoteStatusFresh(
+                       now_ms, remoteStatusTimeoutMs(context.rear_config))) {
+          disableActuators(context, front_left_motor, front_right_motor,
+                           rear_link, now_ms);
+          setFault(context, robot::FaultCode::CommunicationStale,
+                   "rear line follower stopped: ESP1 status stale");
+          logEvent(context, now_ms, robot::EventSeverity::Fault,
+                   robot::EventSource::Uart,
+                   "rear line follower stopped: ESP1 status stale");
+        }
+        printRearTelemetry(context, rear_link, now_ms);
+      }
     } else if (mode == robot::RobotTestMode::MechanismTest) {
       disableMotionActuators(context, front_left_motor, front_right_motor,
                              rear_link, now_ms);
@@ -4623,16 +6587,24 @@ void motionControlTask(void* parameters) {
                mode == robot::RobotTestMode::ManualDriveTest ||
                mode == robot::RobotTestMode::DistributedDriveTest) {
       applyWheelCommand(context, front_left_motor, front_right_motor, rear_link,
-                        context.requested_command, now_ms);
+                        context.requested_command, context.config, now_ms);
     } else {
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
                        now_ms);
     }
 
-    vTaskDelayUntil(&last_wake_tick,
-                    pdMS_TO_TICKS(context.config.controlPeriodMs == 0U
-                                      ? kDefaultMotionTaskPeriodMs
-                                      : context.config.controlPeriodMs));
+    const bool rear_line_mode =
+        mode == robot::RobotTestMode::RearLineFollowTest ||
+        mode == robot::RobotTestMode::RearLineSensorTest ||
+        mode == robot::RobotTestMode::AutonomousTowerPieces;
+    const robot::Milliseconds configured_period_ms =
+        rear_line_mode ? context.rear_config.controlPeriodMs
+                       : context.config.controlPeriodMs;
+    vTaskDelayUntil(
+        &last_wake_tick,
+        pdMS_TO_TICKS(configured_period_ms == 0U
+                          ? kDefaultMotionTaskPeriodMs
+                          : configured_period_ms));
   }
 }
 

@@ -60,5 +60,7 @@ LineFollowerUpdate updateLineFollower(LineFollowerState& state,
                                       bool left_black, bool right_black,
                                       const LineFollowerConfig& config,
                                       Milliseconds now_ms);
+LineFollowerConfig makeReverseTravelLineFollowerConfig(
+    const LineFollowerConfig& configured_values);
 
 }  // namespace robot

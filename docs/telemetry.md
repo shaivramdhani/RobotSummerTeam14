@@ -36,13 +36,16 @@ selects the target beacon frequency: `HIGH` selects 1 kHz and `LOW` selects
 | `DISTRIBUTED_DRIVE_TEST` | All four wheels | ESP2 front wheels plus ESP1 back wheel commands. |
 | `LINE_SENSOR_TEST` | No | Raw LSFL/LSFR/LSS and interpreted front-line error. |
 | `LINE_FOLLOW_TEST` | Yes, gated | Digital two-sensor line follower. |
-| `MECHANISM_TEST` | Mechanisms only, gated | Open/close claw servos and test the ESP1 funnel motor with drive outputs stopped. |
-| `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, and bounded solar-panel contact sequence. |
+| `REAR_LINE_SENSOR_TEST` | No | Raw ESP1 LSBL/LSBR telemetry and reverse-travel line interpretation. |
+| `REAR_LINE_FOLLOW_TEST` | Yes, gated | Reverse travel using rear sensors and independent rear PID settings. |
+| `MECHANISM_TEST` | Mechanisms only, gated | Open/close claw and winch servos and test the ESP1 funnel motor with drive outputs stopped. |
+| `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, solar-panel contact, timed forward motion, and rear-line reacquisition. |
+| `AUTONOMOUS_TOWER_PIECES` | Yes, gated | Reverse rear-line following until the second distinct side-line crossing or timeout. |
 | `AUTONOMOUS_DRY_RUN` | No | Stub view for future mission dry runs. |
 
 Mode changes stop actuators before switching. Sensor-only modes keep motors and
 mechanisms disabled. `MECHANISM_TEST` keeps drive outputs disabled and `/api/stop`
-disables the claw servo outputs and sends a disabled funnel command to ESP1.
+disables the claw and winch servo outputs and sends a disabled funnel command to ESP1.
 
 ## Line Sensor Bench Test
 
@@ -55,7 +58,45 @@ without driving motors:
 - Telemetry: watch `line.lsfl_level`, `line.lsfr_level`, and `line.lss_level`
   for `HIGH`, `LOW`, or `UNKNOWN`; `HIGH` means black tape for all three
   sensors. LSS is ESP1 GPIO4 and reports `UNKNOWN` unless its configuration is
-  present and the ESP1 status link is fresh.
+  present and the ESP1 line-sensor stream is fresh.
+
+For the rear sensors, press `Rear Sensor Test` or run
+`mode rear-line-sensor`, then `rear-line status`. ESP1 samples LSBL on GPIO17
+and LSBR on GPIO18 as digital inputs with `HIGH` meaning black tape. It sends a
+CRC-protected `SensorSnapshot` every `10 ms`; ESP2 reports raw levels,
+sequence, age, configuration, and freshness without enabling motors. For
+reverse travel, LSBR is reported as logical left and LSBL as logical right.
+The same fixed-size packet carries LSS configuration and level so tower-piece
+crossings are observed at the `10 ms` sensor-stream period.
+
+## Tower Pieces
+
+The `Tower Pieces` dashboard panel exposes reverse line-following duty,
+second-line timeout, the live LSS level, a `0 / 2` crossing count, the delay
+after that second crossing, right-strafe duty and duration, the following
+pause, clockwise rotation duty and duration, a post-rotation pause, timed
+backward duty and duration, shimmy duty, separate right and left durations,
+and a shimmy timeout.
+Start enters
+`AUTONOMOUS_TOWER_PIECES` and uses the independent rear PID gains with the
+panel's reverse-duty magnitude. A crossing is one LSS LOW-to-HIGH transition;
+holding LSS HIGH cannot increment the count repeatedly. If LSS is already HIGH
+at start, firmware waits for LOW before accepting a later HIGH as a crossing.
+
+The second crossing stops all four wheels in `POST_LINE_DELAY`. When that delay
+expires, the robot enters `STRAFE_RIGHT` for the configured duration, stops in
+`POST_STRAFE_PAUSE`, rotates clockwise for the configured duration, stops in
+`POST_ROTATION_PAUSE`, and then drives backward for the configured duration.
+It next starts by strafing right and alternates right and left after each
+direction's configured duration. The run completes as soon as either LSBL or
+LSBR is HIGH
+during the shimmy. If the first timeout expires before the second side line,
+telemetry reports `SIDE_LINE_TIMEOUT`; if the shimmy timeout expires before a
+back line is detected, it reports `SHIMMY_TIMEOUT`. Stale ESP1
+status, stale rear/side sensor packets, line loss without history, incomplete
+hardware, and failed rear commands also stop the mode. All new timings and
+open-loop duties default to `0` as explicit TODOs, and Start is rejected until
+nonzero verified values are applied.
 
 ## IR Beacon Bench Test
 
@@ -103,14 +144,31 @@ timeout.
 - `LINE_FOLLOW_TEST` requires configured line sensors, local motors, UART, a
   fresh ESP1 status link, nonzero maximum duty, and nonzero verified hardware
   duty cap.
+- `REAR_LINE_FOLLOW_TEST` requires configured GPIO17/GPIO18 rear sensors, a
+  fresh rear `SensorSnapshot`, configured local motors and UART, a fresh ESP1
+  status link, nonzero maximum duty, and a nonzero verified hardware duty cap.
+- Rear following stops all four wheels if rear sensor data exceeds
+  `remoteCommandTimeoutMs`, ESP1 status becomes stale, or the line is lost
+  without history.
+- `AUTONOMOUS_TOWER_PIECES` adds configured GPIO4 LSS, a positive panel duty,
+  and a nonzero panel timeout to the rear-follow requirements. It stops on the
+  second distinct LSS rising edge, timeout, or any rear-follow safety fault.
 - ESP1 back motors stop on stale, invalid, duplicate, corrupt, or disabled
   wheel command packets.
 - ESP2 stops line following if the rear command link is unhealthy.
 - Solar autonomous motion also stops if a rear-wheel command cannot be sent or
   ESP1 reports that its received commands have gone stale.
-- Claw servo commands are rejected unless the ESP2 claw PWM config is complete,
-  the per-claw start angle is set, and the derived open angle stays within
-  `0..180` degrees. Open is always start plus or minus `90` degrees.
+- After both solar-panel limit switches are hit, the robot waits for
+  `post_contact_forward_start_delay_ms`, drives forward for
+  `post_contact_forward_duration_ms` (default `1000 ms`) at
+  `post_contact_forward_duty`, waits for
+  `line_reacquire_strafe_start_delay_ms`, then strafes left at
+  `line_reacquire_strafe_duty` until LSBL or LSBR reports black. Both delays
+  default to `0 ms`, and all wheel outputs remain disabled during them.
+- Claw and winch servo commands are rejected unless the corresponding ESP2 PWM
+  config is complete, the requested open or closed angle is set, and that
+  absolute angle is within `0..180` degrees. Open and closed targets are
+  configured independently.
 - Funnel commands are press-and-hold with the same `700 ms` deadman timeout as
   single-motor tests. ESP1 initializes the funnel output disabled, rejects stale
   or corrupt packets, and reports whether the funnel PWM hardware is configured.
@@ -131,18 +189,25 @@ timeout.
 | `/api/invert?id=<FL|FR>` | GET/POST | Toggle front motor runtime inversion and save it. Rear inversion is a TODO on ESP1. |
 | `/api/sensors` | GET | Supported sensor states. |
 | `/api/line` | GET | LSFL/LSFR/LSS level, black booleans, error, last side, visibility. |
+| `/api/rear-line` | GET | Physical LSBL/LSBR levels plus reverse-travel logical mapping, error, freshness, sequence, and sample age. |
 | `/api/line-follow/start?ms=<>` | GET/POST | Switch to `LINE_FOLLOW_TEST` and start line following. |
 | `/api/line-follow/stop` | GET/POST | Stop line following. |
 | `/api/line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>` | GET/POST | Runtime PID/config update. |
+| `/api/rear-line-follow/start?ms=<>` | GET/POST | Switch to `REAR_LINE_FOLLOW_TEST` and start reverse travel using the independent rear PID configuration. |
+| `/api/rear-line-follow/stop` | GET/POST | Stop reverse rear line following. |
+| `/api/rear-line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>` | GET/POST | Update the independent rear PID/config; `base` is a positive reverse-speed magnitude. |
 | `/api/autonomous/solar/start` | GET/POST | Start the gated solar-panel autonomous test. |
-| `/api/autonomous/solar/config?...&retry-left-ms=<>&retry-forward-ms=<>&retry-strafe-timeout-ms=<>` | GET/POST | Update solar autonomy settings, including the one-shot contact correction timings. |
+| `/api/autonomous/solar/config?...&post-contact-forward-ms=<>&post-contact-forward-duty=<>&line-reacquire-duty=<>&post-contact-forward-delay-ms=<>&post-forward-strafe-delay-ms=<>` | GET/POST | Update solar autonomy settings, including contact correction and post-contact motion/line-reacquisition tuning. |
+| `/api/autonomous/tower-pieces/start` | GET/POST | Enter the tower-pieces mode and request gated reverse line following. |
+| `/api/autonomous/tower-pieces/config?duty=<>&timeout-ms=<>&post-line-delay-ms=<>&strafe-duty=<>&strafe-duration-ms=<>&post-strafe-pause-ms=<>&rotation-duty=<>&rotation-duration-ms=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&shimmy-duty=<>&shimmy-right-ms=<>&shimmy-left-ms=<>&shimmy-timeout-ms=<>` | GET/POST | Update tower-pieces reverse line following, delayed right strafe, timed rotation, pauses, timed backward drive, and independently timed right/left shimmy settings. |
 | `/api/claw?id=<1|2|3>&state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command one claw servo. |
 | `/api/claws?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command all three claw servos. |
-| `/api/claws/config?claw1-start=<>&claw1-dir=<1|-1>&...` | GET/POST | Runtime claw start angle and 90-degree direction update. |
-| `/api/claws/save` | GET/POST | Save claw start angles and directions to NVS. |
+| `/api/winch?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command the ESP2 GPIO6 winch servo. |
+| `/api/claws/config?claw1-open=<>&claw1-closed=<>&...&winch-open=<>&winch-closed=<>` | GET/POST | Set independent absolute open and closed angles for each claw and the winch. Legacy claw start/direction arguments remain accepted for migration. |
+| `/api/claws/save` | GET/POST | Save claw and winch open/closed angles to NVS. |
 | `/api/funnel?speed=<>` | GET/POST | Switch to `MECHANISM_TEST` and send a timed ESP1 funnel motor command. Use `speed=0` to release. |
 | `/api/config` | GET | Current tunable settings. |
-| `/api/config/save` | GET/POST | Save line-following and solar-autonomy tunables to NVS. |
+| `/api/config/save` | GET/POST | Save line-following, solar-autonomy, and tower-pieces tunables to NVS. |
 | `/api/events` | GET | Fixed-size recent event log. |
 
 All command endpoints return JSON with `ok` and either `message` or `error`.
@@ -160,14 +225,34 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
   `lss_configured`, `line_error`, `line_visible`,
   `has_history`/`hasHistory`, `last_known_line_side`,
   `line_follower_enabled`.
+- Rear line: `rear_line.lsbl_raw_level`, `lsbr_raw_level`, electrical levels,
+  black booleans, `configured`, `data_fresh`, `sequence`, `sample_age_ms`,
+  `captured_at_ms`, `line_error`, visibility/history, last-known side, and
+  `line_follower_enabled`. `logical_left_source` is `LSBR` and
+  `logical_right_source` is `LSBL` for reverse travel.
 - PID: `kp`, `ki`, `kd`, `baseDuty`, `maxDuty`, `maxCorrection`,
   `integralLimit`, `derivativeLimit`, `derivativeFilterAlpha`,
   `steeringPolarity`, `controlPeriodMs`, `remoteCommandTimeoutMs`,
   `telemetryEnabled`, `p_term`, `i_term`, `d_term`, `correction`.
+- Rear PID: the same fields under `rear_pid`, stored independently, plus
+  `effectiveBaseDuty`, which is negative while commanding reverse travel.
+- Tower pieces: `tower_pieces.state`, `fault_reason`, `time_in_state_ms`,
+  `reverse_line_duty`, `side_line_timeout_ms`, `post_line_delay_ms`,
+  `strafe_right_duty`, `strafe_right_duration_ms`,
+  `post_strafe_pause_ms`, `clockwise_rotation_duty`,
+  `clockwise_rotation_duration_ms`, `post_rotation_pause_ms`, `reverse_duty`,
+  `reverse_duration_ms`, `shimmy_duty`, `shimmy_right_duration_ms`,
+  `shimmy_left_duration_ms`,
+  `shimmy_timeout_ms`, `side_line_count`, `target_side_line_count`,
+  side-sensor configuration/level, active-motion flags, and
+  `back_line_detected`.
 - Solar autonomy: state, time in state, fault reason, IR thresholds and
   confirmation, initial contact timeout, strafe duty/delay,
   `retry_strafe_left_duration_ms`, `retry_forward_duration_ms`, and
-  `retry_strafe_timeout_ms`.
+  `retry_strafe_timeout_ms`, `post_contact_forward_duration_ms`,
+  `post_contact_forward_duty`, and
+  `line_reacquire_strafe_duty`, `post_contact_forward_start_delay_ms`, and
+  `line_reacquire_strafe_start_delay_ms`.
 - Motor telemetry: ESP2-local physical FL/FR desired/applied milli-duty and
   ESP1 funnel desired/applied milli-duty, enabled, inversion, configured.
 - ESP1 command status: physical BL/BR command, sequence, age, link health,
@@ -175,9 +260,9 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
 - ESP1 remote status from compact `HealthReport` frames: availability, uptime,
   mode, fault status, rear applied commands, rear inversion flags, funnel applied
   command/configuration, and side-line sensor configuration/raw level.
-- Claws: `rotation_deg`, plus `claw_1`/`claw_2`/`claw_3` hardware configured,
-  start configured, output enabled, start angle, open angle, direction, and
-  commanded angle/open state.
+- Servos: `claws.claw_1`/`claw_2`/`claw_3` and `claws.winch` report hardware
+  configured, independently configured absolute open/closed angles, output
+  enabled, and commanded angle/open state.
 - IR beacon telemetry from ESP1 GPIO7/GPIO2: `selectedBeaconFrequencyHz`,
   `switchRawState`, `switchDebouncedState`, `latest_raw_adc_sample`,
   `adc_sample_mean`, `ir_adc_min`, `ir_adc_max`, `ir_amplitude_pp`,
@@ -204,11 +289,14 @@ mode manual-drive
 mode distributed-drive
 mode line-sensor
 mode line-follow
+mode rear-line-sensor
+mode rear-line-follow
 mode mechanism
 mode autonomous-dry-run
 
 sensor status
 line status
+rear-line status
 
 motor test FL 0.10 1000
 motor test FR 0.10 1000
@@ -241,7 +329,24 @@ lf polarity 1
 lf reset
 lf telemetry on
 lf telemetry off
+rlf start 5000
+rlf stop
+rlf status
+rlf reset
+rlf kp 0.10
+rlf ki 0.00
+rlf kd 0.00
+rlf base 0.20
+rlf max-duty 0.35
+rlf max-correction 0.20
+rlf polarity 1
+rlf telemetry on
 ```
+
+`rlf` tunes a separate rear configuration. Its initial values are copied from
+the front follower, but subsequent `rlf` commands and saves do not change `lf`
+settings. `rlf base` is stored as a positive magnitude; the follower applies a
+negative effective base so all four wheels travel in the opposite direction.
 
 Malformed commands print `rejected: <reason>`.
 

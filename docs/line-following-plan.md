@@ -5,6 +5,11 @@ front sensors `LSFL` and `LSFR` and all four mecanum drive motors. ESP2 owns the
 line follower and front motors. ESP1 receives rear motor commands from ESP2 and
 applies the rear motors it owns.
 
+Reverse rear following is also supported. ESP1 samples rear digital sensors
+LSBL (GPIO17) and LSBR (GPIO18) every `10 ms` and sends a CRC-protected
+`SensorSnapshot` to ESP2. ESP2 still owns the follower, four-wheel calculation,
+and all motion commands. The robot travels backward in this mode.
+
 ## Architecture
 
 ESP2 uses one coherent fixed-period control task:
@@ -39,6 +44,11 @@ surface. Firmware uses `pinMode(..., INPUT)` only; it does not enable
 Positive error is the exact logical result specified for `LSFL` HIGH and
 `LSFR` LOW. Physical steering direction is handled separately by
 `steeringPolarity`.
+
+Reverse rear mode applies the identical table in the direction-of-travel frame:
+physical LSBR is the logical left input and physical LSBL is the logical right
+input. This swap accounts for viewing the robot after a 180-degree change in
+travel direction.
 
 ## PID Controller
 
@@ -83,6 +93,11 @@ front-right and back-right. Mixing produces logical signed normalized commands;
 per-wheel direction signs and H-bridge PWM truth tables stay in each ESP's pin
 configuration.
 
+Reverse rear following uses the same correction math after swapping the rear
+sensor sides, but applies `baseDuty` as a negative command. A positive value in
+the rear Base control is therefore a speed magnitude; telemetry exposes both
+that magnitude and the effective negative base command.
+
 If either side exceeds `maxDuty`, the pair is scaled back so the commands
 remain inside the configured limit.
 
@@ -116,6 +131,26 @@ Malformed values are rejected. `lf max-duty` cannot exceed the verified
 test profile that value is `1.0`, so use the dashboard/serial duty setting
 carefully and start below the desired test value.
 
+Rear commands use an independent `LineFollowerConfig`:
+
+```text
+mode rear-line-sensor
+rear-line status
+rlf start [duration-ms]
+rlf stop
+rlf status
+rlf reset
+rlf telemetry on|off
+rlf <tuning-name> <value>
+```
+
+`REAR_LINE_SENSOR_TEST` never enables actuators. `REAR_LINE_FOLLOW_TEST`
+requires both rear sensors to be configured, a fresh rear snapshot, fresh ESP1
+health, both ESP2 front motors, and the distributed rear-motor link. Stale rear
+sensor data stops all wheels. On first initialization, rear tunables copy the
+front tunables; after that, `rlf` commands, the Reverse Rear Line Following
+dashboard panel, and separate NVS keys maintain them independently.
+
 ## Telemetry
 
 When telemetry is enabled, ESP2 prints about 10 Hz:
@@ -134,6 +169,18 @@ Sensor-only mode prints:
 ```text
 sensor,timestamp_ms,lsfl_level,lsfr_level,left_black,right_black,error,line_visible
 ```
+
+Rear sensor-only mode prints:
+
+```text
+rear_sensor,timestamp_ms,lsbl_level,lsbr_level,logical_left_black,logical_right_black,error,
+line_visible,configured,data_fresh,snapshot_sequence,snapshot_age_ms
+```
+
+Rear-follow telemetry starts with `rlf_csv` and reports the independent rear
+PID and wheel-command fields. Its logical-left/right booleans use LSBR/LSBL,
+respectively, followed by rear snapshot configuration, freshness, sequence,
+and age.
 
 ## Bring-Up Procedure
 

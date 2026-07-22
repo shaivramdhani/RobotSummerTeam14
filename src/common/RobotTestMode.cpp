@@ -60,6 +60,12 @@ const char* robotTestModeName(const RobotTestMode mode) {
       return "AUTONOMOUS_DRY_RUN";
     case RobotTestMode::AutonomousSolarPanel:
       return "AUTONOMOUS_SOLAR_PANEL";
+    case RobotTestMode::RearLineSensorTest:
+      return "REAR_LINE_SENSOR_TEST";
+    case RobotTestMode::RearLineFollowTest:
+      return "REAR_LINE_FOLLOW_TEST";
+    case RobotTestMode::AutonomousTowerPieces:
+      return "AUTONOMOUS_TOWER_PIECES";
   }
 
   return "DISABLED";
@@ -100,6 +106,16 @@ bool parseRobotTestMode(const char* text, RobotTestMode& mode) {
     mode = RobotTestMode::LineFollowTest;
     return true;
   }
+  if (sameModeToken(text, "rear-line-sensor") ||
+      sameModeToken(text, "rear-line-sensor-test")) {
+    mode = RobotTestMode::RearLineSensorTest;
+    return true;
+  }
+  if (sameModeToken(text, "rear-line-follow") ||
+      sameModeToken(text, "rear-line-follow-test")) {
+    mode = RobotTestMode::RearLineFollowTest;
+    return true;
+  }
   if (sameModeToken(text, "mechanism") ||
       sameModeToken(text, "mechanism-test")) {
     mode = RobotTestMode::MechanismTest;
@@ -116,6 +132,11 @@ bool parseRobotTestMode(const char* text, RobotTestMode& mode) {
     mode = RobotTestMode::AutonomousSolarPanel;
     return true;
   }
+  if (sameModeToken(text, "tower-pieces") ||
+      sameModeToken(text, "autonomous-tower-pieces")) {
+    mode = RobotTestMode::AutonomousTowerPieces;
+    return true;
+  }
 
   return false;
 }
@@ -125,18 +146,23 @@ bool robotTestModeAllowsMotion(const RobotTestMode mode) {
          mode == RobotTestMode::ManualDriveTest ||
          mode == RobotTestMode::DistributedDriveTest ||
          mode == RobotTestMode::LineFollowTest ||
+         mode == RobotTestMode::RearLineFollowTest ||
+         mode == RobotTestMode::AutonomousTowerPieces ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 
 bool robotTestModeRequiresRearLink(const RobotTestMode mode) {
   return mode == RobotTestMode::DistributedDriveTest ||
          mode == RobotTestMode::LineFollowTest ||
+         mode == RobotTestMode::RearLineFollowTest ||
+         mode == RobotTestMode::AutonomousTowerPieces ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 
 bool robotTestModeIsSensorOnly(const RobotTestMode mode) {
   return mode == RobotTestMode::SensorMonitor ||
          mode == RobotTestMode::LineSensorTest ||
+         mode == RobotTestMode::RearLineSensorTest ||
          mode == RobotTestMode::AutonomousDryRun ||
          mode == RobotTestMode::Disabled;
 }

@@ -19,8 +19,8 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | `USTRIG2` | TODO | TODO |
 | `USECHO2` | TODO | TODO |
 | `LSS` | 4 | Digital comparator, HIGH = black tape |
-| `LSBL` | TODO | TODO |
-| `LSBR` | TODO | TODO |
+| `LSBL` | 17 | Digital comparator, HIGH = black tape |
+| `LSBR` | 18 | Digital comparator, HIGH = black tape |
 | `PWMBL0` | TODO | TODO |
 | `PWMBL1` | TODO | TODO |
 | `PWMBR0` | TODO | TODO |
@@ -60,7 +60,7 @@ ESP1 UART baud rate: TODO.
 | `MSCLAW2` | 13 | PWM channel/frequency/pulse range TODO |
 | `MSCLAW3` | 12 | PWM channel/frequency/pulse range TODO |
 | `PusherServo` | TODO | TODO |
-| `WinchServo` | TODO | TODO |
+| `WinchServo` | 6 | LEDC channel 7, 50 Hz, 12-bit, 1000–2000 µs |
 | `LimitSwitchStepperBottom` | TODO | TODO |
 | `LimitSwitchStepperMiddle` | TODO | TODO |
 | `LimitSwitchStepperTop` | TODO | TODO |
@@ -78,3 +78,5 @@ ESP1 UART baud rate: TODO.
 
 ESP2 `maximum_safe_test_duty`: `1.0` for drive testing.
 ESP2 UART baud rate: TODO.
+
+ESP2 winch servo: GPIO6, LEDC channel 7, 50 Hz, 12-bit, 1000–2000 µs.

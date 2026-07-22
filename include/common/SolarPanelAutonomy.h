@@ -16,6 +16,10 @@ enum class SolarPanelAutonomyState : std::uint8_t {
   StrafeLeftForSolarRetry = 6,
   MoveForwardForSolarRetry = 7,
   RetryStrafeRightToSolarPanel = 8,
+  MoveForwardAfterSolarContact = 9,
+  StrafeLeftToRearLine = 10,
+  RearLineReacquired = 11,
+  WaitBeforeStrafeLeftToRearLine = 12,
 };
 
 enum class SolarPanelFaultReason : std::uint8_t {
@@ -43,6 +47,11 @@ struct SolarPanelContactConfig {
   Milliseconds retry_strafe_left_duration_ms{0};
   Milliseconds retry_forward_duration_ms{0};
   Milliseconds retry_strafe_timeout_ms{0};
+  Milliseconds post_contact_forward_duration_ms{0};
+  float line_reacquire_strafe_duty{0.0F};
+  Milliseconds post_contact_forward_start_delay_ms{0};
+  Milliseconds line_reacquire_strafe_start_delay_ms{0};
+  float post_contact_forward_duty{0.0F};
 };
 
 struct SolarPanelContactSequenceUpdate {
@@ -76,6 +85,10 @@ bool solarPanelContactConfigValid(const SolarPanelContactConfig& config);
 SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
     SolarPanelAutonomyState current_state, bool front_hit, bool back_hit,
     Milliseconds time_in_state_ms, const SolarPanelContactConfig& config);
+SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
+    SolarPanelAutonomyState current_state, bool front_hit, bool back_hit,
+    bool reacquisition_line_detected, Milliseconds time_in_state_ms,
+    const SolarPanelContactConfig& config);
 void resetSolarBeaconDetectorState(SolarBeaconDetectorState& state);
 SolarBeaconDetectorUpdate updateSolarBeaconDetector(
     SolarBeaconDetectorState& state, std::uint16_t raw_amplitude,

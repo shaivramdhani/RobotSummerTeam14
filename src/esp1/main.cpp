@@ -9,6 +9,7 @@
 #include "common/FunnelCommand.h"
 #include "common/MotorOutput.h"
 #include "common/RearDriveCommand.h"
+#include "common/RearLineSensor.h"
 #include "common/UartProtocol.h"
 #include "esp1/MissionStateMachine.h"
 #include "esp1/PinConfig.h"
@@ -34,12 +35,16 @@ constexpr int kSolarLimitFrontRightSideGpio =
     robot::esp1::kHardwareConfig.pins.limit_switch_front_right_side;
 constexpr int kSideLineSensorGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_side;
+constexpr int kRearLineSensorLeftGpio =
+    robot::esp1::kHardwareConfig.pins.line_sensor_back_left;
+constexpr int kRearLineSensorRightGpio =
+    robot::esp1::kHardwareConfig.pins.line_sensor_back_right;
 constexpr std::uint8_t kIrAdcResolutionBits = 12U;
 constexpr std::uint16_t kIrAdcMaximumSample =
     (static_cast<std::uint16_t>(1U) << kIrAdcResolutionBits) - 1U;
 constexpr std::uint32_t kIrAdcSampleRateHz = 50000U;
-constexpr robot::Milliseconds kIrAdcWindowMs = 40U;
-constexpr std::uint16_t kIrAdcSamplesPerWindow = 2000U;
+constexpr robot::Milliseconds kIrAdcWindowMs = 20U;
+constexpr std::uint16_t kIrAdcSamplesPerWindow = 1000U;
 constexpr std::uint32_t kIrAdcSampleIntervalUs =
     1000000UL / kIrAdcSampleRateHz;
 constexpr std::uint16_t kIrAdcSamplesPerYield = 50U;
@@ -118,11 +123,6 @@ struct SolarPanelLimitSwitchReading {
   bool front_right_high{false};
 };
 
-struct SideLineSensorReading {
-  bool configured{false};
-  bool raw_high{false};
-};
-
 portMUX_TYPE g_ir_adc_result_mux = portMUX_INITIALIZER_UNLOCKED;
 IrAdcWindowResult g_latest_ir_adc_result{};
 std::uint16_t g_ir_adc_samples[kIrAdcSamplesPerWindow]{};
@@ -168,6 +168,11 @@ bool sideLineSensorConfigComplete() {
   return gpioAssigned(kSideLineSensorGpio);
 }
 
+bool rearLineSensorsConfigComplete() {
+  return gpioAssigned(kRearLineSensorLeftGpio) &&
+         gpioAssigned(kRearLineSensorRightGpio);
+}
+
 void initializeSolarPanelLimitSwitches() {
   if (!solarPanelLimitSwitchesConfigComplete()) {
     return;
@@ -195,13 +200,31 @@ void initializeSideLineSensor() {
   }
 }
 
-SideLineSensorReading readSideLineSensor() {
-  SideLineSensorReading reading{};
-  reading.configured = sideLineSensorConfigComplete();
-  if (reading.configured) {
-    reading.raw_high = digitalRead(kSideLineSensorGpio) == HIGH;
+void initializeRearLineSensors() {
+  if (!rearLineSensorsConfigComplete()) {
+    return;
   }
-  return reading;
+  pinMode(kRearLineSensorLeftGpio, INPUT);
+  pinMode(kRearLineSensorRightGpio, INPUT);
+}
+
+robot::RearLineSensorSnapshot readRearLineSensors(
+    const robot::Milliseconds now_ms) {
+  robot::RearLineSensorSnapshot snapshot{};
+  snapshot.captured_at_ms = now_ms;
+  snapshot.configured = rearLineSensorsConfigComplete();
+  if (snapshot.configured) {
+    snapshot.left_electrical_high =
+        digitalRead(kRearLineSensorLeftGpio) == HIGH;
+    snapshot.right_electrical_high =
+        digitalRead(kRearLineSensorRightGpio) == HIGH;
+  }
+  snapshot.side_configured = sideLineSensorConfigComplete();
+  if (snapshot.side_configured) {
+    snapshot.side_electrical_high =
+        digitalRead(kSideLineSensorGpio) == HIGH;
+  }
+  return snapshot;
 }
 
 std::uint16_t clampAdcSample(const int sample) {
@@ -304,7 +327,7 @@ IrAdcWindowResult sampleIrAdcWindow(const DebouncedSwitchState& switch_state,
                                     bool& detected,
                                     std::uint8_t& detect_count,
                                     std::uint8_t& clear_count) {
-  // The 40 ms window captures many cycles of both supported beacons. Peak-to-
+  // The 20 ms window captures many cycles of both supported beacons. Peak-to-
   // peak remains a diagnostic; detection uses mean-subtracted Goertzel output.
   std::uint16_t minimum = kIrAdcMaximumSample;
   std::uint16_t maximum = 0U;
@@ -548,6 +571,7 @@ void publishEsp1Status(RearCommandLink& link,
                        const DualPwmMotorOutput& funnel_motor,
                        const robot::RearDriveStatus& rear_status,
                        const robot::FunnelStatus& funnel_status,
+                       const robot::RearLineSensorSnapshot& line_sensors,
                        const robot::Milliseconds now_ms) {
   static robot::Milliseconds last_publish_ms = 0U;
   static std::uint16_t sequence = 0U;
@@ -585,9 +609,8 @@ void publishEsp1Status(RearCommandLink& link,
       solar_limits.back_right_high;
   report.solar_limit_front_right_high =
       solar_limits.front_right_high;
-  const SideLineSensorReading side_line = readSideLineSensor();
-  report.side_line_sensor_configured = side_line.configured;
-  report.side_line_sensor_high = side_line.raw_high;
+  report.side_line_sensor_configured = line_sensors.side_configured;
+  report.side_line_sensor_high = line_sensors.side_electrical_high;
   report.ir_adc_average = ir.average;
   report.ir_adc_min = ir.minimum;
   report.ir_adc_max = ir.maximum;
@@ -604,6 +627,13 @@ void publishEsp1Status(RearCommandLink& link,
   report.ir_consecutive_detection_count = ir.consecutive_detection_count;
   report.ir_adc_sample_rate_hz = ir.achieved_sample_rate_hz;
   link.send(robot::makeEsp1StatusPacket(report, sequence++));
+}
+
+void publishRearLineSensors(
+    RearCommandLink& link,
+    const robot::RearLineSensorSnapshot& snapshot) {
+  static std::uint16_t sequence = 0U;
+  link.send(robot::makeRearLineSensorPacket(snapshot, sequence++));
 }
 
 void printRearStatus(const robot::RearDriveStatus& status,
@@ -744,6 +774,7 @@ void rearDriveTask(void* parameters) {
   link.initialize();
   initializeSolarPanelLimitSwitches();
   initializeSideLineSensor();
+  initializeRearLineSensors();
 
   TickType_t last_wake_tick = xTaskGetTickCount();
 
@@ -776,8 +807,11 @@ void rearDriveTask(void* parameters) {
 
     const robot::RearDriveStatus rear_status = receiver.status(now_ms);
     const robot::FunnelStatus funnel_status = funnel_receiver.status(now_ms);
+    const robot::RearLineSensorSnapshot line_sensors =
+        readRearLineSensors(now_ms);
     publishEsp1Status(link, back_left_motor, back_right_motor, funnel_motor,
-                      rear_status, funnel_status, now_ms);
+                      rear_status, funnel_status, line_sensors, now_ms);
+    publishRearLineSensors(link, line_sensors);
     printRearStatus(rear_status, back_left_motor, back_right_motor, link,
                     now_ms);
     printIrDebugLine(back_left_motor, back_right_motor, now_ms);

@@ -59,6 +59,18 @@ does not include the magic bytes or CRC field.
 
 Signed motor commands are normalized milli-units from `-1000` to `1000`.
 
+## Line Sensor Snapshot Payload
+
+ESP1 publishes `SensorSnapshot` every `10 ms` using a 5-byte payload:
+
+| Byte(s) | Field |
+| --- | --- |
+| 0-3 | ESP1 capture timestamp in ms |
+| 4 | flags: bit 0 rear sensors configured, bit 1 LSBL high, bit 2 LSBR high, bit 3 LSS configured, bit 4 LSS high |
+
+The shared snapshot keeps rear following and tower-piece side-line counting on
+one coherent ESP1 acquisition path. HIGH means black tape.
+
 ## Funnel Mechanism Command Payload
 
 `MechanismCommand` uses a 12-byte payload for the ESP1-owned funnel motor:

@@ -33,7 +33,8 @@ bool RobotTestModeManager::acceptsSingleMotorCommand() const {
 }
 
 bool RobotTestModeManager::acceptsLineFollowerCommand() const {
-  return current_mode_ == RobotTestMode::LineFollowTest;
+  return current_mode_ == RobotTestMode::LineFollowTest ||
+         current_mode_ == RobotTestMode::RearLineFollowTest;
 }
 
 }  // namespace robot

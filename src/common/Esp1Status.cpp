@@ -58,6 +58,9 @@ RobotTestMode byteToMode(const std::uint8_t value) {
     case RobotTestMode::MechanismTest:
     case RobotTestMode::AutonomousDryRun:
     case RobotTestMode::AutonomousSolarPanel:
+    case RobotTestMode::RearLineSensorTest:
+    case RobotTestMode::RearLineFollowTest:
+    case RobotTestMode::AutonomousTowerPieces:
       return static_cast<RobotTestMode>(value);
   }
   return RobotTestMode::Disabled;

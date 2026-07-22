@@ -48,6 +48,14 @@ const char* solarPanelAutonomyStateName(
       return "MOVE_FORWARD_FOR_SOLAR_RETRY";
     case SolarPanelAutonomyState::RetryStrafeRightToSolarPanel:
       return "RETRY_STRAFE_RIGHT_TO_SOLAR_PANEL";
+    case SolarPanelAutonomyState::MoveForwardAfterSolarContact:
+      return "MOVE_FORWARD_AFTER_SOLAR_CONTACT";
+    case SolarPanelAutonomyState::StrafeLeftToRearLine:
+      return "STRAFE_LEFT_TO_REAR_LINE";
+    case SolarPanelAutonomyState::RearLineReacquired:
+      return "REAR_LINE_REACQUIRED";
+    case SolarPanelAutonomyState::WaitBeforeStrafeLeftToRearLine:
+      return "WAIT_BEFORE_STRAFE_LEFT_TO_REAR_LINE";
   }
   return "WAIT_FOR_START";
 }
@@ -83,13 +91,27 @@ bool solarPanelContactConfigValid(
   return config.timeout_ms > 0U &&
          config.retry_strafe_timeout_ms > 0U &&
          std::isfinite(config.strafe_duty) && config.strafe_duty >= 0.0F &&
-         config.strafe_duty <= 1.0F;
+         config.strafe_duty <= 1.0F &&
+         std::isfinite(config.line_reacquire_strafe_duty) &&
+         config.line_reacquire_strafe_duty >= 0.0F &&
+         config.line_reacquire_strafe_duty <= 1.0F &&
+         std::isfinite(config.post_contact_forward_duty) &&
+         config.post_contact_forward_duty >= 0.0F &&
+         config.post_contact_forward_duty <= 1.0F;
 }
 
 SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
     const SolarPanelAutonomyState current_state, const bool front_hit,
     const bool back_hit, const Milliseconds time_in_state_ms,
     const SolarPanelContactConfig& config) {
+  return updateSolarPanelContactSequence(current_state, front_hit, back_hit,
+                                         false, time_in_state_ms, config);
+}
+
+SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
+    const SolarPanelAutonomyState current_state, const bool front_hit,
+    const bool back_hit, const bool reacquisition_line_detected,
+    const Milliseconds time_in_state_ms, const SolarPanelContactConfig& config) {
   const bool contact_motion_state =
       current_state == SolarPanelAutonomyState::StrafeRightToSolarPanel ||
       current_state == SolarPanelAutonomyState::StrafeLeftForSolarRetry ||
@@ -130,11 +152,50 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
                        SolarPanelAutonomyState::SolarSearchFault, true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
+    case SolarPanelAutonomyState::SolarPanelContacted:
+      return time_in_state_ms >=
+                     config.post_contact_forward_start_delay_ms
+                 ? SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+                       true}
+                 : SolarPanelContactSequenceUpdate{current_state, false};
+
+    case SolarPanelAutonomyState::MoveForwardAfterSolarContact:
+      if (time_in_state_ms < config.post_contact_forward_duration_ms) {
+        return {current_state, false};
+      }
+      if (reacquisition_line_detected) {
+        return {SolarPanelAutonomyState::RearLineReacquired, true};
+      }
+      return config.line_reacquire_strafe_start_delay_ms > 0U
+                 ? SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::
+                           WaitBeforeStrafeLeftToRearLine,
+                       true}
+                 : SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::StrafeLeftToRearLine, true};
+
+    case SolarPanelAutonomyState::WaitBeforeStrafeLeftToRearLine:
+      if (reacquisition_line_detected) {
+        return {SolarPanelAutonomyState::RearLineReacquired, true};
+      }
+      return time_in_state_ms >=
+                     config.line_reacquire_strafe_start_delay_ms
+                 ? SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::StrafeLeftToRearLine, true}
+                 : SolarPanelContactSequenceUpdate{current_state, false};
+
+    case SolarPanelAutonomyState::StrafeLeftToRearLine:
+      return reacquisition_line_detected
+                 ? SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::RearLineReacquired, true}
+                 : SolarPanelContactSequenceUpdate{current_state, false};
+
     case SolarPanelAutonomyState::WaitForStart:
     case SolarPanelAutonomyState::LineFollowToSolar:
     case SolarPanelAutonomyState::SolarBeaconAligned:
     case SolarPanelAutonomyState::SolarSearchFault:
-    case SolarPanelAutonomyState::SolarPanelContacted:
+    case SolarPanelAutonomyState::RearLineReacquired:
       return {current_state, false};
   }
 

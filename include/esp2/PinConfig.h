@@ -53,16 +53,16 @@ struct Esp2Pins {
   int pwm_front_right_0{41};          // TODO: GPIO, PWM resource
   int pwm_front_right_1{42};          // TODO: GPIO, PWM resource
   int stepper_step{4};               // DRV8425 STEP, rising edge = one microstep
-  int stepper_dir{3};                // DRV8425 DIR, HIGH = software Up
+  int stepper_dir{3};                // DRV8425 DIR, LOW = physical Up
   int stepper_sleep{2};              // DRV8425 nSLEEP, active LOW
   int servo_claw_1{14};               // TODO: GPIO, pulse range
   int servo_claw_2{13};               // TODO: GPIO, pulse range
   int servo_claw_3{12};               // TODO: GPIO, pulse range
   int servo_pusher{kUnassignedGpio};               // TODO: GPIO, pulse range
-  int servo_winch{kUnassignedGpio};                // TODO: GPIO, pulse range
+  int servo_winch{6};                 // Winch servo PWM output
   int limit_switch_stepper_bottom{10};  // NO switch: LOW released, HIGH pressed
   int limit_switch_stepper_middle{kUnassignedGpio};  // TODO: GPIO, active level
-  int limit_switch_stepper_top{kUnassignedGpio};     // TODO: GPIO, active level
+  int limit_switch_stepper_top{11};     // NO switch: LOW released, HIGH pressed
   int limit_switch_funnel_left{kUnassignedGpio};     // TODO: GPIO, active level
   int limit_switch_funnel_right{kUnassignedGpio};    // TODO: GPIO, active level
   int uart_tx_to_esp1{21};                         // UART TX to ESP1 GPIO40
@@ -76,6 +76,7 @@ struct Esp2HardwareConfig {
   ServoOutputConfig servo_claw_1{14};              // TODO: PWM resource/range
   ServoOutputConfig servo_claw_2{13};              // TODO: PWM resource/range
   ServoOutputConfig servo_claw_3{12};              // TODO: PWM resource/range
+  ServoOutputConfig servo_winch{6};
   UartConfig uart_to_esp1{};                     // TODO: fill TX/RX/baud
   float maximum_safe_test_duty{0.9F};            // TODO: verified safe duty
 };
@@ -92,6 +93,7 @@ inline constexpr Esp2HardwareConfig kHardwareConfig{
     {kPins.servo_claw_1, 4, 50, 12, 1000, 2000},
     {kPins.servo_claw_2, 5, 50, 12, 1000, 2000},
     {kPins.servo_claw_3, 6, 50, 12, 1000, 2000},
+    {kPins.servo_winch, 7, 50, 12, 1000, 2000},
     {kPins.uart_tx_to_esp1, kPins.uart_rx_from_esp1,
      kDriveTestUartBaudRate},
     1.0F};

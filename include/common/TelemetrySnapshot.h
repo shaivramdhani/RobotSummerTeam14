@@ -8,6 +8,7 @@
 #include "common/LineFollower.h"
 #include "common/RobotTestMode.h"
 #include "common/SolarPanelAutonomy.h"
+#include "common/TowerPiecesAutonomy.h"
 #include "common/Units.h"
 
 namespace robot {
@@ -56,20 +57,20 @@ struct Esp1RemoteStatusTelemetry {
 
 struct ServoClawTelemetry {
   bool hardware_configured{false};
-  bool start_configured{false};
+  bool open_configured{false};
+  bool closed_configured{false};
   bool output_enabled{false};
-  int start_angle_deg{-1};
   int open_angle_deg{-1};
-  int open_direction{1};
+  int closed_angle_deg{-1};
   int commanded_angle_deg{-1};
   bool commanded_open{false};
 };
 
 struct ServoClawBankTelemetry {
-  int rotation_deg{90};
   ServoClawTelemetry claw_1{};
   ServoClawTelemetry claw_2{};
   ServoClawTelemetry claw_3{};
+  ServoClawTelemetry winch{};
 };
 
 struct TelemetrySnapshot {
@@ -99,6 +100,42 @@ struct TelemetrySnapshot {
   bool line_has_history{false};
   std::int8_t last_known_line_side{0};
   bool line_follower_enabled{false};
+
+  int lsbl_raw_level{-1};
+  int lsbr_raw_level{-1};
+  bool lsbl_black{false};
+  bool lsbr_black{false};
+  bool rear_line_configured{false};
+  bool rear_line_data_fresh{false};
+  std::uint16_t rear_line_sequence{0};
+  Milliseconds rear_line_sample_age_ms{0};
+  Milliseconds rear_line_captured_at_ms{0};
+  std::int8_t rear_line_error{0};
+  bool rear_line_visible{false};
+  bool rear_line_has_history{false};
+  std::int8_t rear_last_known_line_side{0};
+  bool rear_line_follower_enabled{false};
+  bool rear_logical_left_black{false};
+  bool rear_logical_right_black{false};
+
+  float rear_kp{0.0F};
+  float rear_ki{0.0F};
+  float rear_kd{0.0F};
+  float rear_base_duty{0.0F};
+  float rear_effective_base_duty{0.0F};
+  float rear_maximum_duty{0.0F};
+  float rear_maximum_correction{0.0F};
+  float rear_integral_limit{0.0F};
+  float rear_derivative_limit{0.0F};
+  float rear_derivative_filter_alpha{0.0F};
+  int rear_steering_polarity{1};
+  Milliseconds rear_control_period_ms{0};
+  Milliseconds rear_remote_command_timeout_ms{0};
+  bool rear_line_telemetry_enabled{false};
+  float rear_pid_p_term{0.0F};
+  float rear_pid_i_term{0.0F};
+  float rear_pid_d_term{0.0F};
+  float rear_pid_correction{0.0F};
 
   float kp{0.0F};
   float ki{0.0F};
@@ -148,12 +185,49 @@ struct TelemetrySnapshot {
   Milliseconds solar_retry_strafe_left_duration_ms{0};
   Milliseconds solar_retry_forward_duration_ms{0};
   Milliseconds solar_retry_strafe_timeout_ms{0};
+  Milliseconds solar_post_contact_forward_duration_ms{0};
+  float solar_line_reacquire_strafe_duty{0.0F};
+  Milliseconds solar_post_contact_forward_start_delay_ms{0};
+  Milliseconds solar_line_reacquire_strafe_start_delay_ms{0};
+  float solar_post_contact_forward_duty{0.0F};
   bool solar_panel_limit_switches_configured{false};
   bool solar_limit_back_right_high{false};
   bool solar_limit_front_right_high{false};
   bool solar_limit_back_right_hit{false};
   bool solar_limit_front_right_hit{false};
   bool solar_limit_all_hit{false};
+
+  TowerPiecesState tower_pieces_state{TowerPiecesState::WaitForStart};
+  TowerPiecesFaultReason tower_pieces_fault_reason{
+      TowerPiecesFaultReason::None};
+  Milliseconds tower_pieces_time_in_state_ms{0};
+  float tower_pieces_reverse_line_duty{0.0F};
+  Milliseconds tower_pieces_side_line_timeout_ms{0};
+  Milliseconds tower_pieces_post_line_delay_ms{0};
+  float tower_pieces_strafe_right_duty{0.0F};
+  Milliseconds tower_pieces_strafe_right_duration_ms{0};
+  Milliseconds tower_pieces_post_strafe_pause_ms{0};
+  float tower_pieces_clockwise_rotation_duty{0.0F};
+  Milliseconds tower_pieces_clockwise_rotation_duration_ms{0};
+  Milliseconds tower_pieces_post_rotation_pause_ms{0};
+  float tower_pieces_reverse_duty{0.0F};
+  Milliseconds tower_pieces_reverse_duration_ms{0};
+  float tower_pieces_shimmy_duty{0.0F};
+  Milliseconds tower_pieces_shimmy_right_duration_ms{0};
+  Milliseconds tower_pieces_shimmy_left_duration_ms{0};
+  Milliseconds tower_pieces_shimmy_timeout_ms{0};
+  std::uint8_t tower_pieces_side_line_count{0};
+  std::uint8_t tower_pieces_target_side_line_count{
+      kTowerPiecesTargetSideLineCount};
+  bool tower_pieces_side_line_sensor_configured{false};
+  bool tower_pieces_side_line_sensor_high{false};
+  bool tower_pieces_line_following{false};
+  bool tower_pieces_strafing_right{false};
+  bool tower_pieces_rotating_clockwise{false};
+  bool tower_pieces_driving_backward{false};
+  bool tower_pieces_shimmying_left{false};
+  bool tower_pieces_shimmying_right{false};
+  bool tower_pieces_back_line_detected{false};
 
   MotorTelemetry front_left{};
   MotorTelemetry front_right{};

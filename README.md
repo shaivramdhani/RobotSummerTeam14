@@ -80,8 +80,11 @@ mode manual-drive
 mode distributed-drive
 mode line-sensor
 mode line-follow
+mode rear-line-sensor
+mode rear-line-follow
 sensor status
 line status
+rear-line status
 motor test FL 0.10 1000
 drive fwd 0.10 1000
 lf start
@@ -103,11 +106,44 @@ lf timeout-ms <integer>
 lf reset
 lf telemetry on
 lf telemetry off
+rlf start
+rlf stop
+rlf status
+rlf reset
+rlf kp <value>
+rlf ki <value>
+rlf kd <value>
+rlf base <positive-normalized-duty-magnitude>
+rlf max-duty <normalized-duty>
+rlf max-correction <value>
+rlf polarity <1|-1>
+rlf telemetry on
+rlf telemetry off
 ```
 
 `lf start` and movement tests reject commands while required hardware facts are
 still TODO or the ESP1 status link is stale. See `docs/line-following-plan.md`
 for the bring-up procedure.
+
+`rlf start` drives the robot in reverse using ESP1 rear sensors LSBL/LSBR on
+GPIO17/GPIO18. In the reverse travel frame, physical LSBR is logical left and
+physical LSBL is logical right. Rear PID settings are independent and are
+initialized from the front settings the first time; the rear dashboard panel,
+`rlf` commands, and saved NVS keys then tune them separately. The entered rear
+base is a positive magnitude and firmware applies it as a negative wheel
+command. Starting also requires a fresh rear-sensor snapshot.
+
+The ESP2 dashboard also has a `Tower Pieces` panel. Its Start button enters
+`AUTONOMOUS_TOWER_PIECES`, follows the rear line backward, counts distinct LSS
+LOW-to-HIGH transitions, and stops all four wheels on transition two. It then
+waits, strafes right for a configured duration, pauses, rotates clockwise for a
+configured duration, pauses again, and drives backward for a configured
+duration. It then alternates right and left strafes, starting right, until either
+back line sensor is HIGH or the shimmy timeout expires. The right and left
+shimmy durations are independently adjustable. Reverse, strafe,
+rotation, and shimmy duties; all step timings; and both timeouts are set in that
+panel and can be saved to NVS. The new values intentionally default to `0`
+(unconfigured), so motion is rejected until the team enters verified values.
 
 ## Upload
 

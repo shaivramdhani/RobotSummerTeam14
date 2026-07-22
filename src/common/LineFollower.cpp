@@ -127,4 +127,11 @@ LineFollowerUpdate updateLineFollower(LineFollowerState& state,
   return update;
 }
 
+LineFollowerConfig makeReverseTravelLineFollowerConfig(
+    const LineFollowerConfig& configured_values) {
+  LineFollowerConfig reverse = configured_values;
+  reverse.baseDuty = -std::fabs(configured_values.baseDuty);
+  return reverse;
+}
+
 }  // namespace robot

@@ -15,6 +15,9 @@ enum class RobotTestMode : std::uint8_t {
   MechanismTest = 7,
   AutonomousDryRun = 8,
   AutonomousSolarPanel = 9,
+  RearLineSensorTest = 10,
+  RearLineFollowTest = 11,
+  AutonomousTowerPieces = 12,
 };
 
 const char* robotTestModeName(RobotTestMode mode);
