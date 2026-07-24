@@ -40,8 +40,8 @@ struct Esp1Pins {
   int left_ir_filtered{kUnassignedGpio};           // TODO: GPIO, active level
   int right_ir_filtered{7};  // GPIO7, ADC1_CH6, analog 0-3.3 V max
   int freq{2};  // IR frequency-select switch, INPUT_PULLUP
-  int ultrasonic_trigger_1{kUnassignedGpio};       // TODO: GPIO, timing
-  int ultrasonic_echo_1{kUnassignedGpio};          // TODO: GPIO, voltage level
+  int ultrasonic_trigger_1{12};  // HC-SR04 trigger output
+  int ultrasonic_echo_1{11};     // HC-SR04 echo, divided to 3.3 V in hardware
   int ultrasonic_trigger_2{kUnassignedGpio};       // TODO: GPIO, timing
   int ultrasonic_echo_2{kUnassignedGpio};          // TODO: GPIO, voltage level
   int line_sensor_side{4};  // Digital comparator, HIGH = black tape

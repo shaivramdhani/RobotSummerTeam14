@@ -6,8 +6,10 @@
 #include "common/EventLog.h"
 #include "common/FaultHealth.h"
 #include "common/LineFollower.h"
+#include "common/PegFinderAutonomy.h"
 #include "common/RobotTestMode.h"
 #include "common/SolarPanelAutonomy.h"
+#include "common/TimeTrialAutonomy.h"
 #include "common/TowerPiecesAutonomy.h"
 #include "common/Units.h"
 
@@ -53,6 +55,19 @@ struct Esp1RemoteStatusTelemetry {
   bool solar_limit_front_right_high{false};
   bool side_line_sensor_configured{false};
   bool side_line_sensor_high{false};
+  bool ultrasonic_1_configured{false};
+  bool ultrasonic_1_echo_valid{false};
+  std::uint16_t ultrasonic_1_distance_mm{0};
+  std::uint32_t ultrasonic_1_echo_duration_us{0};
+};
+
+struct UltrasonicTelemetry {
+  bool configured{false};
+  bool data_fresh{false};
+  bool echo_valid{false};
+  std::uint16_t distance_mm{0};
+  std::uint32_t echo_duration_us{0};
+  Milliseconds sample_age_ms{0};
 };
 
 struct ServoClawTelemetry {
@@ -216,6 +231,15 @@ struct TelemetrySnapshot {
   Milliseconds tower_pieces_shimmy_right_duration_ms{0};
   Milliseconds tower_pieces_shimmy_left_duration_ms{0};
   Milliseconds tower_pieces_shimmy_timeout_ms{0};
+  float tower_pieces_final_reverse_duty{0.0F};
+  Milliseconds tower_pieces_final_reverse_duration_ms{0};
+  Milliseconds tower_pieces_post_final_reverse_delay_ms{0};
+  Milliseconds tower_pieces_post_winch_open_delay_ms{0};
+  Milliseconds tower_pieces_post_claws_open_delay_ms{0};
+  std::uint32_t tower_pieces_stepper_down_speed_steps_per_second{0};
+  Milliseconds tower_pieces_post_stepper_bottom_delay_ms{0};
+  Milliseconds tower_pieces_post_claws_closed_delay_ms{0};
+  std::uint32_t tower_pieces_stepper_up_speed_steps_per_second{0};
   std::uint8_t tower_pieces_side_line_count{0};
   std::uint8_t tower_pieces_target_side_line_count{
       kTowerPiecesTargetSideLineCount};
@@ -228,12 +252,50 @@ struct TelemetrySnapshot {
   bool tower_pieces_shimmying_left{false};
   bool tower_pieces_shimmying_right{false};
   bool tower_pieces_back_line_detected{false};
+  bool tower_pieces_final_reverse_active{false};
+  bool tower_pieces_stepper_moving_down{false};
+  bool tower_pieces_stepper_moving_up{false};
+
+  PegFinderState peg_finder_state{PegFinderState::WaitForStart};
+  PegFinderFaultReason peg_finder_fault_reason{
+      PegFinderFaultReason::None};
+  Milliseconds peg_finder_time_in_state_ms{0};
+  float peg_finder_clockwise_duty{0.0F};
+  Milliseconds peg_finder_clockwise_duration_ms{0};
+  Milliseconds peg_finder_post_rotation_pause_ms{0};
+  float peg_finder_reverse_duty{0.0F};
+  Milliseconds peg_finder_reverse_duration_ms{0};
+  Milliseconds peg_finder_post_reverse_pause_ms{0};
+  float peg_finder_forward_duty{0.0F};
+  Milliseconds peg_finder_forward_duration_ms{0};
+  float peg_finder_funnel_forward_duty{0.0F};
+  Milliseconds peg_finder_funnel_forward_timeout_ms{0};
+  Milliseconds peg_finder_post_funnel_limit_delay_ms{0};
+  Milliseconds peg_finder_claw_open_interval_ms{0};
+  bool peg_finder_funnel_limit_configured{false};
+  bool peg_finder_funnel_limit_high{false};
+  bool peg_finder_rotating_clockwise{false};
+  bool peg_finder_driving_backward{false};
+  bool peg_finder_driving_forward{false};
+  bool peg_finder_funnel_forward{false};
+  bool peg_finder_opening_claw_1{false};
+  bool peg_finder_opening_claw_2{false};
+  bool peg_finder_opening_claw_3{false};
+
+  TimeTrialState time_trial_state{TimeTrialState::WaitForStart};
+  Milliseconds time_trial_time_in_state_ms{0};
+  Milliseconds time_trial_post_solar_delay_ms{0};
+  float time_trial_strafe_right_duty{0.0F};
+  Milliseconds time_trial_strafe_right_duration_ms{0};
+  Milliseconds time_trial_post_tower_delay_ms{0};
+  bool time_trial_strafing_right{false};
 
   MotorTelemetry front_left{};
   MotorTelemetry front_right{};
   MotorTelemetry funnel{};
   RearCommandTelemetry rear{};
   Esp1RemoteStatusTelemetry esp1{};
+  UltrasonicTelemetry ultrasonic_1{};
   ServoClawBankTelemetry claws{};
 
   std::uint16_t ir_adc_average{0};

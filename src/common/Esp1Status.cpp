@@ -61,6 +61,8 @@ RobotTestMode byteToMode(const std::uint8_t value) {
     case RobotTestMode::RearLineSensorTest:
     case RobotTestMode::RearLineFollowTest:
     case RobotTestMode::AutonomousTowerPieces:
+    case RobotTestMode::PegFinder:
+    case RobotTestMode::TimeTrial:
       return static_cast<RobotTestMode>(value);
   }
   return RobotTestMode::Disabled;
@@ -136,7 +138,15 @@ UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
   sensor_flags |= report.side_line_sensor_high
                       ? kEsp1StatusSideLineHighFlag
                       : 0U;
+  sensor_flags |= report.ultrasonic_1_configured
+                      ? kEsp1StatusUltrasonic1ConfiguredFlag
+                      : 0U;
+  sensor_flags |= report.ultrasonic_1_echo_valid
+                      ? kEsp1StatusUltrasonic1EchoValidFlag
+                      : 0U;
   packet.payload[38] = sensor_flags;
+  putU16(&packet.payload[39], report.ultrasonic_1_distance_mm);
+  putU32(&packet.payload[41], report.ultrasonic_1_echo_duration_us);
   packet.header.integrity_crc16 = calculatePacketIntegrity(packet);
   return packet;
 }
@@ -193,6 +203,12 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
       (sensor_flags & kEsp1StatusSideLineConfiguredFlag) != 0U;
   report.side_line_sensor_high =
       (sensor_flags & kEsp1StatusSideLineHighFlag) != 0U;
+  report.ultrasonic_1_configured =
+      (sensor_flags & kEsp1StatusUltrasonic1ConfiguredFlag) != 0U;
+  report.ultrasonic_1_echo_valid =
+      (sensor_flags & kEsp1StatusUltrasonic1EchoValidFlag) != 0U;
+  report.ultrasonic_1_distance_mm = getU16(&packet.payload[39]);
+  report.ultrasonic_1_echo_duration_us = getU32(&packet.payload[41]);
   return true;
 }
 

@@ -401,12 +401,23 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"shimmy_right_duration_ms\":%u,"
       "\"shimmy_left_duration_ms\":%u,"
       "\"shimmy_timeout_ms\":%u,"
+      "\"final_reverse_duty\":%.5f,"
+      "\"final_reverse_duration_ms\":%u,"
+      "\"post_final_reverse_delay_ms\":%u,"
+      "\"post_winch_open_delay_ms\":%u,"
+      "\"post_claws_open_delay_ms\":%u,"
+      "\"stepper_down_speed_steps_per_second\":%u,"
+      "\"post_stepper_bottom_delay_ms\":%u,"
+      "\"post_claws_closed_delay_ms\":%u,"
+      "\"stepper_up_speed_steps_per_second\":%u,"
       "\"side_line_count\":%u,\"target_side_line_count\":%u,"
       "\"side_line_sensor_configured\":%s,"
       "\"side_line_sensor_high\":%s,\"line_following\":%s,"
       "\"strafing_right\":%s,\"rotating_clockwise\":%s,"
       "\"driving_backward\":%s,\"shimmying_left\":%s,"
-      "\"shimmying_right\":%s,\"back_line_detected\":%s}",
+      "\"shimmying_right\":%s,\"back_line_detected\":%s,"
+      "\"final_reverse_active\":%s,"
+      "\"stepper_moving_down\":%s,\"stepper_moving_up\":%s}",
       towerPiecesStateName(snapshot.tower_pieces_state),
       towerPiecesFaultReasonName(snapshot.tower_pieces_fault_reason),
       static_cast<unsigned>(snapshot.tower_pieces_time_in_state_ms),
@@ -428,6 +439,19 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(
           snapshot.tower_pieces_shimmy_left_duration_ms),
       static_cast<unsigned>(snapshot.tower_pieces_shimmy_timeout_ms),
+      snapshot.tower_pieces_final_reverse_duty,
+      static_cast<unsigned>(snapshot.tower_pieces_final_reverse_duration_ms),
+      static_cast<unsigned>(
+          snapshot.tower_pieces_post_final_reverse_delay_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_winch_open_delay_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_claws_open_delay_ms),
+      static_cast<unsigned>(
+          snapshot.tower_pieces_stepper_down_speed_steps_per_second),
+      static_cast<unsigned>(
+          snapshot.tower_pieces_post_stepper_bottom_delay_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_claws_closed_delay_ms),
+      static_cast<unsigned>(
+          snapshot.tower_pieces_stepper_up_speed_steps_per_second),
       static_cast<unsigned>(snapshot.tower_pieces_side_line_count),
       static_cast<unsigned>(snapshot.tower_pieces_target_side_line_count),
       jsonBool(snapshot.tower_pieces_side_line_sensor_configured),
@@ -438,7 +462,68 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.tower_pieces_driving_backward),
       jsonBool(snapshot.tower_pieces_shimmying_left),
       jsonBool(snapshot.tower_pieces_shimmying_right),
-      jsonBool(snapshot.tower_pieces_back_line_detected));
+      jsonBool(snapshot.tower_pieces_back_line_detected),
+      jsonBool(snapshot.tower_pieces_final_reverse_active),
+      jsonBool(snapshot.tower_pieces_stepper_moving_down),
+      jsonBool(snapshot.tower_pieces_stepper_moving_up));
+
+  writer.append(
+      ",\"peg_finder\":{\"state\":\"%s\","
+      "\"fault_reason\":\"%s\",\"time_in_state_ms\":%u,"
+      "\"clockwise_duty\":%.5f,\"clockwise_duration_ms\":%u,"
+      "\"post_rotation_pause_ms\":%u,"
+      "\"reverse_duty\":%.5f,\"reverse_duration_ms\":%u,"
+      "\"post_reverse_pause_ms\":%u,"
+      "\"forward_duty\":%.5f,\"forward_duration_ms\":%u,"
+      "\"funnel_forward_duty\":%.5f,"
+      "\"funnel_forward_timeout_ms\":%u,"
+      "\"funnel_forward_duration_ms\":%u,"
+      "\"post_funnel_limit_delay_ms\":%u,"
+      "\"claw_open_interval_ms\":%u,"
+      "\"funnel_limit_configured\":%s,\"funnel_limit_high\":%s,"
+      "\"rotating_clockwise\":%s,\"driving_backward\":%s,"
+      "\"driving_forward\":%s,\"funnel_forward\":%s,"
+      "\"opening_claw_1\":%s,\"opening_claw_2\":%s,"
+      "\"opening_claw_3\":%s}",
+      pegFinderStateName(snapshot.peg_finder_state),
+      pegFinderFaultReasonName(snapshot.peg_finder_fault_reason),
+      static_cast<unsigned>(snapshot.peg_finder_time_in_state_ms),
+      snapshot.peg_finder_clockwise_duty,
+      static_cast<unsigned>(snapshot.peg_finder_clockwise_duration_ms),
+      static_cast<unsigned>(snapshot.peg_finder_post_rotation_pause_ms),
+      snapshot.peg_finder_reverse_duty,
+      static_cast<unsigned>(snapshot.peg_finder_reverse_duration_ms),
+      static_cast<unsigned>(snapshot.peg_finder_post_reverse_pause_ms),
+      snapshot.peg_finder_forward_duty,
+      static_cast<unsigned>(snapshot.peg_finder_forward_duration_ms),
+      snapshot.peg_finder_funnel_forward_duty,
+      static_cast<unsigned>(snapshot.peg_finder_funnel_forward_timeout_ms),
+      static_cast<unsigned>(snapshot.peg_finder_funnel_forward_timeout_ms),
+      static_cast<unsigned>(
+          snapshot.peg_finder_post_funnel_limit_delay_ms),
+      static_cast<unsigned>(snapshot.peg_finder_claw_open_interval_ms),
+      jsonBool(snapshot.peg_finder_funnel_limit_configured),
+      jsonBool(snapshot.peg_finder_funnel_limit_high),
+      jsonBool(snapshot.peg_finder_rotating_clockwise),
+      jsonBool(snapshot.peg_finder_driving_backward),
+      jsonBool(snapshot.peg_finder_driving_forward),
+      jsonBool(snapshot.peg_finder_funnel_forward),
+      jsonBool(snapshot.peg_finder_opening_claw_1),
+      jsonBool(snapshot.peg_finder_opening_claw_2),
+      jsonBool(snapshot.peg_finder_opening_claw_3));
+
+  writer.append(
+      ",\"time_trial\":{\"state\":\"%s\",\"time_in_state_ms\":%u,"
+      "\"post_solar_delay_ms\":%u,\"strafe_right_duty\":%.5f,"
+      "\"strafe_right_duration_ms\":%u,\"post_tower_delay_ms\":%u,"
+      "\"strafing_right\":%s}",
+      timeTrialStateName(snapshot.time_trial_state),
+      static_cast<unsigned>(snapshot.time_trial_time_in_state_ms),
+      static_cast<unsigned>(snapshot.time_trial_post_solar_delay_ms),
+      snapshot.time_trial_strafe_right_duty,
+      static_cast<unsigned>(snapshot.time_trial_strafe_right_duration_ms),
+      static_cast<unsigned>(snapshot.time_trial_post_tower_delay_ms),
+      jsonBool(snapshot.time_trial_strafing_right));
 
   writer.append(",\"motors\":{");
   appendMotor(writer, "front_left", snapshot.front_left, true);
@@ -473,7 +558,11 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"solar_limit_back_right_high\":%s,"
                 "\"solar_limit_front_right_high\":%s,"
                 "\"side_line_sensor_configured\":%s,"
-                "\"side_line_sensor_high\":%s}",
+                "\"side_line_sensor_high\":%s,"
+                "\"ultrasonic_1_configured\":%s,"
+                "\"ultrasonic_1_echo_valid\":%s,"
+                "\"ultrasonic_1_distance_mm\":%u,"
+                "\"ultrasonic_1_echo_duration_us\":%u}",
                 jsonBool(snapshot.esp1.available),
                 static_cast<unsigned>(snapshot.esp1.uptime_ms),
                 robotTestModeName(snapshot.esp1.mode),
@@ -490,7 +579,24 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 jsonBool(snapshot.esp1.solar_limit_back_right_high),
                 jsonBool(snapshot.esp1.solar_limit_front_right_high),
                 jsonBool(snapshot.esp1.side_line_sensor_configured),
-                jsonBool(snapshot.esp1.side_line_sensor_high));
+                jsonBool(snapshot.esp1.side_line_sensor_high),
+                jsonBool(snapshot.esp1.ultrasonic_1_configured),
+                jsonBool(snapshot.esp1.ultrasonic_1_echo_valid),
+                static_cast<unsigned>(
+                    snapshot.esp1.ultrasonic_1_distance_mm),
+                static_cast<unsigned>(
+                    snapshot.esp1.ultrasonic_1_echo_duration_us));
+
+  writer.append(
+      ",\"ultrasonic_1\":{\"configured\":%s,\"data_fresh\":%s,"
+      "\"echo_valid\":%s,\"distance_mm\":%u,\"echo_duration_us\":%u,"
+      "\"sample_age_ms\":%u}",
+      jsonBool(snapshot.ultrasonic_1.configured),
+      jsonBool(snapshot.ultrasonic_1.data_fresh),
+      jsonBool(snapshot.ultrasonic_1.echo_valid),
+      static_cast<unsigned>(snapshot.ultrasonic_1.distance_mm),
+      static_cast<unsigned>(snapshot.ultrasonic_1.echo_duration_us),
+      static_cast<unsigned>(snapshot.ultrasonic_1.sample_age_ms));
 
   writer.append(",\"claws\":{");
   appendClaw(writer, "claw_1", snapshot.claws.claw_1, true);

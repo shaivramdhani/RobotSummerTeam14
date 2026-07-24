@@ -60,10 +60,10 @@ struct Esp2Pins {
   int servo_claw_3{12};               // TODO: GPIO, pulse range
   int servo_pusher{kUnassignedGpio};               // TODO: GPIO, pulse range
   int servo_winch{6};                 // Winch servo PWM output
-  int limit_switch_stepper_bottom{10};  // NO switch: LOW released, HIGH pressed
+  int limit_switch_stepper_bottom{9};  // NO switch: LOW released, HIGH pressed
   int limit_switch_stepper_middle{kUnassignedGpio};  // TODO: GPIO, active level
   int limit_switch_stepper_top{11};     // NO switch: LOW released, HIGH pressed
-  int limit_switch_funnel_left{kUnassignedGpio};     // TODO: GPIO, active level
+  int limit_switch_funnel_left{47};     // PegFinder funnel: LOW released, HIGH pressed
   int limit_switch_funnel_right{kUnassignedGpio};    // TODO: GPIO, active level
   int uart_tx_to_esp1{21};                         // UART TX to ESP1 GPIO40
   int uart_rx_from_esp1{40};                       // UART RX from ESP1 GPIO21

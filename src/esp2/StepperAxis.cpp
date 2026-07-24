@@ -272,12 +272,15 @@ void StepperAxis::update() {
   last_update_ms_ = now;
 }
 
-bool StepperAxis::setSpeed(std::uint32_t value) { if (!value || value > 1000000U / (config_.step_high_us + 2U)) return false; speed_steps_per_s_ = value; return true; }
-bool StepperAxis::setLimitSearchSpeed(std::uint32_t value) { if (!value || value > 1000000U / (config_.step_high_us + 2U)) return false; limit_search_speed_steps_per_s_ = value; return true; }
+std::uint32_t StepperAxis::maximumSpeedStepsPerSecond() const {
+  return 1000000U / (config_.step_high_us + 2U);
+}
+
+bool StepperAxis::setSpeed(std::uint32_t value) { if (!value || value > maximumSpeedStepsPerSecond()) return false; speed_steps_per_s_ = value; return true; }
+bool StepperAxis::setLimitSearchSpeed(std::uint32_t value) { if (!value || value > maximumSpeedStepsPerSecond()) return false; limit_search_speed_steps_per_s_ = value; return true; }
 bool StepperAxis::setMotionSpeeds(const std::uint32_t manual_steps_per_s,
                                   const std::uint32_t limit_steps_per_s) {
-  const std::uint32_t maximum_speed =
-      1000000U / (config_.step_high_us + 2U);
+  const std::uint32_t maximum_speed = maximumSpeedStepsPerSecond();
   if (manual_steps_per_s == 0U || limit_steps_per_s == 0U ||
       manual_steps_per_s > maximum_speed ||
       limit_steps_per_s > maximum_speed) {

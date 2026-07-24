@@ -10,6 +10,7 @@
 #include "common/MotorOutput.h"
 #include "common/RearDriveCommand.h"
 #include "common/RearLineSensor.h"
+#include "common/Ultrasonic.h"
 #include "common/UartProtocol.h"
 #include "esp1/MissionStateMachine.h"
 #include "esp1/PinConfig.h"
@@ -39,6 +40,10 @@ constexpr int kRearLineSensorLeftGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_back_left;
 constexpr int kRearLineSensorRightGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_back_right;
+constexpr int kUltrasonic1TriggerGpio =
+    robot::esp1::kHardwareConfig.pins.ultrasonic_trigger_1;
+constexpr int kUltrasonic1EchoGpio =
+    robot::esp1::kHardwareConfig.pins.ultrasonic_echo_1;
 constexpr std::uint8_t kIrAdcResolutionBits = 12U;
 constexpr std::uint16_t kIrAdcMaximumSample =
     (static_cast<std::uint16_t>(1U) << kIrAdcResolutionBits) - 1U;
@@ -52,9 +57,9 @@ constexpr bool kIrDebugTelemetryMode = false;
 constexpr robot::Milliseconds kEsp1StatusPeriodMs =
     kIrDebugTelemetryMode ? 50U : 100U;
 constexpr robot::Milliseconds kIrSerialDebugPeriodMs = 100U;
-constexpr std::uint32_t kIrAdcTaskStackBytes = 8192U;
-constexpr UBaseType_t kIrAdcTaskPriority = 0U;
-constexpr BaseType_t kIrAdcTaskCore = 0;
+constexpr std::uint32_t kSensorTaskStackBytes = 8192U;
+constexpr UBaseType_t kSensorTaskPriority = 0U;
+constexpr BaseType_t kSensorTaskCore = 0;
 
 constexpr std::uint32_t kIrBeaconFrequency1Khz = 1000U;
 constexpr std::uint32_t kIrBeaconFrequency10Khz = 10000U;
@@ -89,6 +94,10 @@ static_assert(IR_THRESHOLD_1KHZ_OFF <= IR_THRESHOLD_1KHZ,
               "1 kHz IR off threshold must be <= on threshold");
 static_assert(IR_THRESHOLD_10KHZ_OFF <= IR_THRESHOLD_10KHZ,
               "10 kHz IR off threshold must be <= on threshold");
+static_assert(robot::kHcSr04EchoTimeoutUs > 0U,
+              "HC-SR04 echo timeout must be nonzero");
+static_assert(robot::kHcSr04EchoTimeoutUs < 100000U,
+              "HC-SR04 echo timeout must remain bounded");
 
 struct IrAdcWindowResult {
   std::uint16_t average{0};
@@ -123,9 +132,18 @@ struct SolarPanelLimitSwitchReading {
   bool front_right_high{false};
 };
 
+struct UltrasonicReading {
+  std::uint16_t distance_mm{0};
+  std::uint32_t echo_duration_us{0};
+  bool configured{false};
+  bool echo_valid{false};
+};
+
 portMUX_TYPE g_ir_adc_result_mux = portMUX_INITIALIZER_UNLOCKED;
 IrAdcWindowResult g_latest_ir_adc_result{};
 std::uint16_t g_ir_adc_samples[kIrAdcSamplesPerWindow]{};
+portMUX_TYPE g_ultrasonic_result_mux = portMUX_INITIALIZER_UNLOCKED;
+UltrasonicReading g_latest_ultrasonic_1_reading{};
 
 bool gpioAssigned(const int gpio) {
   return gpio >= 0;
@@ -171,6 +189,61 @@ bool sideLineSensorConfigComplete() {
 bool rearLineSensorsConfigComplete() {
   return gpioAssigned(kRearLineSensorLeftGpio) &&
          gpioAssigned(kRearLineSensorRightGpio);
+}
+
+bool ultrasonic1ConfigComplete() {
+  return gpioAssigned(kUltrasonic1TriggerGpio) &&
+         gpioAssigned(kUltrasonic1EchoGpio) &&
+         kUltrasonic1TriggerGpio != kUltrasonic1EchoGpio;
+}
+
+void initializeUltrasonic1() {
+  if (!ultrasonic1ConfigComplete()) {
+    return;
+  }
+  digitalWrite(kUltrasonic1TriggerGpio, LOW);
+  pinMode(kUltrasonic1TriggerGpio, OUTPUT);
+  pinMode(kUltrasonic1EchoGpio, INPUT);
+}
+
+void storeUltrasonic1Reading(const UltrasonicReading& reading) {
+  portENTER_CRITICAL(&g_ultrasonic_result_mux);
+  g_latest_ultrasonic_1_reading = reading;
+  portEXIT_CRITICAL(&g_ultrasonic_result_mux);
+}
+
+UltrasonicReading latestUltrasonic1Reading() {
+  portENTER_CRITICAL(&g_ultrasonic_result_mux);
+  const UltrasonicReading reading = g_latest_ultrasonic_1_reading;
+  portEXIT_CRITICAL(&g_ultrasonic_result_mux);
+  return reading;
+}
+
+UltrasonicReading readUltrasonic1() {
+  UltrasonicReading reading{};
+  reading.configured = ultrasonic1ConfigComplete();
+  if (!reading.configured) {
+    return reading;
+  }
+
+  // The trigger remains LOW between samples. HC-SR04 requires a minimum 10 us
+  // HIGH pulse; pulseIn is confined to this low-priority sensor task and has a
+  // timeout derived from the data-sheet 4 m maximum range.
+  digitalWrite(kUltrasonic1TriggerGpio, HIGH);
+  delayMicroseconds(robot::kHcSr04TriggerPulseUs);
+  digitalWrite(kUltrasonic1TriggerGpio, LOW);
+
+  reading.echo_duration_us = static_cast<std::uint32_t>(
+      pulseIn(kUltrasonic1EchoGpio, HIGH, robot::kHcSr04EchoTimeoutUs));
+  if (reading.echo_duration_us == 0U) {
+    return reading;
+  }
+
+  reading.distance_mm =
+      robot::hcSr04DistanceMmFromEchoUs(reading.echo_duration_us);
+  reading.echo_valid =
+      robot::hcSr04DistanceMmIsValid(reading.distance_mm);
+  return reading;
 }
 
 void initializeSolarPanelLimitSwitches() {
@@ -581,6 +654,7 @@ void publishEsp1Status(RearCommandLink& link,
   last_publish_ms = now_ms;
 
   const IrAdcWindowResult ir = latestIrAdcResult();
+  const UltrasonicReading ultrasonic_1 = latestUltrasonic1Reading();
   robot::Esp1StatusReport report{};
   report.uptime_ms = now_ms;
   report.mode = robot::RobotTestMode::Disabled;
@@ -611,6 +685,11 @@ void publishEsp1Status(RearCommandLink& link,
       solar_limits.front_right_high;
   report.side_line_sensor_configured = line_sensors.side_configured;
   report.side_line_sensor_high = line_sensors.side_electrical_high;
+  report.ultrasonic_1_configured = ultrasonic_1.configured;
+  report.ultrasonic_1_echo_valid = ultrasonic_1.echo_valid;
+  report.ultrasonic_1_distance_mm = ultrasonic_1.distance_mm;
+  report.ultrasonic_1_echo_duration_us =
+      ultrasonic_1.echo_duration_us;
   report.ir_adc_average = ir.average;
   report.ir_adc_min = ir.minimum;
   report.ir_adc_max = ir.maximum;
@@ -703,7 +782,7 @@ void printIrDebugLine(const DualPwmMotorOutput& back_left,
   Serial.println(motorMagnitudeMilli(back_left, back_right));
 }
 
-void irAdcSamplingTask(void* parameters) {
+void sensorAcquisitionTask(void* parameters) {
   (void)parameters;
 
   bool detected = false;
@@ -728,6 +807,9 @@ void irAdcSamplingTask(void* parameters) {
     analogReadResolution(kIrAdcResolutionBits);
     analogSetPinAttenuation(kIrAdcGpio, ADC_11db);
   }
+  initializeUltrasonic1();
+  storeUltrasonic1Reading(
+      UltrasonicReading{0U, 0U, ultrasonic1ConfigComplete(), false});
 
   TickType_t last_wake_tick = xTaskGetTickCount();
 
@@ -750,6 +832,7 @@ void irAdcSamplingTask(void* parameters) {
                             clear_count);
       storeIrAdcResult(result);
     }
+    storeUltrasonic1Reading(readUltrasonic1());
 
     vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(kEsp1StatusPeriodMs));
   }
@@ -824,9 +907,9 @@ void rearDriveTask(void* parameters) {
 
 void setup() {
   Serial.begin(115200);
-  xTaskCreatePinnedToCore(irAdcSamplingTask, "esp1_ir_adc",
-                          kIrAdcTaskStackBytes, nullptr,
-                          kIrAdcTaskPriority, nullptr, kIrAdcTaskCore);
+  xTaskCreatePinnedToCore(sensorAcquisitionTask, "esp1_sensors",
+                          kSensorTaskStackBytes, nullptr,
+                          kSensorTaskPriority, nullptr, kSensorTaskCore);
   xTaskCreatePinnedToCore(rearDriveTask, "esp1_rear_drive", kTaskStackBytes,
                           nullptr, kTaskPriority, nullptr, kTaskCore);
 }

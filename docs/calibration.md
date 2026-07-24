@@ -1,6 +1,7 @@
 # Calibration
 
-No calibration values are known yet. Do not invent them.
+Only the explicitly verified values below are known. Do not invent remaining
+calibration values.
 
 ## Line Sensors
 
@@ -20,10 +21,17 @@ No calibration values are known yet. Do not invent them.
 
 ## Ultrasonic Sensors
 
-- Trigger pulse timing: TODO
-- Echo voltage compatibility: TODO
-- Minimum and maximum valid distance: TODO
-- Timeout behavior: TODO
+- Ultrasonic 1 is an HC-SR04 on ESP1: trigger GPIO12, echo GPIO11.
+- Echo is divided to 3.3 V in hardware.
+- Trigger pulse: 10 us HIGH, from the HC-SR04 data sheet.
+- Valid data-sheet range: 20-4000 mm.
+- Distance conversion uses the data-sheet 340 m/s sound velocity and divides
+  round-trip time by two.
+- Echo timeout: 23530 us, derived from the 4000 mm maximum range. A timeout or
+  a converted value outside the valid range is reported as no valid echo.
+- Bench-check distance accuracy and environmental sensitivity before using this
+  reading for autonomous decisions.
+- Ultrasonic 2 model, pins, level shifting, and timing: TODO.
 
 ## Motors and Mechanisms
 

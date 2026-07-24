@@ -139,11 +139,42 @@ LOW-to-HIGH transitions, and stops all four wheels on transition two. It then
 waits, strafes right for a configured duration, pauses, rotates clockwise for a
 configured duration, pauses again, and drives backward for a configured
 duration. It then alternates right and left strafes, starting right, until either
-back line sensor is HIGH or the shimmy timeout expires. The right and left
-shimmy durations are independently adjustable. Reverse, strafe,
-rotation, and shimmy duties; all step timings; and both timeouts are set in that
-panel and can be saved to NVS. The new values intentionally default to `0`
-(unconfigured), so motion is rejected until the team enters verified values.
+back line sensor is HIGH or the shimmy timeout expires. After detecting that
+line, it can perform an optional timed backward drive (`0 ms` skips it), waits,
+opens the winch, waits, opens all three claws, waits, and lowers the stepper to
+the bottom limit. It then waits, closes all three claws, waits, raises the
+stepper to the top limit, and closes the winch. There is no final line-following
+stage. The right and left shimmy durations and all tail settings are adjustable
+in the panel and can be saved to NVS.
+
+Tower Pieces motion duties and durations remain `0` until configured, including
+the optional final reverse. Its pause and delay stages default to `1000 ms`, and
+both limit-search speeds default to `2000` driver microsteps per second. The
+shared servo defaults are claw 1 open/closed `23/110`, claw 2 `40/100`, claw 3
+`80/180`, and winch `0/180` degrees. Tower Pieces uses the same live angles as
+the `Servos` panel, so panel changes update an active servo hold and later
+sequence commands; `/api/claws/save` persists them to NVS.
+
+The dashboard also provides a `PegFinder` mode. It rotates clockwise for a
+configured duration, pauses, drives backward for a configured duration,
+pauses again, drives forward for a configured duration, and then runs the
+ESP1-owned funnel motor forward until the ESP2 GPIO47 limit switch is pressed.
+GPIO47 is LOW while released and HIGH while pressed. If the switch is not
+pressed before the adjustable timeout, PegFinder stops with a fault. After a
+configurable delay, it opens claws 1, 2, and 3 in order with a configurable
+delay between each command, using the live angles from the shared `Servos`
+panel. Its chassis and funnel duties and all timings remain `0` (unconfigured)
+until the team enters verified values.
+
+The `Time Trial` panel runs Autonomous Solar, Tower Pieces, and PegFinder in
+that order. It uses the same live configuration objects as the three individual
+panels, so applying or saving an individual setting also changes the combined
+run. Pressing Time Trial Start first applies all three visible panels and the
+shared servo angles. Its only separate settings are the delay after solar, an
+optional timed right strafe and duty before Tower Pieces, and the delay after
+Tower Pieces. These transition values default to `0`; a `0 ms` strafe skips
+that motion. At the Tower Pieces-to-PegFinder handoff, the claws and winch are
+commanded closed and their PWM outputs remain enabled.
 
 ## Upload
 

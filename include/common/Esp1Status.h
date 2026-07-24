@@ -9,7 +9,7 @@
 
 namespace robot {
 
-constexpr std::uint16_t kEsp1StatusPayloadSize = 39U;
+constexpr std::uint16_t kEsp1StatusPayloadSize = 45U;
 constexpr std::uint8_t kEsp1StatusFaultActiveFlag = 0x01U;
 constexpr std::uint8_t kEsp1StatusBackLeftInvertedFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusBackRightInvertedFlag = 0x04U;
@@ -22,6 +22,8 @@ constexpr std::uint8_t kEsp1StatusSolarLimitBackRightHighFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusSolarLimitFrontRightHighFlag = 0x04U;
 constexpr std::uint8_t kEsp1StatusSideLineConfiguredFlag = 0x08U;
 constexpr std::uint8_t kEsp1StatusSideLineHighFlag = 0x10U;
+constexpr std::uint8_t kEsp1StatusUltrasonic1ConfiguredFlag = 0x20U;
+constexpr std::uint8_t kEsp1StatusUltrasonic1EchoValidFlag = 0x40U;
 
 struct Esp1StatusReport {
   Milliseconds uptime_ms{0};
@@ -39,6 +41,10 @@ struct Esp1StatusReport {
   bool solar_limit_front_right_high{false};
   bool side_line_sensor_configured{false};
   bool side_line_sensor_high{false};
+  bool ultrasonic_1_configured{false};
+  bool ultrasonic_1_echo_valid{false};
+  std::uint16_t ultrasonic_1_distance_mm{0};
+  std::uint32_t ultrasonic_1_echo_duration_us{0};
   std::uint16_t ir_adc_average{0};
   std::uint16_t ir_adc_min{0};
   std::uint16_t ir_adc_max{0};

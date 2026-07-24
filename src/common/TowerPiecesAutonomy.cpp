@@ -26,6 +26,30 @@ const char* towerPiecesStateName(const TowerPiecesState state) {
       return "SHIMMY_LEFT";
     case TowerPiecesState::ShimmyRight:
       return "SHIMMY_RIGHT";
+    case TowerPiecesState::FinalReverse:
+      return "FINAL_REVERSE";
+    case TowerPiecesState::PostFinalReverseDelay:
+      return "POST_FINAL_REVERSE_DELAY";
+    case TowerPiecesState::WinchOpen:
+      return "WINCH_OPEN";
+    case TowerPiecesState::PostWinchOpenDelay:
+      return "POST_WINCH_OPEN_DELAY";
+    case TowerPiecesState::ClawsOpen:
+      return "CLAWS_OPEN";
+    case TowerPiecesState::PostClawsOpenDelay:
+      return "POST_CLAWS_OPEN_DELAY";
+    case TowerPiecesState::MoveStepperBottom:
+      return "MOVE_STEPPER_BOTTOM";
+    case TowerPiecesState::PostStepperBottomDelay:
+      return "POST_STEPPER_BOTTOM_DELAY";
+    case TowerPiecesState::ClawsClosed:
+      return "CLAWS_CLOSED";
+    case TowerPiecesState::PostClawsClosedDelay:
+      return "POST_CLAWS_CLOSED_DELAY";
+    case TowerPiecesState::MoveStepperTop:
+      return "MOVE_STEPPER_TOP";
+    case TowerPiecesState::WinchClosed:
+      return "WINCH_CLOSED";
     case TowerPiecesState::Complete:
       return "COMPLETE";
     case TowerPiecesState::Fault:
@@ -51,12 +75,29 @@ const char* towerPiecesFaultReasonName(
       return "REAR_COMMAND_FAILED";
     case TowerPiecesFaultReason::ShimmyTimeout:
       return "SHIMMY_TIMEOUT";
+    case TowerPiecesFaultReason::ServoCommandFailed:
+      return "SERVO_COMMAND_FAILED";
+    case TowerPiecesFaultReason::StepperCommandFailed:
+      return "STEPPER_COMMAND_FAILED";
+    case TowerPiecesFaultReason::StepperLimitSearchFailed:
+      return "STEPPER_LIMIT_SEARCH_FAILED";
+    case TowerPiecesFaultReason::ConflictingLimitSwitches:
+      return "CONFLICTING_LIMIT_SWITCHES";
   }
   return "NONE";
 }
 
 bool towerPiecesConfigValid(const TowerPiecesConfig& config,
-                            const float maximum_allowed_duty) {
+                            const float maximum_allowed_duty,
+                            const std::uint32_t
+                                maximum_stepper_speed_steps_per_second) {
+  const bool final_reverse_valid =
+      std::isfinite(config.final_reverse_duty) &&
+      config.final_reverse_duty >= 0.0F &&
+      config.final_reverse_duty <= maximum_allowed_duty &&
+      (config.final_reverse_duration_ms == 0U ||
+       config.final_reverse_duty > 0.0F);
+
   return std::isfinite(config.reverse_line_duty) &&
          std::isfinite(config.strafe_right_duty) &&
          std::isfinite(config.clockwise_rotation_duty) &&
@@ -82,7 +123,19 @@ bool towerPiecesConfigValid(const TowerPiecesConfig& config,
          config.reverse_duration_ms > 0U &&
          config.shimmy_right_duration_ms > 0U &&
          config.shimmy_left_duration_ms > 0U &&
-         config.shimmy_timeout_ms > 0U;
+         config.shimmy_timeout_ms > 0U &&
+         final_reverse_valid &&
+         config.post_final_reverse_delay_ms > 0U &&
+         config.post_winch_open_delay_ms > 0U &&
+         config.post_claws_open_delay_ms > 0U &&
+         config.stepper_down_speed_steps_per_second > 0U &&
+         config.stepper_down_speed_steps_per_second <=
+             maximum_stepper_speed_steps_per_second &&
+         config.post_stepper_bottom_delay_ms > 0U &&
+         config.post_claws_closed_delay_ms > 0U &&
+         config.stepper_up_speed_steps_per_second > 0U &&
+         config.stepper_up_speed_steps_per_second <=
+             maximum_stepper_speed_steps_per_second;
 }
 
 void resetTowerPiecesAutonomy(TowerPiecesAutonomy& autonomy,
@@ -104,16 +157,24 @@ void startTowerPiecesAutonomy(TowerPiecesAutonomy& autonomy,
 }
 
 TowerPiecesUpdate updateTowerPiecesAutonomy(
-    TowerPiecesAutonomy& autonomy, const bool side_line_high,
-    const bool back_left_line_high, const bool back_right_line_high,
+    TowerPiecesAutonomy& autonomy, const TowerPiecesInputs& inputs,
     const TowerPiecesConfig& config, const Milliseconds now_ms) {
   TowerPiecesUpdate update{};
+
+  const bool is_active = autonomy.state != TowerPiecesState::WaitForStart &&
+                         autonomy.state != TowerPiecesState::Complete &&
+                         autonomy.state != TowerPiecesState::Fault;
+  if (is_active && inputs.bottom_limit_active && inputs.top_limit_active) {
+    failTowerPiecesAutonomy(autonomy,
+                            TowerPiecesFaultReason::ConflictingLimitSwitches,
+                            now_ms);
+  }
 
   switch (autonomy.state) {
     case TowerPiecesState::ReverseLineFollow:
       update.side_line_rising_edge =
-          !autonomy.previous_side_line_high && side_line_high;
-      autonomy.previous_side_line_high = side_line_high;
+          !autonomy.previous_side_line_high && inputs.side_line_high;
+      autonomy.previous_side_line_high = inputs.side_line_high;
       if (update.side_line_rising_edge &&
           autonomy.side_line_count < kTowerPiecesTargetSideLineCount) {
         ++autonomy.side_line_count;
@@ -197,6 +258,89 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
       }
       break;
 
+    case TowerPiecesState::FinalReverse:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.final_reverse_duration_ms) {
+        autonomy.state = TowerPiecesState::PostFinalReverseDelay;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::PostFinalReverseDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.post_final_reverse_delay_ms) {
+        autonomy.state = TowerPiecesState::WinchOpen;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::WinchOpen:
+      autonomy.state = TowerPiecesState::PostWinchOpenDelay;
+      autonomy.state_entered_at_ms = now_ms;
+      break;
+
+    case TowerPiecesState::PostWinchOpenDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.post_winch_open_delay_ms) {
+        autonomy.state = TowerPiecesState::ClawsOpen;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::ClawsOpen:
+      autonomy.state = TowerPiecesState::PostClawsOpenDelay;
+      autonomy.state_entered_at_ms = now_ms;
+      break;
+
+    case TowerPiecesState::PostClawsOpenDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.post_claws_open_delay_ms) {
+        autonomy.state = TowerPiecesState::MoveStepperBottom;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::MoveStepperBottom:
+      if (inputs.bottom_limit_active) {
+        autonomy.state = TowerPiecesState::PostStepperBottomDelay;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::PostStepperBottomDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.post_stepper_bottom_delay_ms) {
+        autonomy.state = TowerPiecesState::ClawsClosed;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::ClawsClosed:
+      autonomy.state = TowerPiecesState::PostClawsClosedDelay;
+      autonomy.state_entered_at_ms = now_ms;
+      break;
+
+    case TowerPiecesState::PostClawsClosedDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.post_claws_closed_delay_ms) {
+        autonomy.state = TowerPiecesState::MoveStepperTop;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::MoveStepperTop:
+      if (inputs.top_limit_active) {
+        autonomy.state = TowerPiecesState::WinchClosed;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::WinchClosed:
+      autonomy.state = TowerPiecesState::Complete;
+      autonomy.fault_reason = TowerPiecesFaultReason::None;
+      autonomy.state_entered_at_ms = now_ms;
+      break;
+
     case TowerPiecesState::WaitForStart:
     case TowerPiecesState::Complete:
     case TowerPiecesState::Fault:
@@ -206,9 +350,11 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
   if (autonomy.state == TowerPiecesState::ShimmyLeft ||
       autonomy.state == TowerPiecesState::ShimmyRight) {
     update.back_line_detected =
-        back_left_line_high || back_right_line_high;
+        inputs.back_left_line_high || inputs.back_right_line_high;
     if (update.back_line_detected) {
-      autonomy.state = TowerPiecesState::Complete;
+      autonomy.state = config.final_reverse_duration_ms == 0U
+                           ? TowerPiecesState::PostFinalReverseDelay
+                           : TowerPiecesState::FinalReverse;
       autonomy.fault_reason = TowerPiecesFaultReason::None;
       autonomy.state_entered_at_ms = now_ms;
     } else if (config.shimmy_timeout_ms == 0U ||
@@ -235,6 +381,12 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
       autonomy.state == TowerPiecesState::ShimmyLeft;
   update.should_shimmy_right =
       autonomy.state == TowerPiecesState::ShimmyRight;
+  update.should_drive_final_reverse =
+      autonomy.state == TowerPiecesState::FinalReverse;
+  update.should_move_stepper_bottom =
+      autonomy.state == TowerPiecesState::MoveStepperBottom;
+  update.should_move_stepper_top =
+      autonomy.state == TowerPiecesState::MoveStepperTop;
   return update;
 }
 

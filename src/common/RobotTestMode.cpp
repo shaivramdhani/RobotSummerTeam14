@@ -66,6 +66,10 @@ const char* robotTestModeName(const RobotTestMode mode) {
       return "REAR_LINE_FOLLOW_TEST";
     case RobotTestMode::AutonomousTowerPieces:
       return "AUTONOMOUS_TOWER_PIECES";
+    case RobotTestMode::PegFinder:
+      return "PEG_FINDER";
+    case RobotTestMode::TimeTrial:
+      return "TIME_TRIAL";
   }
 
   return "DISABLED";
@@ -137,6 +141,16 @@ bool parseRobotTestMode(const char* text, RobotTestMode& mode) {
     mode = RobotTestMode::AutonomousTowerPieces;
     return true;
   }
+  if (sameModeToken(text, "pegfinder") ||
+      sameModeToken(text, "peg-finder")) {
+    mode = RobotTestMode::PegFinder;
+    return true;
+  }
+  if (sameModeToken(text, "time-trial") ||
+      sameModeToken(text, "timetrial")) {
+    mode = RobotTestMode::TimeTrial;
+    return true;
+  }
 
   return false;
 }
@@ -148,6 +162,8 @@ bool robotTestModeAllowsMotion(const RobotTestMode mode) {
          mode == RobotTestMode::LineFollowTest ||
          mode == RobotTestMode::RearLineFollowTest ||
          mode == RobotTestMode::AutonomousTowerPieces ||
+         mode == RobotTestMode::PegFinder ||
+         mode == RobotTestMode::TimeTrial ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 
@@ -156,6 +172,8 @@ bool robotTestModeRequiresRearLink(const RobotTestMode mode) {
          mode == RobotTestMode::LineFollowTest ||
          mode == RobotTestMode::RearLineFollowTest ||
          mode == RobotTestMode::AutonomousTowerPieces ||
+         mode == RobotTestMode::PegFinder ||
+         mode == RobotTestMode::TimeTrial ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 

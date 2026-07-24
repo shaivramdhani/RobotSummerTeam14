@@ -106,7 +106,7 @@ ESP1 publishes a compact `HealthReport` frame periodically on the same UART
 link. ESP2 parses this frame and exposes the latest remote ESP1 status through
 the dashboard telemetry.
 
-Payload size is 39 bytes:
+Payload size is 45 bytes:
 
 | Byte(s) | Field |
 | --- | --- |
@@ -129,7 +129,9 @@ Payload size is 39 bytes:
 | 31-34 | IR ADC sample rate in Hz |
 | 35 | IR consecutive detection count |
 | 36-37 | funnel applied command milli-units |
-| 38 | flags: bit 0 solar limit switches configured, bit 1 back-right solar limit raw high, bit 2 front-right solar limit raw high, bit 3 side line sensor configured, bit 4 side line sensor raw high |
+| 38 | flags: bit 0 solar limit switches configured, bit 1 back-right solar limit raw high, bit 2 front-right solar limit raw high, bit 3 side line sensor configured, bit 4 side line sensor raw high, bit 5 ultrasonic 1 configured, bit 6 ultrasonic 1 echo valid |
+| 39-40 | ultrasonic 1 distance in mm |
+| 41-44 | ultrasonic 1 echo pulse duration in us |
 
 ## TODO
 

@@ -25,6 +25,12 @@ frequency-selective telemetry when ESP1 status packets are fresh. ESP1 GPIO2
 selects the target beacon frequency: `HIGH` selects 1 kHz and `LOW` selects
 10 kHz.
 
+The `Ultrasonic 1` panel shows the current HC-SR04 reading from ESP1 trigger
+GPIO12 and echo GPIO11 in millimetres and centimetres. It also distinguishes a
+valid echo from an out-of-range/no-echo sample and stale ESP1 data. ESP1 samples
+the sensor at the 100 ms sensor-acquisition period; the ECHO input is divided to
+3.3 V in hardware.
+
 ## Modes
 
 | Mode | Motion allowed | Purpose |
@@ -40,12 +46,36 @@ selects the target beacon frequency: `HIGH` selects 1 kHz and `LOW` selects
 | `REAR_LINE_FOLLOW_TEST` | Yes, gated | Reverse travel using rear sensors and independent rear PID settings. |
 | `MECHANISM_TEST` | Mechanisms only, gated | Open/close claw and winch servos and test the ESP1 funnel motor with drive outputs stopped. |
 | `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, solar-panel contact, timed forward motion, and rear-line reacquisition. |
-| `AUTONOMOUS_TOWER_PIECES` | Yes, gated | Reverse rear-line following until the second distinct side-line crossing or timeout. |
+| `AUTONOMOUS_TOWER_PIECES` | Yes, gated | Reverse line following, timed chassis motion, shimmy search, then the winch/claw/stepper collection tail. |
+| `PEG_FINDER` | Yes, gated | Timed chassis sequence, limit-terminated funnel, then sequential claw opening. |
+| `TIME_TRIAL` | Yes, gated | Autonomous Solar, a configurable transition, Tower Pieces, a configurable delay, then PegFinder. |
 | `AUTONOMOUS_DRY_RUN` | No | Stub view for future mission dry runs. |
 
 Mode changes stop actuators before switching. Sensor-only modes keep motors and
-mechanisms disabled. `MECHANISM_TEST` keeps drive outputs disabled and `/api/stop`
-disables the claw and winch servo outputs and sends a disabled funnel command to ESP1.
+mechanisms disabled. `MECHANISM_TEST` keeps drive outputs disabled. Normal
+Tower Pieces and PegFinder stopped stages and mode-specific faults keep any
+commanded claw and winch PWM signals enabled so the servos hold position.
+`/api/stop` is an emergency release: it disables the claw and winch servo PWM
+outputs, which can let the mechanisms move or open if they require powered
+holding, and sends a disabled funnel command to ESP1.
+
+## Time Trial
+
+The `Time Trial` dashboard panel runs `AUTONOMOUS_SOLAR_PANEL`,
+`AUTONOMOUS_TOWER_PIECES`, and `PEG_FINDER` behavior in that order while the
+reported mode remains `TIME_TRIAL`. It directly references the live solar,
+tower, PegFinder, line-following, and servo configurations; it does not copy
+those values. Time Trial Start applies the visible settings from all three
+individual panels and the shared Servos panel before requesting the run.
+
+After solar reacquires the rear line, Time Trial stops the chassis, waits for
+`post_solar_delay_ms`, and optionally strafes right at `strafe_right_duty` for
+`strafe_right_duration_ms`. A duration of `0` skips the transition strafe.
+After Tower Pieces completes, it stops chassis and funnel motion without
+disabling the servo PWM signals, waits for `post_tower_delay_ms`, explicitly
+holds all claws and the winch closed, and starts PegFinder. All four transition
+values persist through the main configuration Save action. Telemetry exposes
+the combined state and values under `time_trial`.
 
 ## Line Sensor Bench Test
 
@@ -76,27 +106,76 @@ second-line timeout, the live LSS level, a `0 / 2` crossing count, the delay
 after that second crossing, right-strafe duty and duration, the following
 pause, clockwise rotation duty and duration, a post-rotation pause, timed
 backward duty and duration, shimmy duty, separate right and left durations,
-and a shimmy timeout.
-Start enters
+the shimmy timeout, optional final-reverse duty and duration, five mechanism
+delays, and independent down/up stepper speeds. Start enters
 `AUTONOMOUS_TOWER_PIECES` and uses the independent rear PID gains with the
-panel's reverse-duty magnitude. A crossing is one LSS LOW-to-HIGH transition;
-holding LSS HIGH cannot increment the count repeatedly. If LSS is already HIGH
-at start, firmware waits for LOW before accepting a later HIGH as a crossing.
+panel's initial reverse-line-duty magnitude. A crossing is one LSS LOW-to-HIGH
+transition; holding LSS HIGH cannot increment the count repeatedly. If LSS is
+already HIGH at start, firmware waits for LOW before accepting a later HIGH as
+a crossing.
 
 The second crossing stops all four wheels in `POST_LINE_DELAY`. When that delay
 expires, the robot enters `STRAFE_RIGHT` for the configured duration, stops in
 `POST_STRAFE_PAUSE`, rotates clockwise for the configured duration, stops in
 `POST_ROTATION_PAUSE`, and then drives backward for the configured duration.
 It next starts by strafing right and alternates right and left after each
-direction's configured duration. The run completes as soon as either LSBL or
-LSBR is HIGH
-during the shimmy. If the first timeout expires before the second side line,
-telemetry reports `SIDE_LINE_TIMEOUT`; if the shimmy timeout expires before a
-back line is detected, it reports `SHIMMY_TIMEOUT`. Stale ESP1
-status, stale rear/side sensor packets, line loss without history, incomplete
-hardware, and failed rear commands also stop the mode. All new timings and
-open-loop duties default to `0` as explicit TODOs, and Start is rejected until
-nonzero verified values are applied.
+direction's configured duration. The shimmy ends as soon as either LSBL or
+LSBR is HIGH. There is no final line-follow stage. Instead, the mode runs this
+tail:
+
+1. Drive backward at `final_reverse_duty` for
+   `final_reverse_duration_ms`. A duration of `0 ms` skips this optional stage.
+2. Wait for `post_final_reverse_delay_ms`, then command the winch open.
+3. Wait for `post_winch_open_delay_ms`, then command all three claws open.
+4. Wait for `post_claws_open_delay_ms`, then move the stepper down at
+   `stepper_down_speed_steps_per_second` until the bottom limit activates.
+5. Wait for `post_stepper_bottom_delay_ms`, then command all three claws closed.
+6. Wait for `post_claws_closed_delay_ms`, then move the stepper up at
+   `stepper_up_speed_steps_per_second` until the top limit activates.
+7. Command the winch closed and complete.
+
+The final-reverse duty and duration default to `0`. All Tower Pieces pause and
+delay stages default to `1000 ms`, and both stepper limit-search speeds default
+to `2000` driver microsteps per second. Other motion duties, durations, and
+timeouts remain `0` (unconfigured), so Start is rejected until the required
+values are positive and within their safe caps.
+
+The default open/closed servo angles are claw 1 `23/110`, claw 2 `40/100`, claw
+3 `80/180`, and winch `0/180` degrees. Tower Pieces reads the same live settings
+as the separate `Servos` panel. Updating that panel rewrites any active servo
+hold and changes later Tower Pieces commands; `/api/claws/save` persists the
+shared values to NVS.
+
+If the first timeout expires before the second side line, telemetry reports
+`SIDE_LINE_TIMEOUT`; if the shimmy timeout expires before a back line is
+detected, it reports `SHIMMY_TIMEOUT`. Stale ESP1 status, stale rear/side sensor
+packets, line loss without history, incomplete hardware, failed rear commands,
+servo command rejection, stepper search failure, or conflicting stepper limits
+also stop the mode. Its stopped and mechanism stages stop chassis and stepper
+motion without disabling the servo holding signals. `/api/stop` stops the mode
+and disables the servo PWM outputs as an emergency release.
+
+## PegFinder
+
+The `PegFinder` dashboard panel runs clockwise rotation, a stopped pause,
+backward drive, another stopped pause, forward drive, and funnel-forward
+operation until its ESP2 GPIO47 limit is HIGH. It then waits and opens claws
+1, 2, and 3 sequentially, using one adjustable interval between claw commands.
+There is no line-follow stage.
+
+Start enters `PEG_FINDER` only after the front motors, rear command link, and
+ESP1-owned funnel motor are ready, GPIO47 is configured, all three claw open
+angles are valid, and ESP1 status is fresh. GPIO47 uses the same active-high
+convention as the other normally-open limit switches: LOW is released and HIGH
+is pressed. The funnel stops as soon as the switch is pressed. If it remains
+LOW for the adjustable funnel timeout, PegFinder faults and stops instead of
+continuing. Its duties and all timings default to `0` (unconfigured), so Start
+is rejected until the required values are positive and within their safe caps.
+ESP2 refreshes rear-wheel and funnel commands during active phases; ESP1
+independently stops those motors when commands become stale. PegFinder pauses
+and mode-specific faults stop chassis and funnel motion without disabling an
+existing servo hold. Claw commands use the live open angles from the shared
+Servos panel.
 
 ## IR Beacon Bench Test
 
@@ -168,7 +247,14 @@ timeout.
 - Claw and winch servo commands are rejected unless the corresponding ESP2 PWM
   config is complete, the requested open or closed angle is set, and that
   absolute angle is within `0..180` degrees. Open and closed targets are
-  configured independently.
+  configured independently. Defaults are claw 1 `23/110`, claw 2 `40/100`,
+  claw 3 `80/180`, and winch `0/180` degrees (open/closed). The `Servos` panel
+  and Tower Pieces share these live settings; `/api/claws/save` persists them
+  to NVS.
+- Tower Pieces and PegFinder ordinary stopped stages leave commanded servo PWM
+  enabled so the claws and winch continue holding. `/api/stop` disables that
+  PWM, so a servo mechanism that depends on powered holding can mechanically
+  release.
 - Funnel commands are press-and-hold with the same `700 ms` deadman timeout as
   single-motor tests. ESP1 initializes the funnel output disabled, rejects stale
   or corrupt packets, and reports whether the funnel PWM hardware is configured.
@@ -199,7 +285,11 @@ timeout.
 | `/api/autonomous/solar/start` | GET/POST | Start the gated solar-panel autonomous test. |
 | `/api/autonomous/solar/config?...&post-contact-forward-ms=<>&post-contact-forward-duty=<>&line-reacquire-duty=<>&post-contact-forward-delay-ms=<>&post-forward-strafe-delay-ms=<>` | GET/POST | Update solar autonomy settings, including contact correction and post-contact motion/line-reacquisition tuning. |
 | `/api/autonomous/tower-pieces/start` | GET/POST | Enter the tower-pieces mode and request gated reverse line following. |
-| `/api/autonomous/tower-pieces/config?duty=<>&timeout-ms=<>&post-line-delay-ms=<>&strafe-duty=<>&strafe-duration-ms=<>&post-strafe-pause-ms=<>&rotation-duty=<>&rotation-duration-ms=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&shimmy-duty=<>&shimmy-right-ms=<>&shimmy-left-ms=<>&shimmy-timeout-ms=<>` | GET/POST | Update tower-pieces reverse line following, delayed right strafe, timed rotation, pauses, timed backward drive, and independently timed right/left shimmy settings. |
+| `/api/autonomous/tower-pieces/config?duty=<>&timeout-ms=<>&post-line-delay-ms=<>&strafe-duty=<>&strafe-duration-ms=<>&post-strafe-pause-ms=<>&rotation-duty=<>&rotation-duration-ms=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&shimmy-duty=<>&shimmy-right-ms=<>&shimmy-left-ms=<>&shimmy-timeout-ms=<>&final-reverse-duty=<>&final-reverse-duration-ms=<>&post-final-reverse-delay-ms=<>&post-winch-open-delay-ms=<>&post-claws-open-delay-ms=<>&stepper-down-speed-steps-per-second=<>&post-stepper-bottom-delay-ms=<>&post-claws-closed-delay-ms=<>&stepper-up-speed-steps-per-second=<>` | GET/POST | Update Tower Pieces chassis, shimmy, optional final-reverse, mechanism-delay, and stepper-speed settings. A final-reverse duration of `0` skips that stage. |
+| `/api/autonomous/peg-finder/start` | GET/POST | Enter `PEG_FINDER` and request the gated timed sequence. |
+| `/api/autonomous/peg-finder/config?clockwise-duty=<>&clockwise-duration-ms=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&post-reverse-pause-ms=<>&forward-duty=<>&forward-duration-ms=<>&funnel-duty=<>&funnel-timeout-ms=<>&post-funnel-limit-delay-ms=<>&claw-open-interval-ms=<>` | GET/POST | Update PegFinder chassis, limit-terminated funnel, post-limit delay, and sequential-claw settings. The legacy `funnel-duration-ms` argument is accepted as a timeout alias. |
+| `/api/autonomous/time-trial/start` | GET/POST | Enter `TIME_TRIAL`, validate all three included modes, and start Autonomous Solar. |
+| `/api/autonomous/time-trial/config?post-solar-delay-ms=<>&strafe-right-duty=<>&strafe-right-duration-ms=<>&post-tower-delay-ms=<>` | GET/POST | Update only the transitions between the three included modes. A right-strafe duration of `0` skips that motion. |
 | `/api/claw?id=<1|2|3>&state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command one claw servo. |
 | `/api/claws?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command all three claw servos. |
 | `/api/winch?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command the ESP2 GPIO6 winch servo. |
@@ -207,7 +297,7 @@ timeout.
 | `/api/claws/save` | GET/POST | Save claw and winch open/closed angles to NVS. |
 | `/api/funnel?speed=<>` | GET/POST | Switch to `MECHANISM_TEST` and send a timed ESP1 funnel motor command. Use `speed=0` to release. |
 | `/api/config` | GET | Current tunable settings. |
-| `/api/config/save` | GET/POST | Save line-following, solar-autonomy, and tower-pieces tunables to NVS. |
+| `/api/config/save` | GET/POST | Save line-following, solar-autonomy, tower-pieces, PegFinder, and Time Trial transition tunables to NVS. |
 | `/api/events` | GET | Fixed-size recent event log. |
 
 All command endpoints return JSON with `ok` and either `message` or `error`.
@@ -242,10 +332,26 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
   `post_strafe_pause_ms`, `clockwise_rotation_duty`,
   `clockwise_rotation_duration_ms`, `post_rotation_pause_ms`, `reverse_duty`,
   `reverse_duration_ms`, `shimmy_duty`, `shimmy_right_duration_ms`,
-  `shimmy_left_duration_ms`,
-  `shimmy_timeout_ms`, `side_line_count`, `target_side_line_count`,
-  side-sensor configuration/level, active-motion flags, and
-  `back_line_detected`.
+  `shimmy_left_duration_ms`, `shimmy_timeout_ms`,
+  `final_reverse_duty`, `final_reverse_duration_ms`,
+  `post_final_reverse_delay_ms`, `post_winch_open_delay_ms`,
+  `post_claws_open_delay_ms`, `stepper_down_speed_steps_per_second`,
+  `post_stepper_bottom_delay_ms`, `post_claws_closed_delay_ms`,
+  `stepper_up_speed_steps_per_second`,
+  `side_line_count`, `target_side_line_count`,
+  side-sensor configuration/level, `back_line_detected`, and active chassis,
+  final-reverse, and stepper flags.
+- PegFinder: `peg_finder.state`, `fault_reason`, `time_in_state_ms`,
+  `clockwise_duty`, `clockwise_duration_ms`, `post_rotation_pause_ms`,
+  `reverse_duty`, `reverse_duration_ms`, `post_reverse_pause_ms`,
+  `forward_duty`, `forward_duration_ms`, `funnel_forward_duty`,
+  `funnel_forward_timeout_ms`, `post_funnel_limit_delay_ms`,
+  `claw_open_interval_ms`, `funnel_limit_configured`, `funnel_limit_high`,
+  and active chassis, funnel, and claw-command flags.
+- Time Trial: `time_trial.state`, `time_in_state_ms`,
+  `post_solar_delay_ms`, `strafe_right_duty`,
+  `strafe_right_duration_ms`, `post_tower_delay_ms`, and
+  `strafing_right`.
 - Solar autonomy: state, time in state, fault reason, IR thresholds and
   confirmation, initial contact timeout, strafe duty/delay,
   `retry_strafe_left_duration_ms`, `retry_forward_duration_ms`, and
@@ -259,7 +365,10 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
   configured flag, packet error count.
 - ESP1 remote status from compact `HealthReport` frames: availability, uptime,
   mode, fault status, rear applied commands, rear inversion flags, funnel applied
-  command/configuration, and side-line sensor configuration/raw level.
+  command/configuration, side-line sensor configuration/raw level, and
+  ultrasonic 1 configuration, validity, distance, and echo duration.
+- Ultrasonic 1: `ultrasonic_1.configured`, `data_fresh`, `echo_valid`,
+  `distance_mm`, `echo_duration_us`, and `sample_age_ms`.
 - Servos: `claws.claw_1`/`claw_2`/`claw_3` and `claws.winch` report hardware
   configured, independently configured absolute open/closed angles, output
   enabled, and commanded angle/open state.
@@ -270,7 +379,7 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
   `ir_selected_frequency_amplitude`, `ir_active_threshold`,
   `ir_beacon_detected`, `ir_consecutive_detection_count`,
   `ir_adc_sample_rate_hz`, and `motor_command_magnitude_milli`.
-- Future/stub fields for IR, ultrasonic, stepper, remaining servos, limit
+- Future/stub fields for the remaining IR, ultrasonic 2, stepper, servos, limit
   switches, and battery-style expansion.
 
 ## Serial Commands

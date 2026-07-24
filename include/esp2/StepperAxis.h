@@ -71,6 +71,7 @@ class StepperAxis {
   std::uint32_t limitSearchSpeedStepsPerSecond() const {
     return limit_search_speed_steps_per_s_;
   }
+  std::uint32_t maximumSpeedStepsPerSecond() const;
   std::uint32_t accelerationStepsPerSecond2() const { return acceleration_steps_per_s2_; }
   std::int64_t maximumPositionSteps() const { return maximum_position_steps_; }
   StepperMotionState motionState() const { return state_; }

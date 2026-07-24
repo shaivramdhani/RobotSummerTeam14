@@ -14,8 +14,8 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | `LeftIRFiltered` | TODO | TODO |
 | `RightIRFiltered` | TODO | TODO |
 | `FREQ` | TODO | TODO |
-| `USTRIG1` | TODO | TODO |
-| `USECHO1` | TODO | TODO |
+| `USTRIG1` | 12 | HC-SR04 trigger output |
+| `USECHO1` | 11 | HC-SR04 echo input, divided to 3.3 V in hardware |
 | `USTRIG2` | TODO | TODO |
 | `USECHO2` | TODO | TODO |
 | `LSS` | 4 | Digital comparator, HIGH = black tape |
@@ -64,7 +64,7 @@ ESP1 UART baud rate: TODO.
 | `LimitSwitchStepperBottom` | TODO | TODO |
 | `LimitSwitchStepperMiddle` | TODO | TODO |
 | `LimitSwitchStepperTop` | TODO | TODO |
-| `LimitSwitchFunnelLeft` | TODO | TODO |
+| `LimitSwitchFunnelLeft` | 47 | PegFinder funnel stop, LOW released / HIGH pressed |
 | `LimitSwitchFunnelRight` | TODO | TODO |
 | UART TX to ESP1 | TODO | TODO |
 | UART RX from ESP1 | TODO | TODO |
