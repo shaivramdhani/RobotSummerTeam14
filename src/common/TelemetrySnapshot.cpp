@@ -173,6 +173,89 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
   writer.append("\"reset_reason\":");
   writer.appendEscaped(snapshot.reset_reason);
 
+  writer.append(
+      ",\"imu\":{\"configured\":%s,\"initialized\":%s,"
+      "\"calibrated\":%s,\"healthy\":%s,\"data_fresh\":%s,"
+      "\"acquisition_running\":%s,"
+      "\"device_acknowledged\":%s,"
+      "\"register_reads_use_repeated_start\":%s,"
+      "\"i2c_address\":%u,"
+      "\"who_am_i\":%u,\"sda_gpio\":%d,\"scl_gpio\":%d,"
+      "\"last_wire_status\":%d,\"initialization_error\":\"%s\","
+      "\"raw_gyro_z\":%d,"
+      "\"gyro_z_bias_dps\":%.5f,\"yaw_rate_dps\":%.5f,"
+      "\"heading_deg\":%.5f,\"sample_age_ms\":%u,"
+      "\"snapshot_age_ms\":%u,\"acquisition_duration_us\":%u,"
+      "\"maximum_completed_acquisition_duration_us\":%u,"
+      "\"total_acquisition_attempts\":%u,"
+      "\"last_successful_read_us\":%u,"
+      "\"last_sample_interval_us\":%u,\"successful_read_count\":%u,"
+      "\"failed_read_count\":%u,\"consecutive_failed_reads\":%u}",
+      jsonBool(snapshot.imu.configured),
+      jsonBool(snapshot.imu.initialized),
+      jsonBool(snapshot.imu.calibrated),
+      jsonBool(snapshot.imu.healthy),
+      jsonBool(snapshot.imu.data_fresh),
+      jsonBool(snapshot.imu.acquisition_running),
+      jsonBool(snapshot.imu.device_acknowledged),
+      jsonBool(snapshot.imu.register_reads_use_repeated_start),
+      static_cast<unsigned>(snapshot.imu.i2c_address),
+      static_cast<unsigned>(snapshot.imu.who_am_i),
+      snapshot.imu.sda_gpio, snapshot.imu.scl_gpio,
+      snapshot.imu.last_wire_status,
+      snapshot.imu.initialization_error,
+      static_cast<int>(snapshot.imu.raw_gyro_z),
+      snapshot.imu.gyro_z_bias_dps, snapshot.imu.yaw_rate_dps,
+      snapshot.imu.heading_deg,
+      static_cast<unsigned>(snapshot.imu.sample_age_ms),
+      static_cast<unsigned>(snapshot.imu.snapshot_age_ms),
+      static_cast<unsigned>(snapshot.imu.acquisition_duration_us),
+      static_cast<unsigned>(
+          snapshot.imu.maximum_completed_acquisition_duration_us),
+      static_cast<unsigned>(snapshot.imu.total_acquisition_attempts),
+      static_cast<unsigned>(snapshot.imu.last_successful_read_us),
+      static_cast<unsigned>(snapshot.imu.last_sample_interval_us),
+      static_cast<unsigned>(snapshot.imu.successful_read_count),
+      static_cast<unsigned>(snapshot.imu.failed_read_count),
+      static_cast<unsigned>(snapshot.imu.consecutive_failed_reads));
+
+  writer.append(
+      ",\"imu_turn\":{\"configuration_valid\":%s,\"active\":%s,"
+      "\"state\":\"%s\",\"fault_reason\":\"%s\","
+      "\"maximum_rotation_duty\":%.5f,\"kp\":%.5f,\"kd\":%.5f,"
+      "\"angle_tolerance_deg\":%.5f,"
+      "\"maximum_finishing_yaw_rate_dps\":%.5f,"
+      "\"settling_time_ms\":%u,\"timeout_ms\":%u,"
+      "\"yaw_command_polarity\":%d,"
+      "\"start_heading_deg\":%.5f,\"current_heading_deg\":%.5f,"
+      "\"target_heading_deg\":%.5f,\"relative_angle_deg\":%.5f,"
+      "\"angle_error_deg\":%.5f,\"yaw_rate_dps\":%.5f,"
+      "\"proportional_term\":%.5f,\"damping_term\":%.5f,"
+      "\"rotation_command\":%.5f,\"elapsed_ms\":%u,"
+      "\"settling_elapsed_ms\":%u}",
+      jsonBool(snapshot.imu_turn.configuration_valid),
+      jsonBool(snapshot.imu_turn.active),
+      imuTurnStateName(snapshot.imu_turn.state),
+      imuTurnFaultReasonName(snapshot.imu_turn.fault_reason),
+      snapshot.imu_turn.maximum_rotation_duty,
+      snapshot.imu_turn.kp, snapshot.imu_turn.kd,
+      snapshot.imu_turn.angle_tolerance_deg,
+      snapshot.imu_turn.maximum_finishing_yaw_rate_dps,
+      static_cast<unsigned>(snapshot.imu_turn.settling_time_ms),
+      static_cast<unsigned>(snapshot.imu_turn.timeout_ms),
+      snapshot.imu_turn.yaw_command_polarity,
+      snapshot.imu_turn.start_heading_deg,
+      snapshot.imu_turn.current_heading_deg,
+      snapshot.imu_turn.target_heading_deg,
+      snapshot.imu_turn.relative_angle_deg,
+      snapshot.imu_turn.angle_error_deg,
+      snapshot.imu_turn.yaw_rate_dps,
+      snapshot.imu_turn.proportional_term,
+      snapshot.imu_turn.damping_term,
+      snapshot.imu_turn.rotation_command,
+      static_cast<unsigned>(snapshot.imu_turn.elapsed_ms),
+      static_cast<unsigned>(snapshot.imu_turn.settling_elapsed_ms));
+
   writer.append(",\"line\":{\"lsfl_raw_level\":%d,\"lsfr_raw_level\":%d,"
                 "\"lss_raw_level\":%d,"
                 "\"lsfl_level\":\"%s\",\"lsfr_level\":\"%s\","

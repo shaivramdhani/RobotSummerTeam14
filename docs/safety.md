@@ -11,6 +11,8 @@ disabled and line following refuses to start.
   H-bridge mode, direction sign, and disabled states are confirmed.
 - High-level mission code must not directly access GPIO or PWM.
 - ESP2 line following requires `lf start`; motors do not start at boot.
+- IMU turn tuning defaults to zero/unconfigured; a dashboard turn cannot start
+  until every controller value and mounting polarity is explicitly configured.
 
 ## Communication
 
@@ -27,6 +29,17 @@ disabled and line following refuses to start.
   periodic FreeRTOS work.
 - Do not dynamically allocate memory in control loops.
 - Pass immutable snapshots and messages between tasks.
+- Runtime MPU-6050 I2C transactions execute only in ESP2's sensor-acquisition
+  task. The core-1 motion task consumes a copied snapshot and treats data older
+  than the IMU freshness limit as unavailable.
+- IMU heading resets are queued to the sensor owner. A turn cannot start until
+  the corresponding reset sequence has been acknowledged in a published
+  snapshot.
+- The read-only IMU soak controls only refresh telemetry or enqueue a reset of
+  fixed acquisition counters. They do not change mode, heading, IMU
+  initialization, turn state, or any actuator command.
+- IMU yaw control is selected only by `IMU_TURN_TEST`; it is not injected into
+  shared wheel output or line-following control.
 
 ## Faults
 

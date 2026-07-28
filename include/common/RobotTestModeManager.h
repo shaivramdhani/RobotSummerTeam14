@@ -18,6 +18,7 @@ class RobotTestModeManager {
   bool acceptsDriveCommand() const;
   bool acceptsSingleMotorCommand() const;
   bool acceptsLineFollowerCommand() const;
+  bool acceptsImuTurnCommand() const;
 
  private:
   RobotTestMode current_mode_{RobotTestMode::Disabled};

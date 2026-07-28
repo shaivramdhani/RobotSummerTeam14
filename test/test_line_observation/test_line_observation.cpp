@@ -8,8 +8,10 @@
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
 #include "common/FunnelCommand.h"
+#include "common/ImuTurnController.h"
 #include "common/LineFollower.h"
 #include "common/LineObservation.h"
+#include "common/MotionDiagnostics.h"
 #include "common/PegFinderAutonomy.h"
 #include "common/RearDriveCommand.h"
 #include "common/RearLineSensor.h"
@@ -55,6 +57,19 @@ robot::TowerPiecesConfig towerPiecesConfig() {
 robot::PegFinderConfig pegFinderConfig() {
   return {0.3F, 10U, 11U, 0.25F, 12U,
           13U, 0.22F, 14U, 0.2F, 15U, 16U, 17U};
+}
+
+robot::ImuTurnConfig imuTurnConfig() {
+  robot::ImuTurnConfig config{};
+  config.maximum_rotation_duty = 0.3F;
+  config.kp = 0.01F;
+  config.kd = 0.02F;
+  config.angle_tolerance_deg = 2.0F;
+  config.maximum_finishing_yaw_rate_dps = 3.0F;
+  config.settling_time_ms = 100U;
+  config.timeout_ms = 2000U;
+  config.yaw_command_polarity = 1;
+  return config;
 }
 
 robot::PegFinderUpdate updatePegFinderForTest(
@@ -727,6 +742,202 @@ void test_time_trial_mode_parses_and_allows_distributed_motion() {
   TEST_ASSERT_TRUE(robot::robotTestModeAllowsMotion(mode));
   TEST_ASSERT_TRUE(robot::robotTestModeRequiresRearLink(mode));
   TEST_ASSERT_FALSE(robot::robotTestModeIsSensorOnly(mode));
+}
+
+void test_imu_turn_mode_is_explicit_and_requires_rear_link() {
+  robot::RobotTestMode mode{};
+  TEST_ASSERT_TRUE(robot::parseRobotTestMode("imu-turn", mode));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::RobotTestMode::ImuTurnTest),
+      static_cast<std::uint8_t>(mode));
+  TEST_ASSERT_EQUAL_STRING("IMU_TURN_TEST",
+                           robot::robotTestModeName(mode));
+  TEST_ASSERT_TRUE(robot::robotTestModeAllowsMotion(mode));
+  TEST_ASSERT_TRUE(robot::robotTestModeRequiresRearLink(mode));
+  TEST_ASSERT_FALSE(robot::robotTestModeIsSensorOnly(mode));
+
+  robot::RobotTestModeManager manager{};
+  manager.setMode(mode, 10U);
+  TEST_ASSERT_TRUE(manager.acceptsImuTurnCommand());
+  TEST_ASSERT_FALSE(manager.acceptsLineFollowerCommand());
+  TEST_ASSERT_FALSE(manager.acceptsDriveCommand());
+}
+
+void test_imu_turn_config_starts_locked_until_every_value_is_configured() {
+  robot::ImuTurnConfig config{};
+  TEST_ASSERT_FALSE(robot::imuTurnConfigValid(config, 0.5F));
+
+  config = imuTurnConfig();
+  TEST_ASSERT_TRUE(robot::imuTurnConfigValid(config, 0.5F));
+  config.maximum_rotation_duty = 0.6F;
+  TEST_ASSERT_FALSE(robot::imuTurnConfigValid(config, 0.5F));
+  config = imuTurnConfig();
+  config.yaw_command_polarity = 0;
+  TEST_ASSERT_FALSE(robot::imuTurnConfigValid(config, 0.5F));
+  config = imuTurnConfig();
+  config.timeout_ms = config.settling_time_ms;
+  TEST_ASSERT_FALSE(robot::imuTurnConfigValid(config, 0.5F));
+  config = imuTurnConfig();
+  config.kp = std::numeric_limits<float>::quiet_NaN();
+  TEST_ASSERT_FALSE(robot::imuTurnConfigValid(config, 0.5F));
+}
+
+void test_imu_turn_start_captures_a_continuous_relative_target() {
+  robot::ImuTurnControllerState state{};
+  const robot::ImuTurnConfig config = imuTurnConfig();
+
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 170.0F, 90.0F, config, 0.5F, 25U));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnState::Turning),
+      static_cast<std::uint8_t>(state.state));
+  assertNear(170.0F, state.start_heading_deg, 0.0001F);
+  assertNear(260.0F, state.target_heading_deg, 0.0001F);
+  assertNear(90.0F, state.relative_angle_deg, 0.0001F);
+}
+
+void test_imu_turn_pd_output_clamps_and_rate_damping_opposes_motion() {
+  robot::ImuTurnControllerState state{};
+  const robot::ImuTurnConfig config = imuTurnConfig();
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 0.0F, 90.0F, config, 0.5F, 100U));
+
+  robot::ImuTurnUpdate update =
+      robot::updateImuTurn(state, 0.0F, 10.0F, config, 0.5F, 110U);
+  assertNear(0.9F, update.proportional_term, 0.0001F);
+  assertNear(-0.2F, update.damping_term, 0.0001F);
+  assertNear(0.3F, update.rotation_command, 0.0001F);
+  TEST_ASSERT_TRUE(update.should_rotate);
+
+  robot::ImuTurnControllerState damped_state{};
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      damped_state, 0.0F, 10.0F, config, 0.5F, 100U));
+  update = robot::updateImuTurn(
+      damped_state, 0.0F, 10.0F, config, 0.5F, 110U);
+  assertNear(0.1F, update.proportional_term, 0.0001F);
+  assertNear(-0.2F, update.damping_term, 0.0001F);
+  assertNear(-0.1F, update.rotation_command, 0.0001F);
+}
+
+void test_imu_turn_requires_low_angle_and_rate_for_full_settling_time() {
+  robot::ImuTurnControllerState state{};
+  const robot::ImuTurnConfig config = imuTurnConfig();
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 0.0F, 90.0F, config, 0.5F, 100U));
+
+  robot::ImuTurnUpdate update =
+      robot::updateImuTurn(state, 89.0F, 4.0F, config, 0.5F, 200U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnState::Turning),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.should_rotate);
+
+  update = robot::updateImuTurn(
+      state, 89.0F, 2.0F, config, 0.5F, 210U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnState::Settling),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_FALSE(update.should_rotate);
+  TEST_ASSERT_FALSE(update.completed);
+
+  update = robot::updateImuTurn(
+      state, 89.0F, 2.0F, config, 0.5F, 309U);
+  TEST_ASSERT_FALSE(update.completed);
+  update = robot::updateImuTurn(
+      state, 89.0F, 2.0F, config, 0.5F, 310U);
+  TEST_ASSERT_TRUE(update.completed);
+  TEST_ASSERT_EQUAL_UINT32(210U, update.elapsed_ms);
+  TEST_ASSERT_EQUAL_UINT32(100U, update.settling_elapsed_ms);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnState::Complete),
+      static_cast<std::uint8_t>(update.state));
+}
+
+void test_imu_turn_leaves_settling_if_either_condition_breaks() {
+  robot::ImuTurnControllerState state{};
+  const robot::ImuTurnConfig config = imuTurnConfig();
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 0.0F, 90.0F, config, 0.5F, 100U));
+  robot::updateImuTurn(state, 89.0F, 2.0F, config, 0.5F, 200U);
+
+  const robot::ImuTurnUpdate update =
+      robot::updateImuTurn(state, 85.0F, 2.0F, config, 0.5F, 220U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnState::Turning),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_EQUAL_UINT32(0U, update.settling_elapsed_ms);
+  TEST_ASSERT_TRUE(update.should_rotate);
+}
+
+void test_imu_turn_timeout_faults_and_stop_is_terminal() {
+  robot::ImuTurnControllerState state{};
+  const robot::ImuTurnConfig config = imuTurnConfig();
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 0.0F, -90.0F, config, 0.5F, 100U));
+  robot::ImuTurnUpdate update =
+      robot::updateImuTurn(state, 0.0F, 0.0F, config, 0.5F, 2100U);
+  TEST_ASSERT_TRUE(update.faulted);
+  TEST_ASSERT_EQUAL_UINT32(2000U, update.elapsed_ms);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnFaultReason::Timeout),
+      static_cast<std::uint8_t>(update.fault_reason));
+  TEST_ASSERT_FALSE(update.should_rotate);
+
+  robot::stopImuTurn(state);
+  update =
+      robot::updateImuTurn(state, 0.0F, 0.0F, config, 0.5F, 2200U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::ImuTurnState::Stopped),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_FALSE(update.should_rotate);
+  TEST_ASSERT_FALSE(robot::imuTurnActive(state));
+}
+
+void test_imu_turn_ignores_a_loop_timestamp_just_before_start() {
+  robot::ImuTurnControllerState state{};
+  const robot::ImuTurnConfig config = imuTurnConfig();
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 0.29F, -90.0F, config, 0.5F, 1000U));
+
+  robot::ImuTurnUpdate update =
+      robot::updateImuTurn(state, 0.29F, 0.08F, config, 0.5F, 995U);
+  TEST_ASSERT_FALSE(update.faulted);
+  TEST_ASSERT_EQUAL_UINT32(0U, update.elapsed_ms);
+  TEST_ASSERT_TRUE(update.should_rotate);
+  TEST_ASSERT_TRUE(update.rotation_command < 0.0F);
+
+  update =
+      robot::updateImuTurn(state, 0.29F, 0.08F, config, 0.5F, 1005U);
+  TEST_ASSERT_FALSE(update.faulted);
+  TEST_ASSERT_EQUAL_UINT32(5U, update.elapsed_ms);
+
+  robot::ImuTurnControllerState rollover_state{};
+  const robot::Milliseconds near_rollover =
+      std::numeric_limits<robot::Milliseconds>::max() - 5U;
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      rollover_state, 0.0F, 90.0F, config, 0.5F, near_rollover));
+  update = robot::updateImuTurn(
+      rollover_state, 0.0F, 0.0F, config, 0.5F, 3U);
+  TEST_ASSERT_FALSE(update.faulted);
+  TEST_ASSERT_EQUAL_UINT32(9U, update.elapsed_ms);
+}
+
+void test_imu_turn_faults_instead_of_emitting_nonfinite_output() {
+  robot::ImuTurnConfig config = imuTurnConfig();
+  config.kp = std::numeric_limits<float>::max();
+  robot::ImuTurnControllerState state{};
+  TEST_ASSERT_TRUE(robot::startImuTurn(
+      state, 0.0F, 1.0e20F, config, 0.5F, 100U));
+
+  const robot::ImuTurnUpdate update =
+      robot::updateImuTurn(state, 0.0F, 0.0F, config, 0.5F, 110U);
+  TEST_ASSERT_TRUE(update.faulted);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::ImuTurnFaultReason::InvalidConfiguration),
+      static_cast<std::uint8_t>(update.fault_reason));
+  TEST_ASSERT_FALSE(update.should_rotate);
+  TEST_ASSERT_TRUE(std::isfinite(update.rotation_command));
 }
 
 void test_time_trial_config_allows_skipped_or_safe_transition_strafe() {
@@ -1565,6 +1776,132 @@ void test_event_log_stores_newest_events_and_wraps() {
   TEST_ASSERT_EQUAL_STRING("newest", newest.message);
 }
 
+void test_motion_diagnostics_retains_newest_samples_in_time_order() {
+  robot::MotionDiagnostics diagnostics{};
+  diagnostics.reset(10U);
+
+  for (std::size_t index = 0U;
+       index < robot::kMotionDiagnosticSampleCapacity + 3U; ++index) {
+    robot::MotionDiagnosticSample sample{};
+    sample.timestamp_ms = static_cast<robot::Milliseconds>(index);
+    diagnostics.record(sample);
+  }
+
+  TEST_ASSERT_EQUAL_UINT(robot::kMotionDiagnosticSampleCapacity,
+                         diagnostics.sampleCount());
+  TEST_ASSERT_EQUAL_UINT32(
+      3U, diagnostics.sampleFromOldest(0U).timestamp_ms);
+  TEST_ASSERT_EQUAL_UINT32(
+      robot::kMotionDiagnosticSampleCapacity + 2U,
+      diagnostics
+          .sampleFromOldest(robot::kMotionDiagnosticSampleCapacity - 1U)
+          .timestamp_ms);
+}
+
+void test_motion_diagnostics_freeze_preserves_trigger_and_samples() {
+  robot::MotionDiagnostics diagnostics{};
+  diagnostics.reset(100U);
+  robot::MotionDiagnosticSample sample{};
+  sample.timestamp_ms = 110U;
+  diagnostics.record(sample);
+  diagnostics.freeze(robot::MotionDiagnosticTrigger::ImuTurnTimedOut, 120U);
+
+  sample.timestamp_ms = 130U;
+  diagnostics.record(sample);
+
+  TEST_ASSERT_TRUE(diagnostics.frozen());
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::MotionDiagnosticTrigger::ImuTurnTimedOut),
+      static_cast<std::uint8_t>(diagnostics.trigger()));
+  TEST_ASSERT_EQUAL_UINT32(120U, diagnostics.frozenAtMs());
+  TEST_ASSERT_EQUAL_UINT(1U, diagnostics.sampleCount());
+  TEST_ASSERT_EQUAL_UINT32(
+      110U, diagnostics.sampleFromOldest(0U).timestamp_ms);
+}
+
+void test_motion_diagnostics_tracks_loop_and_web_failure_evidence() {
+  robot::MotionDiagnostics diagnostics{};
+  diagnostics.reset(200U);
+  diagnostics.observeLoop(10000U, 3000U, 500U, 1000U, 10U);
+  diagnostics.observeLoop(35000U, 32000U, 6000U, 28000U, 10U);
+  diagnostics.noteWebDrive(210U, true, false);
+  diagnostics.noteWebStop(220U);
+  diagnostics.noteWebDrive(230U, false, true);
+
+  TEST_ASSERT_EQUAL_UINT32(35000U, diagnostics.maximumLoopIntervalUs());
+  TEST_ASSERT_EQUAL_UINT32(32000U, diagnostics.maximumLoopWorkUs());
+  TEST_ASSERT_EQUAL_UINT32(6000U, diagnostics.maximumImuUpdateUs());
+  TEST_ASSERT_EQUAL_UINT32(28000U, diagnostics.maximumWebHandleUs());
+  TEST_ASSERT_EQUAL_UINT32(2U, diagnostics.missedDeadlineCount());
+  TEST_ASSERT_EQUAL_UINT32(2U, diagnostics.webDriveRequestCount());
+  TEST_ASSERT_EQUAL_UINT32(1U, diagnostics.webStopRequestCount());
+  TEST_ASSERT_EQUAL_UINT32(1U, diagnostics.driveAfterStopCount());
+}
+
+void test_motion_diagnostics_json_exposes_commands_pwm_and_timing() {
+  robot::MotionDiagnostics diagnostics{};
+  diagnostics.reset(300U);
+  robot::MotionDiagnosticSample sample{};
+  sample.timestamp_ms = 310U;
+  sample.event =
+      robot::MotionDiagnosticEvent::WebDriveHeartbeatAfterStop;
+  sample.mode = robot::RobotTestMode::DistributedDriveTest;
+  sample.loop_interval_us = UINT32_MAX;
+  sample.loop_work_us = UINT32_MAX;
+  sample.imu_update_us = UINT32_MAX;
+  sample.web_handle_us = UINT32_MAX;
+  sample.requested_command_milli[0] = 250;
+  sample.requested_command_milli[1] = -1000;
+  sample.requested_command_milli[2] = 1000;
+  sample.requested_command_milli[3] = -1000;
+  sample.applied_command_milli[0] = 250;
+  sample.applied_command_milli[1] = -1000;
+  sample.applied_command_milli[2] = 1000;
+  sample.applied_command_milli[3] = -1000;
+  sample.front_driver_desired_command_milli[0] = -1000;
+  sample.front_driver_desired_command_milli[1] = 1000;
+  sample.front_command_expires_at_ms[0] = UINT32_MAX;
+  sample.front_command_expires_at_ms[1] = UINT32_MAX;
+  sample.front_pwm_readback[0] = 255U;
+  sample.front_pwm_readback[1] = UINT32_MAX;
+  sample.front_pwm_readback[2] = UINT32_MAX;
+  sample.front_pwm_readback[3] = UINT32_MAX;
+  sample.rear_command_age_ms = UINT32_MAX;
+  sample.esp1_status_age_ms = UINT32_MAX;
+  sample.esp1_packet_error_count = UINT32_MAX;
+  sample.command_deadman_armed = true;
+  sample.command_deadline_ms = UINT32_MAX;
+  sample.last_command_age_ms = UINT32_MAX;
+  sample.heading_deg = 1234567.0F;
+  sample.target_heading_deg = -1234567.0F;
+  sample.angle_error_deg = -2469134.0F;
+  sample.yaw_rate_dps = -500.0F;
+  sample.rotation_command = -1.0F;
+  for (std::size_t index = 0U;
+       index < robot::kMotionDiagnosticSampleCapacity; ++index) {
+    sample.timestamp_ms =
+        static_cast<robot::Milliseconds>(310U + index);
+    diagnostics.record(sample);
+  }
+  diagnostics.freeze(
+      robot::MotionDiagnosticTrigger::DriveHeartbeatAfterStop, 320U);
+
+  char json[16384]{};
+  TEST_ASSERT_TRUE(
+      robot::writeMotionDiagnosticsJson(diagnostics, json, sizeof(json)));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(json, "\"trigger\":\"DRIVE_HEARTBEAT_AFTER_STOP\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(json, "\"event\":\"WEB_DRIVE_HEARTBEAT_AFTER_STOP\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(json, "\"requested\":[250,-1000,1000,-1000]"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(
+          json,
+          "\"pwm_readback\":[255,4294967295,4294967295,4294967295]"));
+}
+
 void test_solar_contact_config_validation() {
   robot::SolarPanelContactConfig config = solarContactConfig();
   TEST_ASSERT_TRUE(robot::solarPanelContactConfigValid(config));
@@ -2009,6 +2346,57 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.uptime_ms = 123U;
   snapshot.current_mode = robot::RobotTestMode::LineSensorTest;
   snapshot.enabled = false;
+  snapshot.imu.configured = true;
+  snapshot.imu.initialized = true;
+  snapshot.imu.calibrated = true;
+  snapshot.imu.healthy = true;
+  snapshot.imu.data_fresh = true;
+  snapshot.imu.acquisition_running = true;
+  snapshot.imu.device_acknowledged = true;
+  snapshot.imu.register_reads_use_repeated_start = true;
+  snapshot.imu.i2c_address = 0x68U;
+  snapshot.imu.who_am_i = 0x74U;
+  snapshot.imu.sda_gpio = 39;
+  snapshot.imu.scl_gpio = 38;
+  snapshot.imu.last_wire_status = 0;
+  std::strcpy(snapshot.imu.initialization_error, "NONE");
+  snapshot.imu.raw_gyro_z = -321;
+  snapshot.imu.gyro_z_bias_dps = 1.25F;
+  snapshot.imu.yaw_rate_dps = -4.5F;
+  snapshot.imu.heading_deg = 92.75F;
+  snapshot.imu.sample_age_ms = 3U;
+  snapshot.imu.snapshot_age_ms = 2U;
+  snapshot.imu.acquisition_duration_us = 1725U;
+  snapshot.imu.maximum_completed_acquisition_duration_us = 12045U;
+  snapshot.imu.total_acquisition_attempts = 702U;
+  snapshot.imu.last_successful_read_us = 1234567U;
+  snapshot.imu.last_sample_interval_us = 10025U;
+  snapshot.imu.successful_read_count = 700U;
+  snapshot.imu.failed_read_count = 2U;
+  snapshot.imu.consecutive_failed_reads = 1U;
+  snapshot.imu_turn.configuration_valid = true;
+  snapshot.imu_turn.active = true;
+  snapshot.imu_turn.state = robot::ImuTurnState::Turning;
+  snapshot.imu_turn.fault_reason = robot::ImuTurnFaultReason::None;
+  snapshot.imu_turn.maximum_rotation_duty = 0.3F;
+  snapshot.imu_turn.kp = 0.01F;
+  snapshot.imu_turn.kd = 0.02F;
+  snapshot.imu_turn.angle_tolerance_deg = 2.0F;
+  snapshot.imu_turn.maximum_finishing_yaw_rate_dps = 3.0F;
+  snapshot.imu_turn.settling_time_ms = 100U;
+  snapshot.imu_turn.timeout_ms = 2000U;
+  snapshot.imu_turn.yaw_command_polarity = -1;
+  snapshot.imu_turn.start_heading_deg = 10.0F;
+  snapshot.imu_turn.current_heading_deg = 42.0F;
+  snapshot.imu_turn.target_heading_deg = 100.0F;
+  snapshot.imu_turn.relative_angle_deg = 90.0F;
+  snapshot.imu_turn.angle_error_deg = 58.0F;
+  snapshot.imu_turn.yaw_rate_dps = 12.0F;
+  snapshot.imu_turn.proportional_term = 0.58F;
+  snapshot.imu_turn.damping_term = -0.24F;
+  snapshot.imu_turn.rotation_command = 0.3F;
+  snapshot.imu_turn.elapsed_ms = 250U;
+  snapshot.imu_turn.settling_elapsed_ms = 0U;
   snapshot.lss_raw_level = 1;
   snapshot.lsfl_black = true;
   snapshot.lsfr_black = false;
@@ -2216,12 +2604,62 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.claws.winch.commanded_open = true;
   snapshot.servo_winch_position = 145;
 
-  char output[10240]{};
+  char output[16384]{};
   TEST_ASSERT_TRUE(
       robot::writeTelemetryJson(snapshot, output, sizeof(output), false));
 
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"current_mode\":\"LINE_SENSOR_TEST\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"enabled\":false"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"imu\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"configured\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"device_acknowledged\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"acquisition_running\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"snapshot_age_ms\":2"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"acquisition_duration_us\":1725"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"maximum_completed_acquisition_duration_us\":12045"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"total_acquisition_attempts\":702"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"last_successful_read_us\":1234567"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"register_reads_use_repeated_start\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"who_am_i\":116"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"sda_gpio\":39"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"scl_gpio\":38"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"initialization_error\":\"NONE\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"raw_gyro_z\":-321"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"gyro_z_bias_dps\":1.25000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"yaw_rate_dps\":-4.50000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"heading_deg\":92.75000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"last_sample_interval_us\":10025"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"successful_read_count\":700"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"consecutive_failed_reads\":1"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"imu_turn\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"configuration_valid\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"state\":\"TURNING\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"fault_reason\":\"NONE\""));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"maximum_rotation_duty\":0.30000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"angle_tolerance_deg\":2.00000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"yaw_command_polarity\":-1"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"angle_error_deg\":58.00000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"damping_term\":-0.24000"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_black\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lsfl_level\":\"UNKNOWN\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_raw_level\":1"));
@@ -2455,6 +2893,26 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_raw_level\":0"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_level\":\"LOW\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"lss_black\":false"));
+
+  snapshot.imu.initialized = false;
+  snapshot.imu.calibrated = false;
+  snapshot.imu.healthy = false;
+  snapshot.imu.data_fresh = false;
+  snapshot.imu.acquisition_running = false;
+  snapshot.imu.device_acknowledged = false;
+  snapshot.imu.who_am_i = 0U;
+  snapshot.imu.last_wire_status = 2;
+  std::strcpy(snapshot.imu.initialization_error, "NO_DEVICE_ACK");
+  TEST_ASSERT_TRUE(
+      robot::writeTelemetryJson(snapshot, output, sizeof(output), false));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"device_acknowledged\":false"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"acquisition_running\":false"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"last_wire_status\":2"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"initialization_error\":\"NO_DEVICE_ACK\""));
 }
 
 void test_esp1_status_packet_round_trips() {
@@ -2636,6 +3094,18 @@ int main() {
   RUN_TEST(test_tower_pieces_mode_parses_and_allows_distributed_motion);
   RUN_TEST(test_peg_finder_mode_parses_and_allows_distributed_motion);
   RUN_TEST(test_time_trial_mode_parses_and_allows_distributed_motion);
+  RUN_TEST(test_imu_turn_mode_is_explicit_and_requires_rear_link);
+  RUN_TEST(
+      test_imu_turn_config_starts_locked_until_every_value_is_configured);
+  RUN_TEST(test_imu_turn_start_captures_a_continuous_relative_target);
+  RUN_TEST(
+      test_imu_turn_pd_output_clamps_and_rate_damping_opposes_motion);
+  RUN_TEST(
+      test_imu_turn_requires_low_angle_and_rate_for_full_settling_time);
+  RUN_TEST(test_imu_turn_leaves_settling_if_either_condition_breaks);
+  RUN_TEST(test_imu_turn_timeout_faults_and_stop_is_terminal);
+  RUN_TEST(test_imu_turn_ignores_a_loop_timestamp_just_before_start);
+  RUN_TEST(test_imu_turn_faults_instead_of_emitting_nonfinite_output);
   RUN_TEST(
       test_time_trial_config_allows_skipped_or_safe_transition_strafe);
   RUN_TEST(
@@ -2664,6 +3134,10 @@ int main() {
   RUN_TEST(test_command_validation_rejects_invalid_pid_value);
   RUN_TEST(test_command_validation_rejects_mode_incompatible_motor_command);
   RUN_TEST(test_event_log_stores_newest_events_and_wraps);
+  RUN_TEST(test_motion_diagnostics_retains_newest_samples_in_time_order);
+  RUN_TEST(test_motion_diagnostics_freeze_preserves_trigger_and_samples);
+  RUN_TEST(test_motion_diagnostics_tracks_loop_and_web_failure_evidence);
+  RUN_TEST(test_motion_diagnostics_json_exposes_commands_pwm_and_timing);
   RUN_TEST(test_solar_contact_config_validation);
   RUN_TEST(test_solar_retry_state_names_are_exposed);
   RUN_TEST(test_solar_front_only_at_first_timeout_begins_adjustment);

@@ -20,6 +20,7 @@ Every physical peripheral must have exactly one software owner.
 
 | Peripheral | Signals | Software owner |
 | --- | --- | --- |
+| MPU-6050-compatible IMU | I2C SDA/SCL | ESP2 sensor-acquisition task; motion and web code consume snapshots only |
 | Front line sensors | `LSFL`, `LSFR` | ESP2 sensor acquisition |
 | Front-left motor | `PWMFL0`, `PWMFL1` | ESP2 motor output |
 | Front-right motor | `PWMFR0`, `PWMFR1` | ESP2 motor output |

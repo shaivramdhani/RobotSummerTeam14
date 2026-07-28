@@ -70,6 +70,8 @@ const char* robotTestModeName(const RobotTestMode mode) {
       return "PEG_FINDER";
     case RobotTestMode::TimeTrial:
       return "TIME_TRIAL";
+    case RobotTestMode::ImuTurnTest:
+      return "IMU_TURN_TEST";
   }
 
   return "DISABLED";
@@ -151,6 +153,11 @@ bool parseRobotTestMode(const char* text, RobotTestMode& mode) {
     mode = RobotTestMode::TimeTrial;
     return true;
   }
+  if (sameModeToken(text, "imu-turn") ||
+      sameModeToken(text, "imu-turn-test")) {
+    mode = RobotTestMode::ImuTurnTest;
+    return true;
+  }
 
   return false;
 }
@@ -164,6 +171,7 @@ bool robotTestModeAllowsMotion(const RobotTestMode mode) {
          mode == RobotTestMode::AutonomousTowerPieces ||
          mode == RobotTestMode::PegFinder ||
          mode == RobotTestMode::TimeTrial ||
+         mode == RobotTestMode::ImuTurnTest ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 
@@ -174,6 +182,7 @@ bool robotTestModeRequiresRearLink(const RobotTestMode mode) {
          mode == RobotTestMode::AutonomousTowerPieces ||
          mode == RobotTestMode::PegFinder ||
          mode == RobotTestMode::TimeTrial ||
+         mode == RobotTestMode::ImuTurnTest ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 

@@ -47,6 +47,8 @@ ESP1 UART baud rate: TODO.
 
 | Signal | GPIO | Active level / electrical notes |
 | --- | --- | --- |
+| `IMU SDA` | 18 | Current software configuration; verify the physical PCB connection |
+| `IMU SCL` | 17 | Current software configuration; verify the physical PCB connection |
 | `LSFL` | 19 | Digital comparator, HIGH = black tape |
 | `LSFR` | 20 | Digital comparator, HIGH = black tape |
 | `PWMFL0` | TODO | TODO |

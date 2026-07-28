@@ -37,4 +37,8 @@ bool RobotTestModeManager::acceptsLineFollowerCommand() const {
          current_mode_ == RobotTestMode::RearLineFollowTest;
 }
 
+bool RobotTestModeManager::acceptsImuTurnCommand() const {
+  return current_mode_ == RobotTestMode::ImuTurnTest;
+}
+
 }  // namespace robot

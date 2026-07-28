@@ -31,6 +31,64 @@ valid echo from an out-of-range/no-echo sample and stale ESP1 data. ESP1 samples
 the sensor at the 100 ms sensor-acquisition period; the ECHO input is divided to
 3.3 V in hardware.
 
+The `IMU` panel shows ESP2's MPU-6050-compatible sensor state. Runtime I2C reads
+run in the core-0 sensor-acquisition task and are published to the core-1 motion
+task as immutable snapshots. The `imu` JSON object includes configuration,
+initialization, calibration, health, freshness, whether the acquisition task
+is running, current snapshot age, last completed and maximum completed
+acquisition durations, total acquisition attempts, successful and failed
+reads, consecutive failures, the last successful-read timestamp, and
+device-acknowledgement flags; SDA/SCL GPIOs; numeric I2C address and
+`WHO_AM_I`; the exact
+initialization failure stage and last raw Arduino `Wire` status; raw gyro Z;
+bias-corrected yaw rate; continuous relative heading; selected repeated-start
+or stop/start register-read mode; and sample timing. A rising
+snapshot age with a running acquisition task indicates that acquisition is
+delayed or blocked. The dashboard renders the address and identity in
+hexadecimal. The driver probes the standard repeated-start read first during
+startup and falls back once to a stop/start read for compatible modules; the
+selected mode is then fixed. The current software assignment is SDA GPIO18 and
+SCL GPIO17; both still require physical PCB verification.
+
+The IMU panel is also the read-only soak-test view. `Reset soak counters`
+enqueues a request to the acquisition service's separate fixed one-element
+queue; it clears only total attempts, successful reads, failed reads,
+consecutive failures, and maximum completed duration. The next scheduled read
+can make the counters nonzero immediately. `Refresh values` performs only the
+normal telemetry fetch. Neither control changes robot mode, heading, turn
+state, IMU initialization, drivetrain output, or accesses `Wire` from the web
+task. The 32-bit microsecond timestamps naturally wrap with `micros()`.
+
+The separate `IMU Turn Test` panel implements Stage 2 manual turns. It exposes
+Apply, Save, Turn +90, Turn -90, Reset angle, and Stop controls. Reset angle
+queues the zero operation to the sensor owner and clears the inactive turn
+state; it is rejected during an active turn, and another turn cannot start
+until the reset sequence is acknowledged. The controller uses
+`kp * angle_error - kd * yaw_rate`, clamps that request to the configured
+maximum duty, and stops driving while it verifies settling. Completion requires
+both the absolute angle error and absolute yaw rate to remain within their
+limits continuously for the required settling time.
+
+All eight IMU-turn fields default to zero/unconfigured and therefore lock out
+motion until the team enters measured values:
+
+| Field | Purpose |
+| --- | --- |
+| Maximum rotation duty | Absolute output clamp and hardware-speed limit for the test. |
+| Kp | Duty requested per degree of remaining angle error. |
+| Kd | Duty removed in proportion to measured yaw rate to damp wheel momentum. |
+| Angle tolerance | Maximum absolute heading error permitted during settling. |
+| Maximum finishing yaw rate | Maximum absolute rotation rate permitted during settling. |
+| Required settling time | How long both completion conditions must remain true. |
+| Overall turn timeout | Hard deadline that faults and stops an unfinished turn; limited by the existing 30-second timed-test cap. |
+| Yaw command polarity | Measured `+1`/`-1` mapping between positive IMU heading and drivetrain yaw. |
+
+Start is also rejected unless the IMU is configured, initialized, calibrated,
+healthy, and fresh; both ESP2 front motors are configured; and the ESP1
+rear-wheel link is configured and fresh. An active turn faults and stops all
+four wheels if any of those runtime gates fails. This test mode does not alter
+line following or any autonomous routine.
+
 ## Modes
 
 | Mode | Motion allowed | Purpose |
@@ -49,6 +107,7 @@ the sensor at the 100 ms sensor-acquisition period; the ECHO input is divided to
 | `AUTONOMOUS_TOWER_PIECES` | Yes, gated | Reverse line following, timed chassis motion, shimmy search, then the winch/claw/stepper collection tail. |
 | `PEG_FINDER` | Yes, gated | Timed chassis sequence, limit-terminated funnel, then sequential claw opening. |
 | `TIME_TRIAL` | Yes, gated | Autonomous Solar, a configurable transition, Tower Pieces, a configurable delay, then PegFinder. |
+| `IMU_TURN_TEST` | Yes, gated | Manual-only relative +90/-90 PD yaw tests; inactive, complete, stopped, and faulted states command zero. |
 | `AUTONOMOUS_DRY_RUN` | No | Stub view for future mission dry runs. |
 
 Mode changes stop actuators before switching. Sensor-only modes keep motors and
@@ -235,6 +294,11 @@ timeout.
 - ESP1 back motors stop on stale, invalid, duplicate, corrupt, or disabled
   wheel command packets.
 - ESP2 stops line following if the rear command link is unhealthy.
+- `IMU_TURN_TEST` starts locked because its tuning defaults to zero. It requires
+  valid tuning, a calibrated/fresh/healthy IMU, both front motor adapters, and
+  a fresh configured rear link. It stops on IMU loss, rear-link loss, a failed
+  rear command, invalid controller data, explicit Stop, completion, or the
+  overall timeout. Its settling state sends disabled wheel commands.
 - Solar autonomous motion also stops if a rear-wheel command cannot be sent or
   ESP1 reports that its received commands have gone stale.
 - After both solar-panel limit switches are hit, the robot waits for
@@ -261,6 +325,25 @@ timeout.
 - Browser requests call high-level command handlers; they do not write GPIO/PWM
   directly.
 
+## Motion Failure Diagnostics
+
+The dashboard provides an on-demand rolling motion trace. It is not polled
+automatically. Press `Reset before run`, perform one raised-wheel reproduction,
+then press `Refresh after failure` and copy the complete JSON report.
+
+The fixed-capacity trace samples active motion every 100 ms and retains the
+newest samples. Stopped time does not overwrite the trace. IMU completion,
+IMU timeout, IMU faults, and command-deadman stops freeze it automatically;
+requesting the report also freezes an unfrozen trace.
+
+The report includes maximum loop, latest completed IMU acquisition, and
+web-handler durations; missed
+deadlines; web drive/stop counts and drive heartbeats processed after Stop;
+requested and applied FL/FR/BL/BR commands; direct ESP2 LEDC duty readback for
+the four front PWM channels; rear sequence and status ages; ESP1 applied rear
+commands; command-deadman state; and IMU turn state, heading, target, error,
+yaw rate, and rotation output.
+
 ## Endpoints
 
 | Endpoint | Method | Description |
@@ -268,6 +351,10 @@ timeout.
 | `/` | GET | Dashboard HTML. |
 | `/api/status` | GET | Compact status JSON. |
 | `/api/telemetry` | GET | Full telemetry JSON. |
+| `/api/imu/soak/reset-counters` | GET/POST | Enqueue a reset of only the fixed IMU soak counters; does not change IMU, heading, turn, mode, or actuator state. |
+| `/api/diagnostics` | GET | Freeze if necessary and return the retained motion-failure trace. |
+| `/api/diagnostics/reset` | GET/POST | Clear and restart the bounded motion trace. |
+| `/api/diagnostics/freeze` | GET/POST | Freeze the current trace without changing actuator state. |
 | `/api/stop` | GET/POST | Emergency stop. |
 | `/api/mode?mode=<mode>` | GET/POST | Change test mode safely. |
 | `/api/drive?vx=<>&vy=<>&wz=<>&duty=<>` | GET/POST | Manual/distributed drive command. |
@@ -290,6 +377,11 @@ timeout.
 | `/api/autonomous/peg-finder/config?clockwise-duty=<>&clockwise-duration-ms=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&post-reverse-pause-ms=<>&forward-duty=<>&forward-duration-ms=<>&funnel-duty=<>&funnel-timeout-ms=<>&post-funnel-limit-delay-ms=<>&claw-open-interval-ms=<>` | GET/POST | Update PegFinder chassis, limit-terminated funnel, post-limit delay, and sequential-claw settings. The legacy `funnel-duration-ms` argument is accepted as a timeout alias. |
 | `/api/autonomous/time-trial/start` | GET/POST | Enter `TIME_TRIAL`, validate all three included modes, and start Autonomous Solar. |
 | `/api/autonomous/time-trial/config?post-solar-delay-ms=<>&strafe-right-duty=<>&strafe-right-duration-ms=<>&post-tower-delay-ms=<>` | GET/POST | Update only the transitions between the three included modes. A right-strafe duration of `0` skips that motion. |
+| `/api/imu-turn/config?max-duty=<>&kp=<>&kd=<>&tolerance-deg=<>&finish-rate-dps=<>&settle-ms=<>&timeout-ms=<>&polarity=<>` | GET/POST | Validate and apply all manual IMU-turn tuning. Changing tuning during an active turn is rejected. |
+| `/api/imu-turn/start?degrees=<90|-90>` | GET/POST | Stop the previous mode, enter `IMU_TURN_TEST`, validate all safety gates, capture the current heading, and start the requested relative turn. |
+| `/api/imu-turn/stop` | GET/POST | Stop all four wheel outputs and leave the IMU controller in its explicit `STOPPED` state. |
+| `/api/imu-turn/reset-angle` | GET/POST | Queue a continuous-heading reset to the sensor-acquisition owner and clear the inactive turn state. Rejected while a turn is active; a new turn is rejected until the reset sequence is acknowledged. |
+| `/api/imu-turn/save` | GET/POST | Persist the currently valid IMU-turn tuning to NVS. |
 | `/api/claw?id=<1|2|3>&state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command one claw servo. |
 | `/api/claws?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command all three claw servos. |
 | `/api/winch?state=<open|close>` | GET/POST | Switch to `MECHANISM_TEST` and command the ESP2 GPIO6 winch servo. |
@@ -326,6 +418,10 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
   `telemetryEnabled`, `p_term`, `i_term`, `d_term`, `correction`.
 - Rear PID: the same fields under `rear_pid`, stored independently, plus
   `effectiveBaseDuty`, which is negative while commanding reverse travel.
+- IMU turn: `imu_turn.configuration_valid`, `active`, controller `state` and
+  `fault_reason`; all eight tuning fields; start/current/target/relative
+  headings, angle error and yaw rate; proportional, damping, and clamped
+  rotation terms; and elapsed/settling times.
 - Tower pieces: `tower_pieces.state`, `fault_reason`, `time_in_state_ms`,
   `reverse_line_duty`, `side_line_timeout_ms`, `post_line_delay_ms`,
   `strafe_right_duty`, `strafe_right_duration_ms`,

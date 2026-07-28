@@ -5,6 +5,7 @@
 
 #include "common/EventLog.h"
 #include "common/FaultHealth.h"
+#include "common/ImuTurnController.h"
 #include "common/LineFollower.h"
 #include "common/PegFinderAutonomy.h"
 #include "common/RobotTestMode.h"
@@ -18,6 +19,7 @@ namespace robot {
 constexpr std::size_t kTelemetryIpAddressSize = 24U;
 constexpr std::size_t kTelemetryResetReasonSize = 32U;
 constexpr std::size_t kTelemetryFaultMessageSize = 64U;
+constexpr std::size_t kTelemetryImuInitializationErrorSize = 32U;
 
 struct MotorTelemetry {
   std::int16_t desired_command_milli{0};
@@ -70,6 +72,68 @@ struct UltrasonicTelemetry {
   Milliseconds sample_age_ms{0};
 };
 
+struct ImuTelemetry {
+  bool configured{false};
+  bool initialized{false};
+  bool calibrated{false};
+  bool healthy{false};
+  bool data_fresh{false};
+  bool acquisition_running{false};
+  bool device_acknowledged{false};
+  bool register_reads_use_repeated_start{true};
+
+  std::uint8_t i2c_address{0x68U};
+  std::uint8_t who_am_i{0U};
+  int sda_gpio{-1};
+  int scl_gpio{-1};
+  int last_wire_status{-1};
+  char initialization_error[kTelemetryImuInitializationErrorSize]{};
+
+  std::int16_t raw_gyro_z{0};
+  float gyro_z_bias_dps{0.0F};
+  float yaw_rate_dps{0.0F};
+  float heading_deg{0.0F};
+
+  Milliseconds sample_age_ms{0U};
+  Milliseconds snapshot_age_ms{0U};
+  std::uint32_t acquisition_duration_us{0U};
+  std::uint32_t maximum_completed_acquisition_duration_us{0U};
+  std::uint32_t total_acquisition_attempts{0U};
+  std::uint32_t last_successful_read_us{0U};
+  std::uint32_t last_sample_interval_us{0U};
+  std::uint32_t successful_read_count{0U};
+  std::uint32_t failed_read_count{0U};
+  std::uint32_t consecutive_failed_reads{0U};
+};
+
+struct ImuTurnTelemetry {
+  bool configuration_valid{false};
+  bool active{false};
+  ImuTurnState state{ImuTurnState::Idle};
+  ImuTurnFaultReason fault_reason{ImuTurnFaultReason::None};
+
+  float maximum_rotation_duty{0.0F};
+  float kp{0.0F};
+  float kd{0.0F};
+  float angle_tolerance_deg{0.0F};
+  float maximum_finishing_yaw_rate_dps{0.0F};
+  Milliseconds settling_time_ms{0U};
+  Milliseconds timeout_ms{0U};
+  int yaw_command_polarity{0};
+
+  float start_heading_deg{0.0F};
+  float current_heading_deg{0.0F};
+  float target_heading_deg{0.0F};
+  float relative_angle_deg{0.0F};
+  float angle_error_deg{0.0F};
+  float yaw_rate_dps{0.0F};
+  float proportional_term{0.0F};
+  float damping_term{0.0F};
+  float rotation_command{0.0F};
+  Milliseconds elapsed_ms{0U};
+  Milliseconds settling_elapsed_ms{0U};
+};
+
 struct ServoClawTelemetry {
   bool hardware_configured{false};
   bool open_configured{false};
@@ -102,6 +166,9 @@ struct TelemetrySnapshot {
   char ip_address[kTelemetryIpAddressSize]{};
   std::uint32_t free_heap_bytes{0};
   char reset_reason[kTelemetryResetReasonSize]{};
+
+  ImuTelemetry imu{};
+  ImuTurnTelemetry imu_turn{};
 
   int lsfl_raw_level{-1};
   int lsfr_raw_level{-1};

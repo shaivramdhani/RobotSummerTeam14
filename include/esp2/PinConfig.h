@@ -46,6 +46,10 @@ struct ServoOutputConfig {
 };
 
 struct Esp2Pins {
+  // Current IMU wiring assignment; verify it against the physical PCB.
+  // GPIO8 and GPIO9 are already owned by other peripherals.
+  int imu_sda{18};
+  int imu_scl{17};
   int line_sensor_front_left{8};     // Digital comparator, HIGH = black tape
   int line_sensor_front_right{7};    // Digital comparator, HIGH = black tape                  // GPIO, active level TODO
   int pwm_front_left_0{15};           // TODO: GPIO, PWM resource

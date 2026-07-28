@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <esp_system.h>
 
 #include <array>
@@ -16,9 +17,11 @@
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
 #include "common/FunnelCommand.h"
+#include "common/ImuTurnController.h"
 #include "common/LineFollower.h"
 #include "common/LineObservation.h"
 #include "common/LineSensor.h"
+#include "common/MotionDiagnostics.h"
 #include "common/MotorOutput.h"
 #include "common/PegFinderAutonomy.h"
 #include "common/RearDriveCommand.h"
@@ -30,6 +33,7 @@
 #include "common/TimeTrialAutonomy.h"
 #include "common/TowerPiecesAutonomy.h"
 #include "common/UartProtocol.h"
+#include "esp2/ImuAcquisitionService.h"
 #include "esp2/MechanismControllers.h"
 #include "esp2/PinConfig.h"
 #include "esp2/StepperAxis.h"
@@ -40,19 +44,26 @@ constexpr const char* kApSsid = "Team14Robot";
 constexpr const char* kApPassword = "robotdebug";
 constexpr robot::Milliseconds kDefaultMotionTaskPeriodMs = 10U;
 constexpr robot::Milliseconds kTelemetryPeriodMs = 100U;
+constexpr robot::Milliseconds kMotionDiagnosticSamplePeriodMs = 100U;
 constexpr robot::Milliseconds kCommandTimeoutMs = 700U;
 constexpr robot::Milliseconds kMaxTimedTestDurationMs = 30000U;
 constexpr float kSingleMotorDutyCap = 1.0F;
 constexpr std::uint32_t kTaskStackBytes = 12288U;
 constexpr UBaseType_t kTaskPriority = 1U;
 constexpr BaseType_t kTaskCore = 1;
+constexpr UBaseType_t kSensorAcquisitionTaskPriority = 1U;
+constexpr BaseType_t kSensorAcquisitionTaskCore = 0;
 constexpr std::size_t kSerialCommandBufferSize = 128U;
-constexpr std::size_t kJsonBufferSize = 10240U;
+constexpr std::size_t kJsonBufferSize = 16384U;
 constexpr std::size_t kClawServoCount = 3U;
 constexpr std::size_t kMechanismServoCount = 4U;
 constexpr std::size_t kWinchServoIndex = 3U;
 constexpr int kClawServoUnsetAngleDeg = -1;
 constexpr int kLegacyClawServoRotationDeg = 90;
+constexpr std::uint8_t kImuI2cAddress = 0x68U;
+constexpr std::uint16_t kImuCalibrationSampleCount = 500U;
+constexpr std::uint32_t kImuFreshnessTimeoutUs = 75000U;
+constexpr robot::Milliseconds kPreCalibrationStopSettleMs = 20U;
 
 // Solar-panel first-stage tuning. TEMPORARY DEFAULTS: tune with the real
 // beacon, sensor, lighting, and motors running before driving at speed.
@@ -437,6 +448,16 @@ class DualPwmMotorOutput final : public robot::IMotorOutput {
   }
   const robot::MotorCommand& lastAppliedCommand() const {
     return last_applied_;
+  }
+  std::uint32_t pwm0DutyReadback() const {
+    return configured_
+               ? ledcRead(static_cast<std::uint8_t>(config_.pwm0_channel))
+               : 0U;
+  }
+  std::uint32_t pwm1DutyReadback() const {
+    return configured_
+               ? ledcRead(static_cast<std::uint8_t>(config_.pwm1_channel))
+               : 0U;
   }
 
  private:
@@ -916,6 +937,7 @@ struct RuntimeContext {
   robot::LineFollowerState follower_state{};
   robot::RobotTestModeManager modes{};
   robot::EventLog events{};
+  robot::MotionDiagnostics motion_diagnostics{};
   robot::FourWheelCommand requested_command{};
   robot::FourWheelCommand last_commanded_wheels{};
   robot::MotorCommand requested_funnel_command{};
@@ -940,12 +962,22 @@ struct RuntimeContext {
   robot::PegFinderAutonomy peg_finder{};
   robot::TimeTrialConfig time_trial_config{};
   robot::TimeTrialAutonomy time_trial{};
+  robot::ImuTurnConfig imu_turn_config{};
+  robot::ImuTurnControllerState imu_turn_state{};
+  robot::ImuTurnUpdate last_imu_turn_update{};
+  robot::esp2::ImuAcquisitionSnapshot latest_imu_snapshot{};
+  std::uint32_t imu_heading_reset_pending_sequence{0U};
   robot::Milliseconds autonomous_state_entered_at_ms{0};
   char command_buffer[kSerialCommandBufferSize]{};
   std::size_t command_length{0};
   robot::Milliseconds last_telemetry_at_ms{0};
   robot::Milliseconds mode_expires_at_ms{0};
   robot::Milliseconds last_command_ms{0};
+  robot::Milliseconds last_motion_diagnostic_sample_ms{0};
+  std::uint32_t diagnostic_loop_started_us{0U};
+  std::uint32_t diagnostic_loop_interval_us{0U};
+  std::uint32_t diagnostic_imu_update_us{0U};
+  std::uint32_t diagnostic_web_handle_us{0U};
   std::int8_t line_sensor_last_known_side{0};
   std::int8_t rear_line_sensor_last_known_side{0};
   bool command_deadman_armed{false};
@@ -954,6 +986,12 @@ struct RuntimeContext {
   bool peg_finder_start_requested{false};
   bool time_trial_start_requested{false};
   bool fault_active{false};
+  bool imu_health_observed{false};
+  bool imu_was_healthy{false};
+  bool diagnostic_motion_was_active{false};
+  bool diagnostic_web_stop_seen{false};
+  robot::MotionDiagnosticTrigger diagnostic_freeze_pending{
+      robot::MotionDiagnosticTrigger::None};
   robot::FaultCode fault_code{robot::FaultCode::None};
   char fault_message[robot::kTelemetryFaultMessageSize]{};
 };
@@ -967,6 +1005,7 @@ struct RuntimeBindings {
   RearCommandLink* rear_link{nullptr};
   ClawServoBank* claws{nullptr};
   robot::esp2::StepperAxis* stepper{nullptr};
+  robot::esp2::ImuAcquisitionService* imu_acquisition{nullptr};
   Preferences* preferences{nullptr};
 };
 
@@ -975,6 +1014,11 @@ RuntimeBindings g_runtime{};
 float hardwareDutyCap() {
   return clampFloat(robot::esp2::kHardwareConfig.maximum_safe_test_duty, 0.0F,
                     1.0F);
+}
+
+bool imuTurnRuntimeConfigValid(const robot::ImuTurnConfig& config) {
+  return robot::imuTurnConfigValid(config, hardwareDutyCap()) &&
+         config.timeout_ms <= kMaxTimedTestDurationMs;
 }
 
 float activeMotionDutyCap(const RuntimeContext& context) {
@@ -1141,6 +1185,11 @@ void resetTimeTrial(RuntimeContext& context,
                     const robot::Milliseconds now_ms) {
   robot::resetTimeTrialAutonomy(context.time_trial, now_ms);
   context.time_trial_start_requested = false;
+}
+
+void resetImuTurn(RuntimeContext& context) {
+  robot::resetImuTurnController(context.imu_turn_state);
+  context.last_imu_turn_update = {};
 }
 
 void enterSolarPanelAutonomyState(
@@ -1387,6 +1436,7 @@ void emergencyStop(RuntimeContext& context, robot::IMotorOutput& front_left,
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
+  resetImuTurn(context);
   setFault(context, robot::FaultCode::None, "");
   logEvent(context, now_ms, robot::EventSeverity::Warn, source,
            "emergency stop requested");
@@ -1411,6 +1461,126 @@ std::uint16_t driveCommandMagnitudeMilli(
   magnitude = front_right > magnitude ? front_right : magnitude;
   magnitude = back_left > magnitude ? back_left : magnitude;
   return back_right > magnitude ? back_right : magnitude;
+}
+
+void recordMotionDiagnostic(
+    RuntimeContext& context, const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right, const RearCommandLink& rear_link,
+    const robot::esp2::ImuAcquisitionSnapshot* imu,
+    const robot::MotionDiagnosticEvent event,
+    const robot::Milliseconds now_ms) {
+  robot::MotionDiagnosticSample sample{};
+  sample.timestamp_ms = now_ms;
+  sample.event = event;
+  sample.mode = context.modes.currentMode();
+  sample.loop_interval_us = context.diagnostic_loop_interval_us;
+  sample.loop_work_us =
+      context.diagnostic_loop_started_us == 0U
+          ? 0U
+          : static_cast<std::uint32_t>(
+                micros() - context.diagnostic_loop_started_us);
+  sample.imu_update_us = context.diagnostic_imu_update_us;
+  sample.web_handle_us = context.diagnostic_web_handle_us;
+
+  sample.requested_command_milli[0] =
+      context.requested_command.front_left.duty_command_milli;
+  sample.requested_command_milli[1] =
+      context.requested_command.front_right.duty_command_milli;
+  sample.requested_command_milli[2] =
+      context.requested_command.back_left.duty_command_milli;
+  sample.requested_command_milli[3] =
+      context.requested_command.back_right.duty_command_milli;
+  sample.front_driver_desired_command_milli[0] =
+      front_left.lastDesiredCommand().duty_command_milli;
+  sample.front_driver_desired_command_milli[1] =
+      front_right.lastDesiredCommand().duty_command_milli;
+  sample.front_command_expires_at_ms[0] =
+      front_left.lastDesiredCommand().expires_at_ms;
+  sample.front_command_expires_at_ms[1] =
+      front_right.lastDesiredCommand().expires_at_ms;
+  sample.applied_command_milli[0] =
+      front_left.lastAppliedCommand().duty_command_milli;
+  sample.applied_command_milli[1] =
+      front_right.lastAppliedCommand().duty_command_milli;
+  sample.front_pwm_readback[0] = front_left.pwm0DutyReadback();
+  sample.front_pwm_readback[1] = front_left.pwm1DutyReadback();
+  sample.front_pwm_readback[2] = front_right.pwm0DutyReadback();
+  sample.front_pwm_readback[3] = front_right.pwm1DutyReadback();
+
+  sample.rear_sequence = rear_link.lastSequenceSent();
+  sample.rear_command_age_ms =
+      rear_link.lastSentAtMs() == 0U
+          ? 0U
+          : elapsedSince(now_ms, rear_link.lastSentAtMs());
+  sample.esp1_status_age_ms =
+      rear_link.lastStatusReceivedAtMs() == 0U
+          ? 0U
+          : elapsedSince(now_ms, rear_link.lastStatusReceivedAtMs());
+  sample.esp1_status_fresh = rear_link.remoteStatusFresh(
+      now_ms, remoteStatusTimeoutMs(context.config));
+  sample.esp1_packet_error_count = rear_link.packetErrorCount();
+  if (rear_link.statusAvailable()) {
+    sample.applied_command_milli[2] =
+        rear_link.latestStatus().back_left_applied_command_milli;
+    sample.applied_command_milli[3] =
+        rear_link.latestStatus().back_right_applied_command_milli;
+  }
+
+  sample.command_deadman_armed = context.command_deadman_armed;
+  sample.command_deadline_ms = context.mode_expires_at_ms;
+  sample.last_command_age_ms =
+      context.last_command_ms == 0U
+          ? 0U
+          : elapsedSince(now_ms, context.last_command_ms);
+
+  sample.imu_turn_state = context.imu_turn_state.state;
+  sample.target_heading_deg = context.imu_turn_state.target_heading_deg;
+  sample.rotation_command = context.last_imu_turn_update.rotation_command;
+  if (imu != nullptr) {
+    sample.heading_deg = imu->state.heading_deg;
+    sample.angle_error_deg =
+        sample.target_heading_deg - sample.heading_deg;
+    sample.yaw_rate_dps = imu->state.yaw_rate_dps;
+  }
+  context.motion_diagnostics.record(sample);
+}
+
+void scheduleMotionDiagnosticFreeze(
+    RuntimeContext& context,
+    const robot::MotionDiagnosticTrigger trigger) {
+  if (context.diagnostic_freeze_pending ==
+      robot::MotionDiagnosticTrigger::None) {
+    context.diagnostic_freeze_pending = trigger;
+  }
+}
+
+void resetMotionDiagnosticCapture(RuntimeContext& context,
+                                  const robot::Milliseconds now_ms) {
+  context.motion_diagnostics.reset(now_ms);
+  context.last_motion_diagnostic_sample_ms = 0U;
+  context.diagnostic_motion_was_active = false;
+  context.diagnostic_web_stop_seen = false;
+  context.diagnostic_freeze_pending =
+      robot::MotionDiagnosticTrigger::None;
+}
+
+bool diagnosticMotionActive(const RuntimeContext& context,
+                            const DualPwmMotorOutput& front_left,
+                            const DualPwmMotorOutput& front_right,
+                            const RearCommandLink& rear_link) {
+  if (context.command_deadman_armed ||
+      robot::imuTurnActive(context.imu_turn_state) ||
+      driveCommandMagnitudeMilli(context.requested_command) > 0U ||
+      front_left.lastAppliedCommand().enabled ||
+      front_right.lastAppliedCommand().enabled) {
+    return true;
+  }
+  if (!rear_link.statusAvailable()) {
+    return false;
+  }
+  const robot::Esp1StatusReport& status = rear_link.latestStatus();
+  return status.back_left_applied_command_milli != 0 ||
+         status.back_right_applied_command_milli != 0;
 }
 
 bool startRequirementsMet(const DigitalFrontLineSensorReader& sensors,
@@ -1544,6 +1714,172 @@ bool applyWheelCommand(RuntimeContext& context,
   front_left.apply(wheels.front_left);
   front_right.apply(wheels.front_right);
   return sendRearWheelCommand(rear_link, wheels, command_config, now_ms);
+}
+
+void enterImuTurnFault(RuntimeContext& context,
+                       DualPwmMotorOutput& front_left,
+                       DualPwmMotorOutput& front_right,
+                       RearCommandLink& rear_link,
+                       const robot::ImuTurnFaultReason reason,
+                       const robot::FaultCode fault_code,
+                       const char* message,
+                       const robot::EventSource source,
+                       const robot::Milliseconds now_ms) {
+  if (context.imu_turn_state.state == robot::ImuTurnState::Fault) {
+    return;
+  }
+  recordMotionDiagnostic(
+      context, front_left, front_right, rear_link,
+      &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::ImuTurnFaulted, now_ms);
+  robot::faultImuTurn(context.imu_turn_state, reason);
+  context.last_imu_turn_update = {};
+  context.last_imu_turn_update.state = context.imu_turn_state.state;
+  context.last_imu_turn_update.fault_reason =
+      context.imu_turn_state.fault_reason;
+  disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  recordMotionDiagnostic(
+      context, front_left, front_right, rear_link,
+      &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::OutputsDisabled, now_ms);
+  scheduleMotionDiagnosticFreeze(
+      context, robot::MotionDiagnosticTrigger::ImuTurnFaulted);
+  setFault(context, fault_code, message);
+  logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
+}
+
+void runImuTurnTest(RuntimeContext& context,
+                    DualPwmMotorOutput& front_left,
+                    DualPwmMotorOutput& front_right,
+                    RearCommandLink& rear_link,
+                    const robot::esp2::ImuAcquisitionSnapshot& imu,
+                    const robot::Milliseconds now_ms) {
+  if (!robot::imuTurnActive(context.imu_turn_state)) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
+  if (!imuTurnRuntimeConfigValid(context.imu_turn_config)) {
+    enterImuTurnFault(
+        context, front_left, front_right, rear_link,
+        robot::ImuTurnFaultReason::InvalidConfiguration,
+        robot::FaultCode::InvalidCommand,
+        "IMU turn stopped: invalid configuration",
+        robot::EventSource::System, now_ms);
+    return;
+  }
+
+  const robot::esp2::ImuState& imu_state = imu.state;
+  if (!imu_state.configured || !imu_state.initialized ||
+      !imu_state.calibrated || !imu_state.healthy ||
+      !robot::esp2::imuSnapshotFresh(
+          imu, micros(), kImuFreshnessTimeoutUs)) {
+    enterImuTurnFault(context, front_left, front_right, rear_link,
+                      robot::ImuTurnFaultReason::ImuUnavailable,
+                      robot::FaultCode::HardwareNotConfigured,
+                      "IMU turn stopped: IMU unavailable",
+                      robot::EventSource::System, now_ms);
+    return;
+  }
+
+  if (!front_left.configured() || !front_right.configured()) {
+    enterImuTurnFault(context, front_left, front_right, rear_link,
+                      robot::ImuTurnFaultReason::CommandFailed,
+                      robot::FaultCode::HardwareNotConfigured,
+                      "IMU turn stopped: front motors unavailable",
+                      robot::EventSource::Motor, now_ms);
+    return;
+  }
+  if (!rear_link.configured() ||
+      !rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config))) {
+    enterImuTurnFault(context, front_left, front_right, rear_link,
+                      robot::ImuTurnFaultReason::RearLinkUnavailable,
+                      robot::FaultCode::CommunicationStale,
+                      "IMU turn stopped: rear link unavailable",
+                      robot::EventSource::Uart, now_ms);
+    return;
+  }
+
+  context.last_imu_turn_update = robot::updateImuTurn(
+      context.imu_turn_state, imu_state.heading_deg,
+      imu_state.yaw_rate_dps, context.imu_turn_config,
+      hardwareDutyCap(), now_ms);
+  if (context.last_imu_turn_update.faulted) {
+    const bool timed_out =
+        context.imu_turn_state.fault_reason ==
+        robot::ImuTurnFaultReason::Timeout;
+    recordMotionDiagnostic(
+        context, front_left, front_right, rear_link, &imu,
+        timed_out ? robot::MotionDiagnosticEvent::ImuTurnTimedOut
+                  : robot::MotionDiagnosticEvent::ImuTurnFaulted,
+        now_ms);
+    // updateImuTurn already put the controller in Fault, so stop explicitly.
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    recordMotionDiagnostic(
+        context, front_left, front_right, rear_link, &imu,
+        robot::MotionDiagnosticEvent::OutputsDisabled, now_ms);
+    scheduleMotionDiagnosticFreeze(
+        context, timed_out
+                     ? robot::MotionDiagnosticTrigger::ImuTurnTimedOut
+                     : robot::MotionDiagnosticTrigger::ImuTurnFaulted);
+    setFault(context,
+             timed_out ? robot::FaultCode::SearchTimeout
+                       : robot::FaultCode::InvalidCommand,
+             timed_out ? "IMU turn stopped: overall timeout"
+                       : "IMU turn stopped: controller fault");
+    logEvent(context, now_ms, robot::EventSeverity::Fault,
+             robot::EventSource::System,
+             timed_out ? "IMU turn stopped: overall timeout"
+                       : "IMU turn stopped: controller fault");
+    return;
+  }
+
+  if (context.last_imu_turn_update.completed) {
+    recordMotionDiagnostic(
+        context, front_left, front_right, rear_link, &imu,
+        robot::MotionDiagnosticEvent::ImuTurnCompleted, now_ms);
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    recordMotionDiagnostic(
+        context, front_left, front_right, rear_link, &imu,
+        robot::MotionDiagnosticEvent::OutputsDisabled, now_ms);
+    scheduleMotionDiagnosticFreeze(
+        context, robot::MotionDiagnosticTrigger::ImuTurnCompleted);
+    clearFault(context);
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::System, "IMU turn complete");
+    return;
+  }
+
+  if (!context.last_imu_turn_update.should_rotate) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
+  const float signed_yaw_command =
+      context.last_imu_turn_update.rotation_command *
+      static_cast<float>(context.imu_turn_config.yaw_command_polarity);
+  const robot::FourWheelCommand wheels = robot::mixOpenLoopMecanum(
+      0.0F, 0.0F, signed_yaw_command < 0.0F ? -1.0F : 1.0F,
+      std::fabs(signed_yaw_command), now_ms,
+      context.config.remoteCommandTimeoutMs);
+  context.requested_command = wheels;
+  if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                         wheels, context.config, now_ms)) {
+    enterImuTurnFault(context, front_left, front_right, rear_link,
+                      robot::ImuTurnFaultReason::CommandFailed,
+                      robot::FaultCode::CommunicationStale,
+                      "IMU turn stopped: rear command failed",
+                      robot::EventSource::Uart, now_ms);
+    return;
+  }
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = false;
+  context.mode_expires_at_ms = 0U;
 }
 
 void printTelemetry(RuntimeContext& context,
@@ -3200,6 +3536,7 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
                            const RearCommandLink& rear_link,
                            const ClawServoBank& claws,
                            const DigitalActiveHighLimitSwitch& funnel_limit,
+                           const robot::esp2::ImuAcquisitionSnapshot& imu,
                            robot::TelemetrySnapshot& snapshot,
                            const robot::Milliseconds now_ms) {
   snapshot = {};
@@ -3226,6 +3563,99 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.free_heap_bytes = ESP.getFreeHeap();
   copyText(snapshot.reset_reason, sizeof(snapshot.reset_reason),
            resetReasonName(esp_reset_reason()));
+
+  const robot::esp2::ImuState& imu_state = imu.state;
+  const std::uint32_t now_us = micros();
+  snapshot.imu.configured = imu_state.configured;
+  snapshot.imu.initialized = imu_state.initialized;
+  snapshot.imu.calibrated = imu_state.calibrated;
+  snapshot.imu.data_fresh = robot::esp2::imuSnapshotFresh(
+      imu, now_us, kImuFreshnessTimeoutUs);
+  snapshot.imu.healthy = imu_state.healthy && snapshot.imu.data_fresh;
+  snapshot.imu.acquisition_running = imu.acquisition_running;
+  snapshot.imu.device_acknowledged =
+      imu_state.device_acknowledged;
+  snapshot.imu.register_reads_use_repeated_start =
+      imu_state.register_reads_use_repeated_start;
+  snapshot.imu.i2c_address = imu_state.address;
+  snapshot.imu.who_am_i = imu_state.who_am_i;
+  snapshot.imu.sda_gpio = imu_state.sda_gpio;
+  snapshot.imu.scl_gpio = imu_state.scl_gpio;
+  snapshot.imu.last_wire_status = imu_state.last_wire_status;
+  copyText(snapshot.imu.initialization_error,
+           sizeof(snapshot.imu.initialization_error),
+           robot::esp2::imuInitializationErrorName(
+               imu_state.initialization_error));
+  snapshot.imu.raw_gyro_z = imu_state.raw_gyro_z;
+  snapshot.imu.gyro_z_bias_dps = imu_state.gyro_z_bias_dps;
+  snapshot.imu.yaw_rate_dps = imu_state.yaw_rate_dps;
+  snapshot.imu.heading_deg = imu_state.heading_deg;
+  snapshot.imu.sample_age_ms =
+      imu_state.last_successful_read_us == 0U
+          ? 0U
+          : static_cast<robot::Milliseconds>(
+                (now_us - imu_state.last_successful_read_us) / 1000U);
+  snapshot.imu.snapshot_age_ms =
+      imu.published_at_us == 0U
+          ? 0U
+          : static_cast<robot::Milliseconds>(
+                (now_us - imu.published_at_us) / 1000U);
+  snapshot.imu.acquisition_duration_us =
+      imu.acquisition_duration_us;
+  snapshot.imu.maximum_completed_acquisition_duration_us =
+      imu.maximum_completed_acquisition_duration_us;
+  snapshot.imu.total_acquisition_attempts =
+      imu.total_acquisition_attempts;
+  snapshot.imu.last_successful_read_us =
+      imu_state.last_successful_read_us;
+  snapshot.imu.last_sample_interval_us =
+      imu_state.last_sample_interval_us;
+  snapshot.imu.successful_read_count =
+      imu.successful_acquisitions;
+  snapshot.imu.failed_read_count = imu.failed_acquisitions;
+  snapshot.imu.consecutive_failed_reads =
+      imu.consecutive_acquisition_failures;
+
+  snapshot.imu_turn.configuration_valid =
+      imuTurnRuntimeConfigValid(context.imu_turn_config);
+  snapshot.imu_turn.active =
+      robot::imuTurnActive(context.imu_turn_state);
+  snapshot.imu_turn.state = context.imu_turn_state.state;
+  snapshot.imu_turn.fault_reason =
+      context.imu_turn_state.fault_reason;
+  snapshot.imu_turn.maximum_rotation_duty =
+      context.imu_turn_config.maximum_rotation_duty;
+  snapshot.imu_turn.kp = context.imu_turn_config.kp;
+  snapshot.imu_turn.kd = context.imu_turn_config.kd;
+  snapshot.imu_turn.angle_tolerance_deg =
+      context.imu_turn_config.angle_tolerance_deg;
+  snapshot.imu_turn.maximum_finishing_yaw_rate_dps =
+      context.imu_turn_config.maximum_finishing_yaw_rate_dps;
+  snapshot.imu_turn.settling_time_ms =
+      context.imu_turn_config.settling_time_ms;
+  snapshot.imu_turn.timeout_ms = context.imu_turn_config.timeout_ms;
+  snapshot.imu_turn.yaw_command_polarity =
+      context.imu_turn_config.yaw_command_polarity;
+  snapshot.imu_turn.start_heading_deg =
+      context.imu_turn_state.start_heading_deg;
+  snapshot.imu_turn.current_heading_deg = imu_state.heading_deg;
+  snapshot.imu_turn.target_heading_deg =
+      context.imu_turn_state.target_heading_deg;
+  snapshot.imu_turn.relative_angle_deg =
+      context.imu_turn_state.relative_angle_deg;
+  snapshot.imu_turn.angle_error_deg =
+      context.imu_turn_state.target_heading_deg - imu_state.heading_deg;
+  snapshot.imu_turn.yaw_rate_dps = imu_state.yaw_rate_dps;
+  snapshot.imu_turn.proportional_term =
+      context.last_imu_turn_update.proportional_term;
+  snapshot.imu_turn.damping_term =
+      context.last_imu_turn_update.damping_term;
+  snapshot.imu_turn.rotation_command =
+      context.last_imu_turn_update.rotation_command;
+  snapshot.imu_turn.elapsed_ms =
+      context.last_imu_turn_update.elapsed_ms;
+  snapshot.imu_turn.settling_elapsed_ms =
+      context.last_imu_turn_update.settling_elapsed_ms;
 
   const bool time_trial_tower_active =
       context.modes.currentMode() == robot::RobotTestMode::TimeTrial &&
@@ -3769,7 +4199,8 @@ bool runtimeReady() {
          g_runtime.peg_finder_funnel_limit != nullptr &&
          g_runtime.front_left != nullptr && g_runtime.front_right != nullptr &&
          g_runtime.rear_link != nullptr && g_runtime.claws != nullptr &&
-         g_runtime.stepper != nullptr;
+         g_runtime.stepper != nullptr &&
+         g_runtime.imu_acquisition != nullptr;
 }
 
 robot::TelemetrySnapshot currentSnapshot() {
@@ -3778,7 +4209,9 @@ robot::TelemetrySnapshot currentSnapshot() {
     fillTelemetrySnapshot(*g_runtime.context, *g_runtime.sensors,
                           *g_runtime.front_left, *g_runtime.front_right,
                           *g_runtime.rear_link, *g_runtime.claws,
-                          *g_runtime.peg_finder_funnel_limit, snapshot,
+                          *g_runtime.peg_finder_funnel_limit,
+                          g_runtime.context->latest_imu_snapshot,
+                          snapshot,
                           static_cast<robot::Milliseconds>(millis()));
   }
   return snapshot;
@@ -3787,6 +4220,10 @@ robot::TelemetrySnapshot currentSnapshot() {
 void handleRoot();
 void handleStatus();
 void handleTelemetry();
+void handleImuSoakCountersReset();
+void handleDiagnostics();
+void handleDiagnosticsReset();
+void handleDiagnosticsFreeze();
 void handleStop();
 void handleMode();
 void handleDrive();
@@ -3803,6 +4240,11 @@ void handlePegFinderStart();
 void handlePegFinderConfig();
 void handleTimeTrialStart();
 void handleTimeTrialConfig();
+void handleImuTurnConfig();
+void handleImuTurnStart();
+void handleImuTurnStop();
+void handleImuAngleReset();
+void handleImuTurnSave();
 void handleLineFollowStart();
 void handleLineFollowStop();
 void handleLineFollowConfig();
@@ -3882,6 +4324,85 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Status</span><span id="ultrasonic1Status" class="mono"></span>
       <span>Echo pulse</span><span id="ultrasonic1Echo" class="mono"></span>
       <span>Sample age</span><span id="ultrasonic1Age" class="mono"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>IMU</h2>
+    <div class="muted">ESP2 MPU-6050-compatible sensor · read-only 10 ms soak monitoring. Reset affects only soak counters.</div>
+    <div class="kv">
+      <span>Configured</span><span id="imuConfigured" class="mono"></span>
+      <span>Initialized</span><span id="imuInitialized" class="mono"></span>
+      <span>Calibrated</span><span id="imuCalibrated" class="mono"></span>
+      <span>Acquisition task</span><span id="imuAcquisitionRunning" class="mono"></span>
+      <span>Health</span><span id="imuHealth" class="mono"></span>
+      <span>Initialization result</span><span id="imuInitializationError" class="mono"></span>
+      <span>SDA / SCL GPIO</span><span id="imuPins" class="mono"></span>
+      <span>Device ACK</span><span id="imuDeviceAck" class="mono"></span>
+      <span>Register-read mode</span><span id="imuReadMode" class="mono"></span>
+      <span>Last Wire status</span><span id="imuWireStatus" class="mono"></span>
+      <span>I2C address</span><span id="imuAddress" class="mono"></span>
+      <span>WHO_AM_I</span><span id="imuWhoAmI" class="mono"></span>
+      <span>Raw gyro Z</span><span id="imuRawGyroZ" class="mono"></span>
+      <span>Gyro Z bias</span><span id="imuBias" class="mono"></span>
+      <span>Yaw rate</span><span id="imuYawRate" class="mono"></span>
+      <span>Heading</span><span id="imuHeading" class="mono"></span>
+      <span>Sample age</span><span id="imuSampleAge" class="mono"></span>
+      <span>Snapshot age</span><span id="imuSnapshotAge" class="mono"></span>
+      <span>Acquisition duration</span><span id="imuAcquisitionDuration" class="mono"></span>
+      <span>Maximum completed acquisition duration</span><span id="imuMaxAcquisitionDuration" class="mono"></span>
+      <span>Total acquisition attempts</span><span id="imuTotalAttempts" class="mono"></span>
+      <span>Last successful-read timestamp</span><span id="imuLastSuccessfulReadUs" class="mono"></span>
+      <span>Sample interval</span><span id="imuSampleInterval" class="mono"></span>
+      <span>Reads OK / failed</span><span id="imuReadCounts" class="mono"></span>
+      <span>Consecutive failures</span><span id="imuConsecutiveFailures" class="mono"></span>
+    </div>
+    <div class="row">
+      <button onclick="imuSoakResetCounters()">Reset soak counters</button>
+      <button onclick="imuSoakRefresh()">Refresh values</button>
+      <span id="imuSoakResult" class="mono muted"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>IMU Turn Test</h2>
+    <div class="muted">Stage 2 manual test only. Motion is locked until every field is valid, the IMU is healthy, and the ESP1 rear-wheel link is fresh. Start with wheels raised.</div>
+    <div class="kv">
+      <span>Configuration</span><span id="imuTurnConfigValid" class="mono"></span>
+      <span>State</span><span id="imuTurnState" class="mono"></span>
+      <span>Fault</span><span id="imuTurnFault" class="mono"></span>
+      <span>Current angle</span><span id="imuTurnCurrentAngle" class="mono"></span>
+      <span>Start / target</span><span id="imuTurnHeadings" class="mono"></span>
+      <span>Angle error / yaw rate</span><span id="imuTurnErrorRate" class="mono"></span>
+      <span>P / damping</span><span id="imuTurnTerms" class="mono"></span>
+      <span>Rotation command</span><span id="imuTurnOutput" class="mono"></span>
+      <span>Elapsed / settling</span><span id="imuTurnTime" class="mono"></span>
+      <span>Last request</span><span id="imuTurnResult" class="mono muted">none</span>
+    </div>
+    <div class="two">
+      <label>Maximum rotation duty <input id="imuTurnMaxDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Kp (duty/degree) <input id="imuTurnKp" type="number" min="0.00001" step="0.001"></label>
+      <label>Kd (duty/(degree/second)) <input id="imuTurnKd" type="number" min="0" step="0.001"></label>
+      <label>Angle tolerance (degrees) <input id="imuTurnTolerance" type="number" min="0.001" step="0.1"></label>
+      <label>Maximum finishing yaw rate (degrees/second) <input id="imuTurnFinishRate" type="number" min="0.001" step="0.1"></label>
+      <label>Required settling time (ms) <input id="imuTurnSettleMs" type="number" min="1" step="10"></label>
+      <label>Overall turn timeout (ms) <input id="imuTurnTimeoutMs" type="number" min="2" max="30000" step="100"></label>
+      <label>Yaw command polarity
+        <select id="imuTurnPolarity">
+          <option value="0">unconfigured</option>
+          <option value="1">+1</option>
+          <option value="-1">-1</option>
+        </select>
+      </label>
+    </div>
+    <div class="muted">Polarity maps positive IMU heading to drivetrain yaw. Verify it with wheels raised: if a +90 request initially turns heading negative, stop and reverse this value.</div>
+    <div class="row">
+      <button onclick="imuTurnApply()">Apply</button>
+      <button onclick="imuTurnSave()">Save</button>
+      <button class="run" onclick="imuTurnStart(90)">Turn +90°</button>
+      <button class="run" onclick="imuTurnStart(-90)">Turn -90°</button>
+      <button class="warn" onclick="imuAngleReset()">Reset angle</button>
+      <button class="stop" onclick="imuTurnStop()">Stop</button>
     </div>
   </section>
 
@@ -4231,10 +4752,21 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 	    <pre id="funnel"></pre>
 	  </section>
 
-	  <section class="wide">
-    <h2>Recent Events</h2>
-    <pre id="events"></pre>
+  <section class="wide">
+    <h2>Motion Failure Diagnostics</h2>
+    <div class="muted">Reset before a raised-wheel reproduction. The trace is collected only while motion is active and is not polled automatically.</div>
+    <div class="row">
+      <button onclick="diagnosticsReset()">Reset before run</button>
+      <button onclick="diagnosticsRefresh()">Refresh after failure</button>
+      <button class="warn" onclick="diagnosticsFreeze()">Freeze capture</button>
+    </div>
+    <pre id="motionDiagnostics">No diagnostic report loaded.</pre>
   </section>
+
+  <section class="wide">
+	    <h2>Recent Events</h2>
+	    <pre id="events"></pre>
+	  </section>
 </main>
 <script>
 let holdTimer = null;
@@ -4245,6 +4777,7 @@ let solarLoaded = false;
 let towerLoaded = false;
 let pegFinderLoaded = false;
 let timeTrialLoaded = false;
+let imuTurnLoaded = false;
 function qs(id){ return document.getElementById(id); }
 function api(path){ return fetch(path).then(r => r.json().catch(() => ({})).then(j => ({ok:r.ok, status:r.status, json:j}))); }
 function stepperCommand(command, extra=''){ return api(`/api/stepper/command?command=${command}${extra}`); }
@@ -4300,8 +4833,25 @@ function updateStepper(){ fetch('/api/stepper').then(r=>r.json()).then(s=>{
 function stopAll(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; api('/api/stop'); }
 function drive(vx,vy,wz){
   const duty = Number(qs('driveDuty').value || 0);
-  const send = () => api(`/api/drive?vx=${vx}&vy=${vy}&wz=${wz}&duty=${duty}`);
-  send(); if (holdTimer) clearInterval(holdTimer); holdTimer=setInterval(send, 200);
+  const send = start => api(`/api/drive?vx=${vx}&vy=${vy}&wz=${wz}&duty=${duty}&hold-start=${start ? 1 : 0}`);
+  send(true); if (holdTimer) clearInterval(holdTimer); holdTimer=setInterval(() => send(false), 200);
+}
+function diagnosticsRefresh(){
+  return fetch('/api/diagnostics').then(r => r.json()).then(j => {
+    qs('motionDiagnostics').textContent = JSON.stringify(j, null, 2);
+    return j;
+  }).catch(() => { qs('motionDiagnostics').textContent = 'diagnostic request failed'; });
+}
+function diagnosticsReset(){
+  return api('/api/diagnostics/reset').then(r => {
+    qs('motionDiagnostics').textContent =
+      r.ok ? 'Capture reset. Run one test, then press Refresh after failure.' :
+             (r.json.error || `reset rejected (${r.status})`);
+    return r;
+  });
+}
+function diagnosticsFreeze(){
+  return api('/api/diagnostics/freeze').then(() => diagnosticsRefresh());
 }
 function motorCommand(speed){ api(`/api/motor?id=${qs('motorId').value}&speed=${speed}`); }
 function motorHold(sign){
@@ -4541,6 +5091,78 @@ async function timeTrialSave(){
   }
   return applied;
 }
+function loadImuTurnControls(j){
+  if (imuTurnLoaded || !j.imu_turn) return;
+  const t = j.imu_turn;
+  setLfValue('imuTurnMaxDuty', t.maximum_rotation_duty);
+  setLfValue('imuTurnKp', t.kp);
+  setLfValue('imuTurnKd', t.kd);
+  setLfValue('imuTurnTolerance', t.angle_tolerance_deg);
+  setLfValue('imuTurnFinishRate', t.maximum_finishing_yaw_rate_dps);
+  setLfValue('imuTurnSettleMs', t.settling_time_ms);
+  setLfValue('imuTurnTimeoutMs', t.timeout_ms);
+  setLfValue('imuTurnPolarity', t.yaw_command_polarity);
+  imuTurnLoaded = true;
+}
+function imuTurnParams(){
+  const p = new URLSearchParams();
+  p.set('max-duty', qs('imuTurnMaxDuty').value);
+  p.set('kp', qs('imuTurnKp').value);
+  p.set('kd', qs('imuTurnKd').value);
+  p.set('tolerance-deg', qs('imuTurnTolerance').value);
+  p.set('finish-rate-dps', qs('imuTurnFinishRate').value);
+  p.set('settle-ms', qs('imuTurnSettleMs').value);
+  p.set('timeout-ms', qs('imuTurnTimeoutMs').value);
+  p.set('polarity', qs('imuTurnPolarity').value);
+  return p;
+}
+function imuTurnShowResult(result){
+  qs('imuTurnResult').textContent =
+    result.ok ? (result.json.message || 'ok')
+              : (result.json.error || `HTTP ${result.status}`);
+  qs('imuTurnResult').className =
+    result.ok ? 'mono good' : 'mono bad';
+  return result;
+}
+function imuTurnApply(){
+  return api(`/api/imu-turn/config?${imuTurnParams().toString()}`)
+    .then(imuTurnShowResult);
+}
+async function imuTurnStart(degrees){
+  const applied = await imuTurnApply();
+  if (!applied.ok) return applied;
+  return api(`/api/imu-turn/start?degrees=${degrees}`)
+    .then(imuTurnShowResult);
+}
+async function imuTurnSave(){
+  const applied = await imuTurnApply();
+  if (!applied.ok) return applied;
+  return api('/api/imu-turn/save').then(imuTurnShowResult);
+}
+function imuTurnStop(){
+  return api('/api/imu-turn/stop').then(imuTurnShowResult);
+}
+function imuAngleReset(){
+  return api('/api/imu-turn/reset-angle').then(imuTurnShowResult);
+}
+function imuSoakRefresh(){
+  qs('imuSoakResult').textContent = 'refresh requested';
+  qs('imuSoakResult').className = 'mono muted';
+  update();
+}
+function imuSoakResetCounters(){
+  qs('imuSoakResult').textContent = 'reset request pending';
+  qs('imuSoakResult').className = 'mono muted';
+  return api('/api/imu/soak/reset-counters').then(result => {
+    qs('imuSoakResult').textContent =
+      result.ok ? (result.json.message || 'reset queued')
+                : (result.json.error || `HTTP ${result.status}`);
+    qs('imuSoakResult').className =
+      result.ok ? 'mono good' : 'mono bad';
+    if (result.ok) setTimeout(update, 30);
+    return result;
+  });
+}
 function loadSolarControls(j){
   if (solarLoaded || !j.autonomous) return;
   const a = j.autonomous;
@@ -4676,6 +5298,83 @@ function update(){
       ultrasonic1Fresh ? `${ultrasonic1.echo_duration_us ?? 0} µs` : '—';
     qs('ultrasonic1Age').textContent =
       ultrasonic1Fresh ? `${ultrasonic1.sample_age_ms ?? 0} ms` : '—';
+    const imu = j.imu || {};
+    const hexByte = value =>
+      `0x${Number(value ?? 0).toString(16).toUpperCase().padStart(2, '0')}`;
+    qs('imuConfigured').textContent = yn(imu.configured);
+    qs('imuInitialized').textContent = yn(imu.initialized);
+    qs('imuCalibrated').textContent = yn(imu.calibrated);
+    qs('imuAcquisitionRunning').textContent = yn(imu.acquisition_running);
+    qs('imuAcquisitionRunning').className =
+      imu.acquisition_running ? 'mono good' : 'mono bad';
+    qs('imuHealth').textContent =
+      `${imu.healthy ? 'healthy' : 'unhealthy'} / ${imu.data_fresh ? 'fresh' : 'stale'}`;
+    qs('imuHealth').className =
+      imu.healthy && imu.data_fresh ? 'mono good' : 'mono bad';
+    qs('imuInitializationError').textContent =
+      imu.initialization_error || 'UNKNOWN';
+    qs('imuInitializationError').className =
+      imu.initialization_error === 'NONE' ? 'mono good' : 'mono bad';
+    qs('imuPins').textContent =
+      `${imu.sda_gpio ?? -1} / ${imu.scl_gpio ?? -1}`;
+    qs('imuDeviceAck').textContent = yn(imu.device_acknowledged);
+    qs('imuDeviceAck').className =
+      imu.device_acknowledged ? 'mono good' : 'mono bad';
+    qs('imuReadMode').textContent =
+      imu.register_reads_use_repeated_start ? 'repeated start' : 'stop / start';
+    const wireStatus = imu.last_wire_status ?? -1;
+    const wireStatusNames = {
+      '-1':'no transaction', 0:'success', 1:'buffer overflow',
+      2:'address NACK', 3:'data NACK', 4:'other error', 5:'timeout'
+    };
+    qs('imuWireStatus').textContent =
+      `${wireStatus} (${wireStatusNames[wireStatus] || 'unknown'})`;
+    qs('imuAddress').textContent = hexByte(imu.i2c_address);
+    qs('imuWhoAmI').textContent = hexByte(imu.who_am_i);
+    qs('imuRawGyroZ').textContent = imu.raw_gyro_z ?? 0;
+    qs('imuBias').textContent = `${Number(imu.gyro_z_bias_dps ?? 0).toFixed(4)} °/s`;
+    qs('imuYawRate').textContent = `${Number(imu.yaw_rate_dps ?? 0).toFixed(3)} °/s`;
+    qs('imuHeading').textContent = `${Number(imu.heading_deg ?? 0).toFixed(2)}°`;
+    qs('imuSampleAge').textContent = `${imu.sample_age_ms ?? 0} ms`;
+    qs('imuSnapshotAge').textContent = `${imu.snapshot_age_ms ?? 0} ms`;
+    qs('imuAcquisitionDuration').textContent =
+      `${imu.acquisition_duration_us ?? 0} µs`;
+    qs('imuMaxAcquisitionDuration').textContent =
+      `${imu.maximum_completed_acquisition_duration_us ?? 0} µs`;
+    qs('imuTotalAttempts').textContent =
+      imu.total_acquisition_attempts ?? 0;
+    qs('imuLastSuccessfulReadUs').textContent =
+      `${imu.last_successful_read_us ?? 0} µs`;
+    qs('imuSampleInterval').textContent =
+      `${imu.last_sample_interval_us ?? 0} µs`;
+    qs('imuReadCounts').textContent =
+      `${imu.successful_read_count ?? 0} / ${imu.failed_read_count ?? 0}`;
+    qs('imuConsecutiveFailures').textContent =
+      imu.consecutive_failed_reads ?? 0;
+    const imuTurn = j.imu_turn || {};
+    loadImuTurnControls(j);
+    qs('imuTurnConfigValid').textContent =
+      imuTurn.configuration_valid ? 'valid' : 'incomplete / locked';
+    qs('imuTurnConfigValid').className =
+      imuTurn.configuration_valid ? 'mono good' : 'mono bad';
+    qs('imuTurnState').textContent =
+      `${imuTurn.state || 'IDLE'} active=${yn(imuTurn.active)}`;
+    qs('imuTurnFault').textContent =
+      imuTurn.fault_reason || 'NONE';
+    qs('imuTurnFault').className =
+      (imuTurn.fault_reason || 'NONE') === 'NONE' ? 'mono good' : 'mono bad';
+    qs('imuTurnCurrentAngle').textContent =
+      `${Number(imuTurn.current_heading_deg ?? 0).toFixed(2)}°`;
+    qs('imuTurnHeadings').textContent =
+      `${Number(imuTurn.start_heading_deg ?? 0).toFixed(2)}° / ${Number(imuTurn.target_heading_deg ?? 0).toFixed(2)}°`;
+    qs('imuTurnErrorRate').textContent =
+      `${Number(imuTurn.angle_error_deg ?? 0).toFixed(2)}° / ${Number(imuTurn.yaw_rate_dps ?? 0).toFixed(2)} °/s`;
+    qs('imuTurnTerms').textContent =
+      `${Number(imuTurn.proportional_term ?? 0).toFixed(4)} / ${Number(imuTurn.damping_term ?? 0).toFixed(4)}`;
+    qs('imuTurnOutput').textContent =
+      Number(imuTurn.rotation_command ?? 0).toFixed(4);
+    qs('imuTurnTime').textContent =
+      `${imuTurn.elapsed_ms ?? 0} ms / ${imuTurn.settling_elapsed_ms ?? 0} ms`;
     const a = j.autonomous || {};
     qs('autoState').textContent = a.state || j.autonomous_state || 'WAIT_FOR_START';
     qs('autoFault').textContent = a.fault_reason || 'NONE';
@@ -4806,6 +5505,77 @@ void handleTelemetry() {
   g_server.send(200, "application/json", g_json_buffer);
 }
 
+void handleImuSoakCountersReset() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  if (!g_runtime.imu_acquisition->requestSoakCountersReset()) {
+    sendErrorJson(503, "IMU acquisition command queue unavailable");
+    return;
+  }
+  sendOkJson("IMU soak counter reset queued");
+}
+
+void handleDiagnostics() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  if (!context.motion_diagnostics.frozen()) {
+    const robot::Milliseconds now_ms =
+        static_cast<robot::Milliseconds>(millis());
+    recordMotionDiagnostic(
+        context, *g_runtime.front_left, *g_runtime.front_right,
+        *g_runtime.rear_link, &context.latest_imu_snapshot,
+        robot::MotionDiagnosticEvent::Periodic, now_ms);
+    context.motion_diagnostics.freeze(
+        robot::MotionDiagnosticTrigger::ManualFreeze, now_ms);
+  }
+  if (!robot::writeMotionDiagnosticsJson(
+          context.motion_diagnostics, g_json_buffer,
+          sizeof(g_json_buffer))) {
+    sendErrorJson(500, "diagnostic json overflow");
+    return;
+  }
+  g_server.sendHeader("Cache-Control", "no-store, max-age=0");
+  g_server.send(200, "application/json", g_json_buffer);
+}
+
+void handleDiagnosticsReset() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  resetMotionDiagnosticCapture(context, now_ms);
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::Periodic, now_ms);
+  sendOkJson("motion diagnostics reset");
+}
+
+void handleDiagnosticsFreeze() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::Periodic, now_ms);
+  context.motion_diagnostics.freeze(
+      robot::MotionDiagnosticTrigger::ManualFreeze, now_ms);
+  sendOkJson("motion diagnostics frozen");
+}
+
 void handleStop() {
   if (!runtimeReady()) {
     sendErrorJson(503, "runtime not ready");
@@ -4813,9 +5583,20 @@ void handleStop() {
   }
   const robot::Milliseconds now_ms =
       static_cast<robot::Milliseconds>(millis());
+  RuntimeContext& context = *g_runtime.context;
+  context.motion_diagnostics.noteWebStop(now_ms);
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::WebStop, now_ms);
+  context.diagnostic_web_stop_seen = true;
   emergencyStop(*g_runtime.context, *g_runtime.front_left,
                 *g_runtime.front_right, *g_runtime.rear_link, now_ms,
                 robot::EventSource::Web);
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::OutputsDisabled, now_ms);
   sendOkJson("stopped");
 }
 
@@ -4844,6 +5625,7 @@ void handleMode() {
   resetTowerPieces(*g_runtime.context, now_ms);
   resetPegFinder(*g_runtime.context, now_ms);
   resetTimeTrial(*g_runtime.context, now_ms);
+  resetImuTurn(*g_runtime.context);
   clearFault(*g_runtime.context);
   logEvent(*g_runtime.context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Web, "mode changed");
@@ -4862,10 +5644,13 @@ void handleDrive() {
   float vy = 0.0F;
   float wz = 0.0F;
   float duty = 0.0F;
+  int hold_start_value = 0;
   if (!argFloat("vx", vx, 0.0F, true) ||
       !argFloat("vy", vy, 0.0F, true) ||
       !argFloat("wz", wz, 0.0F, true) ||
-      !argFloat("duty", duty, 0.0F, true)) {
+      !argFloat("duty", duty, 0.0F, true) ||
+      !argSigned("hold-start", hold_start_value, 0, false) ||
+      (hold_start_value != 0 && hold_start_value != 1)) {
     sendErrorJson(400, "malformed drive argument");
     return;
   }
@@ -4909,11 +5694,29 @@ void handleDrive() {
     return;
   }
 
+  const bool starts_new_hold = hold_start_value == 1;
+  if (starts_new_hold) {
+    resetMotionDiagnosticCapture(context, now_ms);
+  }
+  const bool arrived_after_stop =
+      !starts_new_hold && context.diagnostic_web_stop_seen;
+  context.motion_diagnostics.noteWebDrive(
+      now_ms, starts_new_hold, arrived_after_stop);
+
   context.requested_command =
       makeManualDriveCommand(context, vx, vy, wz, duty, now_ms);
   context.last_command_ms = now_ms;
   context.command_deadman_armed = true;
   context.mode_expires_at_ms = now_ms + kCommandTimeoutMs;
+  if (starts_new_hold || arrived_after_stop) {
+    recordMotionDiagnostic(
+        context, *g_runtime.front_left, *g_runtime.front_right,
+        *g_runtime.rear_link, &context.latest_imu_snapshot,
+        starts_new_hold
+            ? robot::MotionDiagnosticEvent::WebDriveStart
+            : robot::MotionDiagnosticEvent::WebDriveHeartbeatAfterStop,
+        now_ms);
+  }
   clearFault(context);
   sendOkJson("drive command accepted");
 }
@@ -5815,6 +6618,283 @@ void handleTimeTrialConfig() {
            robot::EventSeverity::Info, robot::EventSource::Web,
            "Time Trial transition config updated");
   sendOkJson("Time Trial transition config updated");
+}
+
+void handleImuTurnConfig() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  if (robot::imuTurnActive(context.imu_turn_state)) {
+    sendErrorJson(409, "stop the active IMU turn before changing tuning");
+    return;
+  }
+
+  robot::ImuTurnConfig next = context.imu_turn_config;
+  if (g_server.hasArg("max-duty") &&
+      !argFloat("max-duty", next.maximum_rotation_duty,
+                next.maximum_rotation_duty, true)) {
+    sendErrorJson(400, "malformed max-duty");
+    return;
+  }
+  if (g_server.hasArg("kp") &&
+      !argFloat("kp", next.kp, next.kp, true)) {
+    sendErrorJson(400, "malformed kp");
+    return;
+  }
+  if (g_server.hasArg("kd") &&
+      !argFloat("kd", next.kd, next.kd, true)) {
+    sendErrorJson(400, "malformed kd");
+    return;
+  }
+  if (g_server.hasArg("tolerance-deg") &&
+      !argFloat("tolerance-deg", next.angle_tolerance_deg,
+                next.angle_tolerance_deg, true)) {
+    sendErrorJson(400, "malformed tolerance-deg");
+    return;
+  }
+  if (g_server.hasArg("finish-rate-dps") &&
+      !argFloat("finish-rate-dps",
+                next.maximum_finishing_yaw_rate_dps,
+                next.maximum_finishing_yaw_rate_dps, true)) {
+    sendErrorJson(400, "malformed finish-rate-dps");
+    return;
+  }
+  if (g_server.hasArg("settle-ms") &&
+      !argUnsigned("settle-ms", next.settling_time_ms,
+                   next.settling_time_ms, true)) {
+    sendErrorJson(400, "malformed settle-ms");
+    return;
+  }
+  if (g_server.hasArg("timeout-ms") &&
+      !argUnsigned("timeout-ms", next.timeout_ms, next.timeout_ms, true)) {
+    sendErrorJson(400, "malformed timeout-ms");
+    return;
+  }
+  if (g_server.hasArg("polarity") &&
+      !argPolarity("polarity", next.yaw_command_polarity,
+                   next.yaw_command_polarity, true)) {
+    sendErrorJson(400, "polarity must be +1 or -1");
+    return;
+  }
+
+  if (!imuTurnRuntimeConfigValid(next)) {
+    sendErrorJson(
+        409,
+        "IMU turn tuning incomplete: duty/Kp/tolerances/times must be positive, Kd nonnegative, timeout greater than settling and at most 30000 ms, duty within hardware cap, and polarity +1 or -1");
+    return;
+  }
+
+  context.imu_turn_config = next;
+  clearFault(context);
+  logEvent(context, static_cast<robot::Milliseconds>(millis()),
+           robot::EventSeverity::Info, robot::EventSource::Web,
+           "IMU turn tuning updated");
+  sendOkJson("IMU turn tuning updated");
+}
+
+void handleImuTurnStart() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  float relative_angle_deg = 0.0F;
+  if (!argFloat("degrees", relative_angle_deg, 0.0F, true) ||
+      (relative_angle_deg != 90.0F &&
+       relative_angle_deg != -90.0F)) {
+    sendErrorJson(400, "degrees must be +90 or -90");
+    return;
+  }
+
+  // A rejected turn request must not allow a previously active mode to resume.
+  disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
+                   *g_runtime.rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::ImuTurnTest, now_ms);
+  resetSolarPanelAutonomy(context, now_ms);
+  resetTowerPieces(context, now_ms);
+  resetPegFinder(context, now_ms);
+  resetTimeTrial(context, now_ms);
+  resetImuTurn(context);
+
+  if (!imuTurnRuntimeConfigValid(context.imu_turn_config)) {
+    robot::faultImuTurn(
+        context.imu_turn_state,
+        robot::ImuTurnFaultReason::InvalidConfiguration);
+    setFault(context, robot::FaultCode::InvalidCommand,
+             "IMU turn tuning is incomplete");
+    sendErrorJson(409, "IMU turn tuning is incomplete");
+    return;
+  }
+
+  const robot::esp2::ImuAcquisitionSnapshot& imu_snapshot =
+      context.latest_imu_snapshot;
+  const robot::esp2::ImuState& imu_state = imu_snapshot.state;
+  if (context.imu_heading_reset_pending_sequence != 0U) {
+    sendErrorJson(409, "IMU angle reset is still being applied");
+    return;
+  }
+  if (!imu_state.configured || !imu_state.initialized ||
+      !imu_state.calibrated || !imu_state.healthy ||
+      !robot::esp2::imuSnapshotFresh(
+          imu_snapshot, micros(), kImuFreshnessTimeoutUs)) {
+    robot::faultImuTurn(context.imu_turn_state,
+                        robot::ImuTurnFaultReason::ImuUnavailable);
+    setFault(context, robot::FaultCode::HardwareNotConfigured,
+             "IMU turn unavailable: IMU unhealthy");
+    sendErrorJson(409, "IMU turn unavailable: IMU unhealthy or stale");
+    return;
+  }
+  if (!g_runtime.front_left->configured() ||
+      !g_runtime.front_right->configured()) {
+    robot::faultImuTurn(context.imu_turn_state,
+                        robot::ImuTurnFaultReason::CommandFailed);
+    setFault(context, robot::FaultCode::HardwareNotConfigured,
+             "IMU turn unavailable: front motors invalid");
+    sendErrorJson(409, "IMU turn unavailable: front motors invalid");
+    return;
+  }
+  if (!g_runtime.rear_link->configured() ||
+      !g_runtime.rear_link->remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config))) {
+    robot::faultImuTurn(
+        context.imu_turn_state,
+        robot::ImuTurnFaultReason::RearLinkUnavailable);
+    setFault(context, robot::FaultCode::CommunicationStale,
+             "IMU turn unavailable: rear link unhealthy");
+    sendErrorJson(409, "IMU turn unavailable: rear link unhealthy");
+    return;
+  }
+
+  if (!robot::startImuTurn(
+          context.imu_turn_state, imu_state.heading_deg,
+          relative_angle_deg, context.imu_turn_config,
+          hardwareDutyCap(), now_ms)) {
+    setFault(context, robot::FaultCode::InvalidCommand,
+             "IMU turn controller rejected start");
+    sendErrorJson(409, "IMU turn controller rejected start");
+    return;
+  }
+
+  context.last_imu_turn_update = {};
+  context.last_imu_turn_update.state = context.imu_turn_state.state;
+  context.last_imu_turn_update.current_heading_deg =
+      imu_state.heading_deg;
+  context.last_imu_turn_update.target_heading_deg =
+      context.imu_turn_state.target_heading_deg;
+  context.last_imu_turn_update.angle_error_deg = relative_angle_deg;
+  context.last_imu_turn_update.yaw_rate_dps = imu_state.yaw_rate_dps;
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = false;
+  context.mode_expires_at_ms = 0U;
+  resetMotionDiagnosticCapture(context, now_ms);
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::ImuTurnStarted, now_ms);
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web,
+           relative_angle_deg > 0.0F
+               ? "IMU +90 degree turn started"
+               : "IMU -90 degree turn started");
+  sendOkJson(relative_angle_deg > 0.0F
+                 ? "IMU +90 degree turn started"
+                 : "IMU -90 degree turn started");
+}
+
+void handleImuTurnStop() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::ImuTurnStopped, now_ms);
+  disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
+                   *g_runtime.rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::ImuTurnTest, now_ms);
+  resetSolarPanelAutonomy(context, now_ms);
+  resetTowerPieces(context, now_ms);
+  resetPegFinder(context, now_ms);
+  resetTimeTrial(context, now_ms);
+  robot::stopImuTurn(context.imu_turn_state);
+  context.last_imu_turn_update = {};
+  context.last_imu_turn_update.state = context.imu_turn_state.state;
+  recordMotionDiagnostic(
+      context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, &context.latest_imu_snapshot,
+      robot::MotionDiagnosticEvent::OutputsDisabled, now_ms);
+  scheduleMotionDiagnosticFreeze(
+      context, robot::MotionDiagnosticTrigger::ManualFreeze);
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Warn,
+           robot::EventSource::Web, "IMU turn stopped");
+  sendOkJson("IMU turn stopped");
+}
+
+void handleImuAngleReset() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  if (robot::imuTurnActive(context.imu_turn_state)) {
+    sendErrorJson(409, "stop the active IMU turn before resetting angle");
+    return;
+  }
+
+  std::uint32_t reset_sequence = 0U;
+  if (!g_runtime.imu_acquisition->requestHeadingReset(
+          0.0F, reset_sequence)) {
+    sendErrorJson(503, "IMU acquisition task is unavailable");
+    return;
+  }
+  context.imu_heading_reset_pending_sequence = reset_sequence;
+  resetImuTurn(context);
+  if (context.modes.currentMode() ==
+      robot::RobotTestMode::ImuTurnTest) {
+    clearFault(context);
+  }
+  logEvent(context, static_cast<robot::Milliseconds>(millis()),
+           robot::EventSeverity::Info, robot::EventSource::Web,
+           "IMU relative heading reset requested");
+  sendOkJson("IMU angle reset queued");
+}
+
+void handleImuTurnSave() {
+  if (!runtimeReady() || g_runtime.preferences == nullptr) {
+    sendErrorJson(503, "preferences unavailable");
+    return;
+  }
+  const robot::ImuTurnConfig& config =
+      g_runtime.context->imu_turn_config;
+  if (!imuTurnRuntimeConfigValid(config)) {
+    sendErrorJson(409, "apply valid IMU turn tuning before saving");
+    return;
+  }
+  g_runtime.preferences->putFloat("itmax",
+                                  config.maximum_rotation_duty);
+  g_runtime.preferences->putFloat("itkp", config.kp);
+  g_runtime.preferences->putFloat("itkd", config.kd);
+  g_runtime.preferences->putFloat("ittol",
+                                  config.angle_tolerance_deg);
+  g_runtime.preferences->putFloat(
+      "itrate", config.maximum_finishing_yaw_rate_dps);
+  g_runtime.preferences->putUInt("itsettle",
+                                 config.settling_time_ms);
+  g_runtime.preferences->putUInt("ittimeout", config.timeout_ms);
+  g_runtime.preferences->putInt("itpol", config.yaw_command_polarity);
+  sendOkJson("IMU turn tuning saved");
 }
 
 bool parseClawId(std::size_t& claw_index) {
@@ -6817,6 +7897,13 @@ void setupWebHandlers() {
   g_server.on("/", HTTP_GET, handleRoot);
   g_server.on("/api/status", HTTP_GET, handleStatus);
   g_server.on("/api/telemetry", HTTP_GET, handleTelemetry);
+  g_server.on("/api/imu/soak/reset-counters", HTTP_ANY,
+              handleImuSoakCountersReset);
+  g_server.on("/api/diagnostics", HTTP_GET, handleDiagnostics);
+  g_server.on("/api/diagnostics/reset", HTTP_ANY,
+              handleDiagnosticsReset);
+  g_server.on("/api/diagnostics/freeze", HTTP_ANY,
+              handleDiagnosticsFreeze);
   g_server.on("/api/stop", HTTP_ANY, handleStop);
   g_server.on("/api/mode", HTTP_ANY, handleMode);
   g_server.on("/api/drive", HTTP_ANY, handleDrive);
@@ -6841,6 +7928,12 @@ void setupWebHandlers() {
               handleTimeTrialStart);
   g_server.on("/api/autonomous/time-trial/config", HTTP_ANY,
               handleTimeTrialConfig);
+  g_server.on("/api/imu-turn/config", HTTP_ANY, handleImuTurnConfig);
+  g_server.on("/api/imu-turn/start", HTTP_ANY, handleImuTurnStart);
+  g_server.on("/api/imu-turn/stop", HTTP_ANY, handleImuTurnStop);
+  g_server.on("/api/imu-turn/reset-angle", HTTP_ANY,
+              handleImuAngleReset);
+  g_server.on("/api/imu-turn/save", HTTP_ANY, handleImuTurnSave);
   g_server.on("/api/line-follow/start", HTTP_ANY, handleLineFollowStart);
   g_server.on("/api/line-follow/stop", HTTP_ANY, handleLineFollowStop);
   g_server.on("/api/line-follow/config", HTTP_ANY, handleLineFollowConfig);
@@ -7922,6 +9015,29 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       preferences.getBool("lftele", context.config.telemetryEnabled);
   context.config.steeringPolarity =
       preferences.getInt("pol", context.config.steeringPolarity) < 0 ? -1 : 1;
+  context.imu_turn_config.maximum_rotation_duty =
+      preferences.getFloat(
+          "itmax", context.imu_turn_config.maximum_rotation_duty);
+  context.imu_turn_config.kp =
+      preferences.getFloat("itkp", context.imu_turn_config.kp);
+  context.imu_turn_config.kd =
+      preferences.getFloat("itkd", context.imu_turn_config.kd);
+  context.imu_turn_config.angle_tolerance_deg =
+      preferences.getFloat(
+          "ittol", context.imu_turn_config.angle_tolerance_deg);
+  context.imu_turn_config.maximum_finishing_yaw_rate_dps =
+      preferences.getFloat(
+          "itrate",
+          context.imu_turn_config.maximum_finishing_yaw_rate_dps);
+  context.imu_turn_config.settling_time_ms =
+      preferences.getUInt(
+          "itsettle", context.imu_turn_config.settling_time_ms);
+  context.imu_turn_config.timeout_ms =
+      preferences.getUInt(
+          "ittimeout", context.imu_turn_config.timeout_ms);
+  context.imu_turn_config.yaw_command_polarity =
+      preferences.getInt(
+          "itpol", context.imu_turn_config.yaw_command_polarity);
   // First-time rear settings inherit the current front settings, then become
   // independently persistent under their own NVS keys.
   context.rear_config = context.config;
@@ -8265,6 +9381,7 @@ void motionControlTask(void* parameters) {
                       robot::esp2::kHardwareConfig.servo_claw_2,
                       robot::esp2::kHardwareConfig.servo_claw_3,
                       robot::esp2::kHardwareConfig.servo_winch};
+  static robot::esp2::ImuAcquisitionService imu_acquisition{};
   Preferences preferences{};
 
   line_sensor_reader.initialize();
@@ -8275,6 +9392,75 @@ void motionControlTask(void* parameters) {
   stepper.begin();
   claws.initializeDisabled();
 
+  // An ESP2-only reboot can occur while ESP1 still holds a fresh rear-wheel or
+  // funnel command. Send disabled commands twice, separated by two ESP1 drive
+  // task periods, before measuring a stationary gyro bias. Front motors and
+  // ESP2 mechanisms have already been initialized disabled above.
+  robot::Milliseconds startup_now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  (void)sendStoppedRearCommand(rear_link, context.config, startup_now_ms);
+  (void)sendStoppedFunnelCommand(rear_link, context.config, startup_now_ms);
+  delay(kPreCalibrationStopSettleMs);
+  startup_now_ms = static_cast<robot::Milliseconds>(millis());
+  (void)sendStoppedRearCommand(rear_link, context.config, startup_now_ms);
+  (void)sendStoppedFunnelCommand(rear_link, context.config, startup_now_ms);
+
+  const bool imu_ready = imu_acquisition.initialize(
+      Wire, robot::esp2::kPins.imu_sda, robot::esp2::kPins.imu_scl,
+      kImuI2cAddress, kImuCalibrationSampleCount);
+  (void)imu_acquisition.latest(context.latest_imu_snapshot);
+  const robot::esp2::ImuState& startup_imu_state =
+      context.latest_imu_snapshot.state;
+  char imu_event_message[robot::kEventMessageSize]{};
+  if (startup_imu_state.initialized) {
+    std::snprintf(imu_event_message, sizeof(imu_event_message),
+                  "IMU initialized: WHO_AM_I=0x%02X",
+                  static_cast<unsigned>(startup_imu_state.who_am_i));
+    logEvent(context, static_cast<robot::Milliseconds>(millis()),
+             robot::EventSeverity::Info, robot::EventSource::System,
+             imu_event_message);
+    if (startup_imu_state.calibrated) {
+      logEvent(context, static_cast<robot::Milliseconds>(millis()),
+               robot::EventSeverity::Info, robot::EventSource::System,
+               "IMU gyro Z calibration succeeded");
+    } else {
+      logEvent(context, static_cast<robot::Milliseconds>(millis()),
+             robot::EventSeverity::Warn, robot::EventSource::System,
+             "IMU gyro Z calibration failed");
+    }
+  } else {
+    if (!startup_imu_state.configured) {
+      std::snprintf(imu_event_message, sizeof(imu_event_message),
+                    "IMU not configured: SDA/SCL unassigned");
+    } else {
+      std::snprintf(imu_event_message, sizeof(imu_event_message),
+                    "IMU init failed: %s id=0x%02X wire=%d",
+                    robot::esp2::imuInitializationErrorName(
+                        startup_imu_state.initialization_error),
+                    static_cast<unsigned>(startup_imu_state.who_am_i),
+                    startup_imu_state.last_wire_status);
+    }
+    logEvent(context, static_cast<robot::Milliseconds>(millis()),
+             robot::EventSeverity::Warn, robot::EventSource::System,
+             imu_event_message);
+  }
+  const bool imu_acquisition_started =
+      imu_ready &&
+      imu_acquisition.start(kDefaultMotionTaskPeriodMs,
+                            kSensorAcquisitionTaskPriority,
+                            kSensorAcquisitionTaskCore);
+  if (imu_ready && !imu_acquisition_started) {
+    logEvent(context, static_cast<robot::Milliseconds>(millis()),
+             robot::EventSeverity::Warn, robot::EventSource::System,
+             "IMU sensor acquisition task failed to start");
+  }
+  (void)imu_acquisition.latest(context.latest_imu_snapshot);
+  context.imu_health_observed = true;
+  context.imu_was_healthy =
+      context.latest_imu_snapshot.state.healthy &&
+      robot::esp2::imuSnapshotFresh(
+          context.latest_imu_snapshot, micros(), kImuFreshnessTimeoutUs);
+
   preferences.begin("telemetry", false);
   loadPreferences(preferences, context, front_left_motor, front_right_motor,
                   claws);
@@ -8282,10 +9468,11 @@ void motionControlTask(void* parameters) {
   resetTowerPieces(context, static_cast<robot::Milliseconds>(millis()));
   resetPegFinder(context, static_cast<robot::Milliseconds>(millis()));
   resetTimeTrial(context, static_cast<robot::Milliseconds>(millis()));
+  resetImuTurn(context);
 
   g_runtime = {&context, &line_sensor_reader, &peg_finder_funnel_limit,
                &front_left_motor, &front_right_motor, &rear_link, &claws,
-               &stepper, &preferences};
+               &stepper, &imu_acquisition, &preferences};
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(kApSsid, kApPassword);
@@ -8294,13 +9481,54 @@ void motionControlTask(void* parameters) {
   logEvent(context, static_cast<robot::Milliseconds>(millis()),
            robot::EventSeverity::Info, robot::EventSource::System,
            "telemetry web server started");
+  resetMotionDiagnosticCapture(
+      context, static_cast<robot::Milliseconds>(millis()));
 
   TickType_t last_wake_tick = xTaskGetTickCount();
+  std::uint32_t previous_loop_started_us = 0U;
 
   for (;;) {
+    const std::uint32_t loop_started_us = micros();
+    context.diagnostic_loop_started_us = loop_started_us;
+    context.diagnostic_loop_interval_us =
+        previous_loop_started_us == 0U
+            ? 0U
+            : static_cast<std::uint32_t>(
+                  loop_started_us - previous_loop_started_us);
+    previous_loop_started_us = loop_started_us;
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
+    (void)imu_acquisition.latest(context.latest_imu_snapshot);
+    context.diagnostic_imu_update_us =
+        context.latest_imu_snapshot.acquisition_duration_us;
+    if (context.imu_heading_reset_pending_sequence != 0U &&
+        context.latest_imu_snapshot.last_heading_reset_sequence ==
+            context.imu_heading_reset_pending_sequence) {
+      context.imu_heading_reset_pending_sequence = 0U;
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::System,
+               "IMU relative heading reset applied");
+    }
+    const bool imu_healthy =
+        context.latest_imu_snapshot.state.healthy &&
+        robot::esp2::imuSnapshotFresh(
+            context.latest_imu_snapshot, micros(),
+            kImuFreshnessTimeoutUs);
+    if (context.imu_health_observed &&
+        imu_healthy != context.imu_was_healthy) {
+      logEvent(context, now_ms,
+               imu_healthy ? robot::EventSeverity::Info
+                           : robot::EventSeverity::Warn,
+               robot::EventSource::System,
+               imu_healthy ? "IMU recovered"
+                           : "IMU became unhealthy");
+    }
+    context.imu_health_observed = true;
+    context.imu_was_healthy = imu_healthy;
+    const std::uint32_t web_started_us = micros();
     g_server.handleClient();
+    context.diagnostic_web_handle_us =
+        static_cast<std::uint32_t>(micros() - web_started_us);
     stepper.update();
     peg_finder_funnel_limit.update();
     rear_link.pollReceive(now_ms);
@@ -8331,8 +9559,25 @@ void motionControlTask(void* parameters) {
          context.modes.currentMode() ==
              robot::RobotTestMode::DistributedDriveTest);
     if (timed_mode_expired || stale_command) {
+      const robot::Milliseconds diagnostic_now_ms =
+          static_cast<robot::Milliseconds>(millis());
+      recordMotionDiagnostic(
+          context, front_left_motor, front_right_motor, rear_link,
+          &context.latest_imu_snapshot,
+          robot::MotionDiagnosticEvent::CommandDeadmanExpired,
+          diagnostic_now_ms);
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
                        now_ms);
+      recordMotionDiagnostic(
+          context, front_left_motor, front_right_motor, rear_link,
+          &context.latest_imu_snapshot,
+          robot::MotionDiagnosticEvent::OutputsDisabled,
+          diagnostic_now_ms);
+      scheduleMotionDiagnosticFreeze(
+          context,
+          context.motion_diagnostics.driveAfterStopCount() > 0U
+              ? robot::MotionDiagnosticTrigger::DriveHeartbeatAfterStop
+              : robot::MotionDiagnosticTrigger::CommandDeadmanExpired);
       logEvent(context, now_ms, robot::EventSeverity::Warn,
                robot::EventSource::System,
                stale_command ? "command deadman expired"
@@ -8361,6 +9606,10 @@ void motionControlTask(void* parameters) {
         context.time_trial.state != robot::TimeTrialState::WaitForStart) {
       resetTimeTrial(context, now_ms);
     }
+    if (mode != robot::RobotTestMode::ImuTurnTest &&
+        context.imu_turn_state.state != robot::ImuTurnState::Idle) {
+      resetImuTurn(context);
+    }
     if (robot::robotTestModeIsSensorOnly(mode)) {
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
                        now_ms);
@@ -8370,6 +9619,9 @@ void motionControlTask(void* parameters) {
       } else if (mode == robot::RobotTestMode::RearLineSensorTest) {
         runRearSensorOnlyTelemetry(context, rear_link, now_ms);
       }
+    } else if (mode == robot::RobotTestMode::ImuTurnTest) {
+      runImuTurnTest(context, front_left_motor, front_right_motor,
+                     rear_link, context.latest_imu_snapshot, now_ms);
     } else if (mode == robot::RobotTestMode::AutonomousSolarPanel) {
       runSolarPanelAutonomy(context, line_sensor_reader, front_left_motor,
                             front_right_motor, rear_link, now_ms);
@@ -8505,13 +9757,53 @@ void motionControlTask(void* parameters) {
         mode == robot::RobotTestMode::PegFinder ||
         time_trial_rear_phase;
     const robot::Milliseconds configured_period_ms =
-        rear_line_mode ? context.rear_config.controlPeriodMs
-                       : context.config.controlPeriodMs;
+        mode == robot::RobotTestMode::ImuTurnTest
+            ? kDefaultMotionTaskPeriodMs
+            : (rear_line_mode ? context.rear_config.controlPeriodMs
+                              : context.config.controlPeriodMs);
+    const robot::Milliseconds effective_period_ms =
+        configured_period_ms == 0U ? kDefaultMotionTaskPeriodMs
+                                   : configured_period_ms;
+    const std::uint32_t loop_work_us =
+        static_cast<std::uint32_t>(micros() - loop_started_us);
+    context.motion_diagnostics.observeLoop(
+        context.diagnostic_loop_interval_us, loop_work_us,
+        context.diagnostic_imu_update_us,
+        context.diagnostic_web_handle_us, effective_period_ms);
+
+    const robot::Milliseconds diagnostic_now_ms =
+        static_cast<robot::Milliseconds>(millis());
+    const bool diagnostic_motion_active = diagnosticMotionActive(
+        context, front_left_motor, front_right_motor, rear_link);
+    if (diagnostic_motion_active &&
+        (context.last_motion_diagnostic_sample_ms == 0U ||
+         elapsedSince(diagnostic_now_ms,
+                      context.last_motion_diagnostic_sample_ms) >=
+             kMotionDiagnosticSamplePeriodMs)) {
+      recordMotionDiagnostic(
+          context, front_left_motor, front_right_motor, rear_link,
+          &context.latest_imu_snapshot,
+          robot::MotionDiagnosticEvent::Periodic, diagnostic_now_ms);
+      context.last_motion_diagnostic_sample_ms = diagnostic_now_ms;
+    } else if (!diagnostic_motion_active &&
+               context.diagnostic_motion_was_active) {
+      recordMotionDiagnostic(
+          context, front_left_motor, front_right_motor, rear_link,
+          &context.latest_imu_snapshot,
+          robot::MotionDiagnosticEvent::OutputsDisabled,
+          diagnostic_now_ms);
+    }
+    context.diagnostic_motion_was_active = diagnostic_motion_active;
+
+    if (context.diagnostic_freeze_pending !=
+        robot::MotionDiagnosticTrigger::None) {
+      context.motion_diagnostics.freeze(
+          context.diagnostic_freeze_pending, diagnostic_now_ms);
+      context.diagnostic_freeze_pending =
+          robot::MotionDiagnosticTrigger::None;
+    }
     vTaskDelayUntil(
-        &last_wake_tick,
-        pdMS_TO_TICKS(configured_period_ms == 0U
-                          ? kDefaultMotionTaskPeriodMs
-                          : configured_period_ms));
+        &last_wake_tick, pdMS_TO_TICKS(effective_period_ms));
   }
 }
 

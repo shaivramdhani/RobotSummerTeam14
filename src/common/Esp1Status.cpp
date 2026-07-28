@@ -63,6 +63,7 @@ RobotTestMode byteToMode(const std::uint8_t value) {
     case RobotTestMode::AutonomousTowerPieces:
     case RobotTestMode::PegFinder:
     case RobotTestMode::TimeTrial:
+    case RobotTestMode::ImuTurnTest:
       return static_cast<RobotTestMode>(value);
   }
   return RobotTestMode::Disabled;

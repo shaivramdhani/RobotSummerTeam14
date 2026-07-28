@@ -12,6 +12,17 @@ mechanical orientation before enabling hardware outputs.
 - Command values are normalized in milli-units from `-1000` to `1000`, not motor
   duty-cycle percentages.
 
+## IMU Heading
+
+- `heading_deg` is a continuous relative angle formed by integrating the
+  bias-corrected gyro Z rate. It is not wrapped at `+/-180` or `360` degrees.
+- An IMU turn captures the current heading once and adds `+90` or `-90` degrees
+  to form the target.
+- The sensor's positive mounted Z direction is not assumed to match the
+  drivetrain's positive-yaw direction. `yaw_command_polarity` must be measured
+  with the wheels raised and set to `+1` or `-1` before turn motion is allowed.
+- Line-following error and steering polarity remain independent of IMU heading.
+
 ## Line Error
 
 Front digital line observation uses `error`:
