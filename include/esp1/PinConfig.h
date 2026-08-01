@@ -12,6 +12,9 @@ constexpr std::uint32_t kUnassignedBaudRate = 0U;
 constexpr std::uint32_t kDriveTestPwmFrequencyHz = 100U;
 constexpr std::uint8_t kDriveTestPwmResolutionBits = 10U;
 constexpr std::uint32_t kDriveTestUartBaudRate = 115200U;
+constexpr std::uint32_t kLaserI2cFrequencyHz = 100000U;
+constexpr std::uint16_t kLaserI2cTransactionTimeoutMs = 5U;
+constexpr std::uint16_t kLaserIntermeasurementPeriodMs = 200U;
 
 enum class DualPwmHBridgeMode : std::uint8_t {
   Unconfigured = 0,
@@ -36,15 +39,37 @@ struct UartConfig {
   std::uint32_t baud_rate{kUnassignedBaudRate};
 };
 
+struct ServoOutputConfig {
+  int gpio{kUnassignedGpio};
+  int pwm_channel{kUnassignedPwmChannel};
+  std::uint32_t pwm_frequency_hz{kUnassignedFrequencyHz};
+  std::uint8_t pwm_resolution_bits{kUnassignedPwmResolutionBits};
+  std::uint16_t minimum_pulse_us{0U};
+  std::uint16_t maximum_pulse_us{0U};
+};
+
+struct I2cDistanceSensorConfig {
+  int sda_gpio{kUnassignedGpio};
+  int scl_gpio{kUnassignedGpio};
+  std::uint8_t address{0U};
+  std::uint32_t frequency_hz{0U};
+  std::uint16_t transaction_timeout_ms{0U};
+  std::uint16_t intermeasurement_period_ms{0U};
+};
+
 struct Esp1Pins {
   int left_ir_filtered{kUnassignedGpio};           // TODO: GPIO, active level
   int right_ir_filtered{7};  // GPIO7, ADC1_CH6, analog 0-3.3 V max
-  int freq{2};  // IR frequency-select switch, INPUT_PULLUP
-  int ultrasonic_trigger_1{12};  // HC-SR04 trigger output
-  int ultrasonic_echo_1{11};     // HC-SR04 echo, divided to 3.3 V in hardware
-  int ultrasonic_trigger_2{kUnassignedGpio};       // TODO: GPIO, timing
-  int ultrasonic_echo_2{kUnassignedGpio};          // TODO: GPIO, voltage level
+  int freq{2};                // IR frequency-select switch, INPUT_PULLUP
+  int servo_solar_hook{3};    // Solar Hook servo PWM output
+  // TODO(team): reassign Ultrasonic 1; GPIO11/GPIO12 now belong to LSS2/LSS3.
+  int ultrasonic_trigger_1{kUnassignedGpio};
+  int ultrasonic_echo_1{kUnassignedGpio};
+  int laser_scl{9};            // VL53L0X V2 I2C SCL
+  int laser_sda{10};           // VL53L0X V2 I2C SDA
   int line_sensor_side{4};  // Digital comparator, HIGH = black tape
+  int line_sensor_side_2{11};  // LSS2 digital comparator, HIGH = black tape
+  int line_sensor_side_3{12};  // LSS3 digital comparator, HIGH = black tape
   int line_sensor_back_left{17};   // Digital comparator, HIGH = black tape
   int line_sensor_back_right{18};  // Digital comparator, HIGH = black tape
   int pwm_back_left_0{16};            // TODO: GPIO, PWM resource
@@ -64,11 +89,19 @@ struct Esp1HardwareConfig {
   DualPwmMotorOutputConfig back_left_motor{};   // TODO: fill from schematic
   DualPwmMotorOutputConfig back_right_motor{};  // TODO: fill from schematic
   DualPwmMotorOutputConfig funnel_motor{};      // TODO: PWM resource review
+  ServoOutputConfig solar_hook_servo{};
+  I2cDistanceSensorConfig laser_distance_sensor{};
   UartConfig uart_to_esp2{};                    // TODO: fill TX/RX/baud
   float maximum_safe_test_duty{0.8F};           // TODO: verified safe duty
 };
 
 inline constexpr Esp1Pins kPins{};
+static_assert(kPins.laser_sda != kPins.laser_scl,
+              "VL53L0X SDA and SCL must use different GPIOs");
+static_assert(kPins.line_sensor_side != kPins.line_sensor_side_2 &&
+                  kPins.line_sensor_side != kPins.line_sensor_side_3 &&
+                  kPins.line_sensor_side_2 != kPins.line_sensor_side_3,
+              "LSS, LSS2, and LSS3 must use distinct GPIOs");
 inline constexpr Esp1HardwareConfig kHardwareConfig{
     kPins,
     {kPins.pwm_back_left_0, kPins.pwm_back_left_1, 0, 1,
@@ -80,6 +113,10 @@ inline constexpr Esp1HardwareConfig kHardwareConfig{
     {kPins.pwm_funnel_0, kPins.pwm_funnel_1, 4,
      5, kDriveTestPwmFrequencyHz,
      kDriveTestPwmResolutionBits, 1, DualPwmHBridgeMode::Pwm0ForwardPwm1Reverse},
+    {kPins.servo_solar_hook, 6, 50, 12, 1000, 2000},
+    {kPins.laser_sda, kPins.laser_scl, 0x29U,
+     kLaserI2cFrequencyHz, kLaserI2cTransactionTimeoutMs,
+     kLaserIntermeasurementPeriodMs},
     {kPins.uart_tx_to_esp2, kPins.uart_rx_from_esp2,
      kDriveTestUartBaudRate},
     1.0F};

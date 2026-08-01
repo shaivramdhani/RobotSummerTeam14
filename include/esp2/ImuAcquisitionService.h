@@ -19,14 +19,33 @@ struct ImuAcquisitionSnapshot {
   std::uint32_t total_acquisition_attempts{0U};
   std::uint32_t successful_acquisitions{0U};
   std::uint32_t failed_acquisitions{0U};
+  std::uint32_t lifetime_successful_acquisitions{0U};
+  std::uint32_t lifetime_failed_acquisitions{0U};
   std::uint32_t consecutive_acquisition_failures{0U};
   std::uint32_t maximum_completed_acquisition_duration_us{0U};
+  std::uint32_t acquisition_loop_interval_us{0U};
+  std::uint32_t maximum_acquisition_loop_interval_us{0U};
+  std::uint32_t synchronization_duration_us{0U};
+  std::uint32_t maximum_synchronization_duration_us{0U};
+  std::uint32_t successful_read_to_publication_us{0U};
+  std::uint32_t maximum_successful_read_to_publication_us{0U};
+  std::uint32_t publication_queue_duration_us{0U};
+  std::uint32_t maximum_publication_queue_duration_us{0U};
+  std::uint32_t successful_sample_publication_gap_us{0U};
+  std::uint32_t maximum_successful_sample_publication_gap_us{0U};
+  std::uint32_t last_successful_sample_published_at_us{0U};
+  std::uint32_t publication_sequence{0U};
+  std::uint32_t successful_sample_sequence{0U};
+  std::uint32_t delayed_iteration_count{0U};
   std::uint32_t last_heading_reset_sequence{0U};
   bool acquisition_running{false};
 };
 
 bool imuSnapshotFresh(const ImuAcquisitionSnapshot& snapshot,
                       std::uint32_t now_us, std::uint32_t timeout_us);
+const char* imuDisconnectReason(
+    const ImuAcquisitionSnapshot& snapshot, std::uint32_t now_us,
+    std::uint32_t timeout_us);
 
 class ImuAcquisitionService {
  public:
@@ -52,7 +71,8 @@ class ImuAcquisitionService {
   static void taskEntry(void* parameter);
   void run();
   void publish(std::uint32_t acquisition_duration_us,
-               bool acquisition_running);
+               bool acquisition_running,
+               bool successful_acquisition);
   void processPendingCommands();
   void resetSoakCounters();
 
@@ -75,8 +95,25 @@ class ImuAcquisitionService {
   std::uint32_t total_acquisition_attempts_{0U};
   std::uint32_t successful_acquisitions_{0U};
   std::uint32_t failed_acquisitions_{0U};
+  std::uint32_t lifetime_successful_acquisitions_{0U};
+  std::uint32_t lifetime_failed_acquisitions_{0U};
   std::uint32_t consecutive_acquisition_failures_{0U};
   std::uint32_t maximum_completed_acquisition_duration_us_{0U};
+  std::uint32_t previous_iteration_started_us_{0U};
+  std::uint32_t acquisition_loop_interval_us_{0U};
+  std::uint32_t maximum_acquisition_loop_interval_us_{0U};
+  std::uint32_t synchronization_duration_us_{0U};
+  std::uint32_t maximum_synchronization_duration_us_{0U};
+  std::uint32_t successful_read_to_publication_us_{0U};
+  std::uint32_t maximum_successful_read_to_publication_us_{0U};
+  std::uint32_t publication_queue_duration_us_{0U};
+  std::uint32_t maximum_publication_queue_duration_us_{0U};
+  std::uint32_t previous_successful_sample_published_at_us_{0U};
+  std::uint32_t successful_sample_publication_gap_us_{0U};
+  std::uint32_t maximum_successful_sample_publication_gap_us_{0U};
+  std::uint32_t publication_sequence_{0U};
+  std::uint32_t successful_sample_sequence_{0U};
+  std::uint32_t delayed_iteration_count_{0U};
   bool initialized_and_calibrated_{false};
 };
 

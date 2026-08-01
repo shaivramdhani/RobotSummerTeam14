@@ -22,6 +22,8 @@ enum class PegFinderState : std::uint8_t {
   OpenClaw2 = 12,
   PostClaw2OpenDelay = 13,
   OpenClaw3 = 14,
+  PostClawsOpenDelay = 15,
+  FunnelReverse = 16,
 };
 
 enum class PegFinderFaultReason : std::uint8_t {
@@ -32,11 +34,13 @@ enum class PegFinderFaultReason : std::uint8_t {
   FunnelCommandFailed = 4,
   FunnelLimitTimeout = 5,
   ServoCommandFailed = 6,
+  ImuUnavailable = 7,
+  ImuTurnFailed = 8,
+  ImuTurnTimeout = 9,
 };
 
 struct PegFinderConfig {
-  float clockwise_duty{0.0F};
-  Milliseconds clockwise_duration_ms{0U};
+  float clockwise_angle_deg{0.0F};
   Milliseconds post_rotation_pause_ms{0U};
   float reverse_duty{0.0F};
   Milliseconds reverse_duration_ms{0U};
@@ -47,10 +51,17 @@ struct PegFinderConfig {
   Milliseconds funnel_forward_timeout_ms{0U};
   Milliseconds post_funnel_limit_delay_ms{0U};
   Milliseconds claw_open_interval_ms{0U};
+  std::uint8_t claw_open_order_1{1U};
+  std::uint8_t claw_open_order_2{2U};
+  std::uint8_t claw_open_order_3{3U};
+  Milliseconds post_claws_open_delay_ms{0U};
+  float funnel_reverse_duty{0.0F};
+  Milliseconds funnel_reverse_duration_ms{0U};
 };
 
 struct PegFinderInputs {
   bool funnel_limit_active{false};
+  bool clockwise_turn_complete{false};
 };
 
 struct PegFinderAutonomy {
@@ -66,6 +77,7 @@ struct PegFinderUpdate {
   bool should_drive_backward{false};
   bool should_drive_forward{false};
   bool should_run_funnel_forward{false};
+  bool should_run_funnel_reverse{false};
   bool funnel_limit_detected{false};
   bool should_open_claw_1{false};
   bool should_open_claw_2{false};

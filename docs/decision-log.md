@@ -42,3 +42,108 @@ Reason: The first physical milestone is following black electrical tape using
 Safety note: Hardware outputs remain disabled until GPIOs, PWM resources,
 H-bridge mode, UART pins/baud, per-wheel direction signs, and maximum safe duty
 are verified in `PinConfig.h`.
+
+## 2026-07-27: Stage 3 IMU Heading-Held Manual Strafe
+
+Decision: Add a dedicated `IMU_STRAFE_TEST` mode with a separately tuned PD
+heading controller. Capture heading once at held-strafe start, combine bounded
+lateral and yaw duties before the existing mecanum mixer, and retain the
+existing output and IMU-acquisition ownership paths unchanged.
+
+Reason: Explicit mode selection prevents IMU correction from affecting normal
+manual drive, line-following PID, Stage 2 turns, or autonomous routines. The
+combined-duty validation and existing browser deadman bound the new manual
+motion.
+
+## 2026-07-28: Autonomous IMU Motion Reuses Manual-Test Tuning
+
+Decision: Route every Solar lateral state, the Tower initial strafe and
+shimmy, and the optional Time Trial transition through the shared Stage 3
+heading-hold controller. Route Tower and PegFinder clockwise turns through the
+shared Stage 2 angle controller. Autonomous panels retain only strafe
+durations/timeouts and turn angles; they do not own separate IMU motion gains
+or duty limits.
+
+Reason: One live tuning source prevents tested IMU values from drifting away
+from autonomous behavior. Each owning mode still handles its own state
+transition and faults, while stale IMU/link data stops all wheel outputs.
+
+## 2026-07-30: ESP1 Owns the Habitat Distance Sensor
+
+Decision: Put the VL53L0X V2 on ESP1 SDA GPIO10/SCL GPIO9, use the existing
+ESP1 sensor-acquisition task as its sole owner, and transport complete immutable
+snapshots to ESP2 in a dedicated UART message.
+
+Reason: The IMU is physically and logically owned by ESP2, so there is no
+cross-processor I2C bus to share. A local ESP1 bus keeps the distance sensor
+close to the mission controller, isolates it from IMU traffic and failures,
+and avoids expanding the already compact ESP1 status payload.
+
+Safety note: The shared habitat distance-stop gate defaults locked and fails
+safe on missing, invalid, or stale data. It is not connected to motion until
+the currently stubbed habitat approach and its physical stop-distance and
+freshness calibrations exist.
+
+## 2026-07-31: Explicit Habitat Pieces Laser Approach Mode (superseded)
+
+Decision: Add ESP2 `HABITAT_PIECES` mode. It reuses the front-sensor line
+follower with an independent default duty of `0.12`, evaluates
+`HabitatDistanceStop` before every wheel command, and latches all-wheel stop at
+the configured laser distance. It also applies an adjustable overall run
+timeout so an approach that never reaches the distance threshold cannot run
+indefinitely.
+
+Reason: The approach can be calibrated and exercised independently of the
+still-stubbed ESP1 mission transitions while preserving ESP2's ownership of
+four-wheel motion calculation.
+
+Safety note: Stop distance, maximum sample age, and run timeout remain zero by
+default. Start is locked until all three are nonzero and all line, motor, link,
+and duty requirements pass. Fresh driver-error-free no-target measurements are
+allowed so the robot can approach until the sensor acquires the piece. Missing,
+unavailable, frozen, or driver-faulted laser data and an expired run timeout
+stop the mode instead of allowing unbounded motion.
+
+Profile behavior: ESP1 configures the Adafruit high-accuracy profile before
+continuous ranging starts and remains the sole laser owner. HabitatPieces
+confirms that profile over the expiring rear-wheel command before enabling
+motion. Stop, fault, completion, mode exit, and command expiry all retain high
+accuracy. Its 200 ms timing budget is paired with a 200 ms continuous
+intermeasurement period.
+
+## 2026-07-31: Habitat Pieces Stops on Delayed LSS2 Detection (superseded)
+
+Decision: Replace the Habitat Pieces laser-distance stop gate with the
+ESP1-owned LSS2 digital line sensor. Front-sensor line following begins
+immediately. LSS2 is ignored for an explicitly configured nonzero delay; after
+that delay, a fresh black level latches completion and all-wheel stop. The
+existing overall run timeout remains and must be longer than the delay.
+
+Reason: The intended field sequence is to drive past early side markings and
+only begin watching for the Habitat Pieces stop line after a known travel
+interval.
+
+Safety note: No detection delay is invented. Start remains locked until the
+delay and timeout are valid, LSS2 has a real GPIO configuration, its ESP1
+sensor packet is fresh, and all existing front-line, motor, UART, and duty gates
+pass. Stale/unconfigured LSS2 data, front line loss, rear-command failure, or
+timeout stops all four wheels. The laser remains independent telemetry and is
+not consulted by this mode.
+
+## 2026-07-31: Habitat Pieces Reverses After Delayed LSS2 Detection
+
+Decision: Retain immediate front-sensor line following and the delayed LSS2
+search, but transition a latched black detection to a new `REVERSING` state.
+That state commands straight backward motion through the existing mecanum mixer
+at an explicitly configured duty for an explicitly configured duration, then
+latches `COMPLETE` and all-wheel stop. The existing timeout now bounds finding
+LSS2; the reverse has its own duration.
+
+Reason: The intended field sequence requires a repeatable backward displacement
+after reaching the side line rather than stopping at the first detection.
+
+Safety note: Reverse duty and duration default to zero and lock out Start until
+explicitly configured. LSS2 must remain configured and fresh through detection.
+Once detection is latched, LSS2 is no longer an input to the bounded reverse;
+configured motors, fresh rear status, expiring rear commands, explicit Stop,
+and mode-exit shutdown remain active throughout it.

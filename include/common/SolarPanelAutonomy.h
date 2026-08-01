@@ -20,6 +20,7 @@ enum class SolarPanelAutonomyState : std::uint8_t {
   StrafeLeftToRearLine = 10,
   RearLineReacquired = 11,
   WaitBeforeStrafeLeftToRearLine = 12,
+  BackwardLineFollowAfterRearDetection = 13,
 };
 
 enum class SolarPanelFaultReason : std::uint8_t {
@@ -29,6 +30,8 @@ enum class SolarPanelFaultReason : std::uint8_t {
   LineLost = 3,
   RearLinkStale = 4,
   LimitSwitchTimeout = 5,
+  ImuUnavailable = 6,
+  ImuStrafeFailed = 7,
 };
 
 struct SolarPanelAutonomyConfig {
@@ -42,16 +45,20 @@ struct SolarPanelAutonomyConfig {
 
 struct SolarPanelContactConfig {
   Milliseconds timeout_ms{0};
-  float strafe_duty{0.0F};
+  float initial_strafe_right_duty{0.0F};
+  float retry_strafe_left_duty{0.0F};
+  float retry_strafe_right_duty{0.0F};
+  float retry_forward_duty{0.0F};
   Milliseconds strafe_start_delay_ms{0};
   Milliseconds retry_strafe_left_duration_ms{0};
   Milliseconds retry_forward_duration_ms{0};
   Milliseconds retry_strafe_timeout_ms{0};
   Milliseconds post_contact_forward_duration_ms{0};
-  float line_reacquire_strafe_duty{0.0F};
   Milliseconds post_contact_forward_start_delay_ms{0};
   Milliseconds line_reacquire_strafe_start_delay_ms{0};
   float post_contact_forward_duty{0.0F};
+  float line_reacquire_strafe_duty{0.0F};
+  Milliseconds rear_line_follow_duration_ms{0U};
 };
 
 struct SolarPanelContactSequenceUpdate {

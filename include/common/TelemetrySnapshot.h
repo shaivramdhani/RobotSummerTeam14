@@ -5,7 +5,11 @@
 
 #include "common/EventLog.h"
 #include "common/FaultHealth.h"
+#include "common/HabitatPiecesAutonomy.h"
+#include "common/HabitatPlacementAutonomy.h"
+#include "common/ImuHeadingHoldController.h"
 #include "common/ImuTurnController.h"
+#include "common/LaserDistance.h"
 #include "common/LineFollower.h"
 #include "common/PegFinderAutonomy.h"
 #include "common/RobotTestMode.h"
@@ -20,6 +24,7 @@ constexpr std::size_t kTelemetryIpAddressSize = 24U;
 constexpr std::size_t kTelemetryResetReasonSize = 32U;
 constexpr std::size_t kTelemetryFaultMessageSize = 64U;
 constexpr std::size_t kTelemetryImuInitializationErrorSize = 32U;
+constexpr std::size_t kTelemetryImuDiagnosticReasonSize = 40U;
 
 struct MotorTelemetry {
   std::int16_t desired_command_milli{0};
@@ -61,6 +66,9 @@ struct Esp1RemoteStatusTelemetry {
   bool ultrasonic_1_echo_valid{false};
   std::uint16_t ultrasonic_1_distance_mm{0};
   std::uint32_t ultrasonic_1_echo_duration_us{0};
+  bool solar_hook_configured{false};
+  bool solar_hook_output_enabled{false};
+  int solar_hook_commanded_angle_deg{-1};
 };
 
 struct UltrasonicTelemetry {
@@ -72,6 +80,33 @@ struct UltrasonicTelemetry {
   Milliseconds sample_age_ms{0};
 };
 
+struct LaserDistanceTelemetry {
+  bool available{false};
+  bool configured{false};
+  bool initialized{false};
+  bool ranging{false};
+  bool data_fresh{false};
+  bool data_valid{false};
+  LaserDistanceProfile profile{LaserDistanceProfile::Default};
+  std::uint16_t distance_mm{0U};
+  std::uint16_t measurement_sequence{0U};
+  std::uint16_t packet_sequence{0U};
+  std::uint8_t sensor_range_status{0xFFU};
+  std::int8_t driver_status{0};
+  std::int8_t sda_gpio{-1};
+  std::int8_t scl_gpio{-1};
+  std::uint8_t i2c_address{kVl53l0xDefaultI2cAddress};
+  Milliseconds captured_at_ms{0U};
+  Milliseconds sample_age_ms{0U};
+  Milliseconds snapshot_age_ms{0U};
+  std::uint16_t intermeasurement_period_ms{0U};
+  std::uint32_t successful_measurement_count{0U};
+  std::uint32_t failed_measurement_count{0U};
+  std::uint16_t consecutive_failed_measurements{0U};
+  std::uint32_t acquisition_duration_us{0U};
+  std::uint32_t maximum_acquisition_duration_us{0U};
+};
+
 struct ImuTelemetry {
   bool configured{false};
   bool initialized{false};
@@ -80,6 +115,7 @@ struct ImuTelemetry {
   bool data_fresh{false};
   bool acquisition_running{false};
   bool device_acknowledged{false};
+  bool runtime_configuration_valid{false};
   bool register_reads_use_repeated_start{true};
 
   std::uint8_t i2c_address{0x68U};
@@ -88,6 +124,9 @@ struct ImuTelemetry {
   int scl_gpio{-1};
   int last_wire_status{-1};
   char initialization_error[kTelemetryImuInitializationErrorSize]{};
+  char last_read_failure_reason[kTelemetryImuDiagnosticReasonSize]{};
+  char disconnect_reason[kTelemetryImuDiagnosticReasonSize]{};
+  char last_disconnect_reason[kTelemetryImuDiagnosticReasonSize]{};
 
   std::int16_t raw_gyro_z{0};
   float gyro_z_bias_dps{0.0F};
@@ -101,9 +140,31 @@ struct ImuTelemetry {
   std::uint32_t total_acquisition_attempts{0U};
   std::uint32_t last_successful_read_us{0U};
   std::uint32_t last_sample_interval_us{0U};
+  std::uint32_t last_read_failure_us{0U};
   std::uint32_t successful_read_count{0U};
   std::uint32_t failed_read_count{0U};
   std::uint32_t consecutive_failed_reads{0U};
+  std::uint32_t disconnect_count{0U};
+  Milliseconds last_disconnect_at_ms{0U};
+  std::uint32_t acquisition_loop_interval_us{0U};
+  std::uint32_t maximum_acquisition_loop_interval_us{0U};
+  std::uint32_t synchronization_duration_us{0U};
+  std::uint32_t maximum_synchronization_duration_us{0U};
+  std::uint32_t wire_lock_acquire_duration_us{0U};
+  std::uint32_t maximum_wire_lock_acquire_duration_us{0U};
+  std::uint32_t measurement_read_duration_us{0U};
+  std::uint32_t maximum_measurement_read_duration_us{0U};
+  std::uint32_t successful_read_to_publication_us{0U};
+  std::uint32_t maximum_successful_read_to_publication_us{0U};
+  std::uint32_t publication_queue_duration_us{0U};
+  std::uint32_t maximum_publication_queue_duration_us{0U};
+  std::uint32_t successful_sample_publication_gap_us{0U};
+  std::uint32_t maximum_successful_sample_publication_gap_us{0U};
+  std::uint32_t current_observed_publication_gap_us{0U};
+  std::uint32_t maximum_observed_publication_gap_us{0U};
+  std::uint32_t publication_sequence{0U};
+  std::uint32_t successful_sample_sequence{0U};
+  std::uint32_t delayed_iteration_count{0U};
 };
 
 struct ImuTurnTelemetry {
@@ -111,6 +172,45 @@ struct ImuTurnTelemetry {
   bool active{false};
   ImuTurnState state{ImuTurnState::Idle};
   ImuTurnFaultReason fault_reason{ImuTurnFaultReason::None};
+  bool availability_fault_capture_valid{false};
+  bool availability_fault_latched{false};
+  bool imu_currently_available{false};
+  bool captured_configured{false};
+  bool captured_initialized{false};
+  bool captured_calibrated{false};
+  bool captured_healthy{false};
+  bool captured_sample_valid{false};
+  bool captured_data_fresh{false};
+  bool captured_acquisition_running{false};
+  bool captured_shared_snapshot_available{false};
+  bool captured_front_left_configured{false};
+  bool captured_front_right_configured{false};
+  bool captured_rear_link_configured{false};
+  bool captured_rear_status_available{false};
+  bool captured_rear_status_fresh{false};
+  bool captured_newest_snapshot_available{false};
+  bool captured_cached_snapshot_matches_newest{false};
+  char availability_fault_origin[kTelemetryImuDiagnosticReasonSize]{};
+  char captured_availability_reason[kTelemetryImuDiagnosticReasonSize]{};
+  std::uint32_t availability_evaluated_at_us{0U};
+  Milliseconds availability_evaluated_at_ms{0U};
+  std::uint32_t captured_published_at_us{0U};
+  std::uint32_t captured_last_successful_read_us{0U};
+  std::uint32_t captured_sample_age_us{0U};
+  std::uint32_t captured_snapshot_age_us{0U};
+  std::uint32_t captured_freshness_timeout_us{0U};
+  std::uint32_t captured_cached_snapshot_sequence{0U};
+  std::uint32_t captured_newest_snapshot_sequence{0U};
+  std::uint32_t captured_cached_successful_sample_sequence{0U};
+  std::uint32_t captured_newest_successful_sample_sequence{0U};
+  std::uint32_t captured_cached_snapshot_fetched_at_us{0U};
+  std::uint32_t captured_cached_snapshot_fetch_to_gate_us{0U};
+  std::uint32_t captured_successful_sample_publication_gap_us{0U};
+  std::uint32_t captured_maximum_successful_sample_publication_gap_us{0U};
+  std::uint32_t captured_current_observed_publication_gap_us{0U};
+  std::uint32_t captured_maximum_observed_publication_gap_us{0U};
+  Milliseconds captured_rear_last_status_received_at_ms{0U};
+  Milliseconds captured_rear_status_age_ms{0U};
 
   float maximum_rotation_duty{0.0F};
   float kp{0.0F};
@@ -134,8 +234,56 @@ struct ImuTurnTelemetry {
   Milliseconds settling_elapsed_ms{0U};
 };
 
+struct ImuHeadingHoldTelemetry {
+  bool configuration_valid{false};
+  bool active{false};
+  ImuHeadingHoldState state{ImuHeadingHoldState::Idle};
+  ImuHeadingHoldFaultReason fault_reason{
+      ImuHeadingHoldFaultReason::None};
+
+  float maximum_strafe_duty{0.0F};
+  float kp{0.0F};
+  float kd{0.0F};
+  float maximum_yaw_correction_duty{0.0F};
+  int yaw_command_polarity{0};
+
+  float start_heading_deg{0.0F};
+  float current_heading_deg{0.0F};
+  float target_heading_deg{0.0F};
+  float angle_error_deg{0.0F};
+  float yaw_rate_dps{0.0F};
+  float proportional_term{0.0F};
+  float damping_term{0.0F};
+  float yaw_correction_duty{0.0F};
+  int lateral_direction{0};
+  Milliseconds elapsed_ms{0U};
+};
+
+struct ImuRecoveryTelemetry {
+  bool turn_paused{false};
+  bool strafe_paused{false};
+  float turn_saved_heading_deg{0.0F};
+  float strafe_saved_heading_deg{0.0F};
+  Milliseconds turn_pause_elapsed_ms{0U};
+  Milliseconds strafe_pause_elapsed_ms{0U};
+  Milliseconds maximum_pause_ms{0U};
+  std::uint8_t consecutive_fresh_samples_required{0U};
+  std::uint8_t turn_consecutive_fresh_samples{0U};
+  std::uint8_t strafe_consecutive_fresh_samples{0U};
+  std::uint32_t turn_pause_count{0U};
+  std::uint32_t strafe_pause_count{0U};
+  Milliseconds total_paused_ms{0U};
+};
+
 struct ServoClawTelemetry {
   bool hardware_configured{false};
+  int gpio{-1};
+  int ledc_channel{-1};
+  int mcpwm_unit{-1};
+  int mcpwm_timer{-1};
+  int mcpwm_generator{-1};
+  std::uint32_t pwm_frequency_hz{0U};
+  std::uint32_t mcpwm_timer_resolution_hz{0U};
   bool open_configured{false};
   bool closed_configured{false};
   bool output_enabled{false};
@@ -149,7 +297,19 @@ struct ServoClawBankTelemetry {
   ServoClawTelemetry claw_1{};
   ServoClawTelemetry claw_2{};
   ServoClawTelemetry claw_3{};
+  ServoClawTelemetry habitat_pusher{};
   ServoClawTelemetry winch{};
+};
+
+struct SolarHookServoTelemetry {
+  bool hardware_configured{false};
+  bool open_configured{false};
+  bool closed_configured{false};
+  bool output_enabled{false};
+  int open_angle_deg{-1};
+  int closed_angle_deg{-1};
+  int commanded_angle_deg{-1};
+  bool commanded_open{false};
 };
 
 struct TelemetrySnapshot {
@@ -169,14 +329,22 @@ struct TelemetrySnapshot {
 
   ImuTelemetry imu{};
   ImuTurnTelemetry imu_turn{};
+  ImuHeadingHoldTelemetry imu_heading_hold{};
+  ImuRecoveryTelemetry imu_recovery{};
 
   int lsfl_raw_level{-1};
   int lsfr_raw_level{-1};
   int lss_raw_level{-1};
+  int lss2_raw_level{-1};
+  int lss3_raw_level{-1};
   bool lsfl_black{false};
   bool lsfr_black{false};
   bool lss_black{false};
   bool lss_configured{false};
+  bool lss2_black{false};
+  bool lss2_configured{false};
+  bool lss3_black{false};
+  bool lss3_configured{false};
   std::int8_t line_error{0};
   bool line_visible{false};
   bool line_has_history{false};
@@ -263,15 +431,19 @@ struct TelemetrySnapshot {
   bool solar_beacon_confirmed{false};
   Milliseconds solar_contact_timeout_ms{0};
   float solar_contact_strafe_duty{0.0F};
+  float solar_retry_left_strafe_duty{0.0F};
+  float solar_retry_right_strafe_duty{0.0F};
   Milliseconds solar_strafe_start_delay_ms{0};
   Milliseconds solar_retry_strafe_left_duration_ms{0};
   Milliseconds solar_retry_forward_duration_ms{0};
+  float solar_retry_forward_duty{0.0F};
   Milliseconds solar_retry_strafe_timeout_ms{0};
   Milliseconds solar_post_contact_forward_duration_ms{0};
   float solar_line_reacquire_strafe_duty{0.0F};
   Milliseconds solar_post_contact_forward_start_delay_ms{0};
   Milliseconds solar_line_reacquire_strafe_start_delay_ms{0};
   float solar_post_contact_forward_duty{0.0F};
+  Milliseconds solar_rear_line_follow_duration_ms{0U};
   bool solar_panel_limit_switches_configured{false};
   bool solar_limit_back_right_high{false};
   bool solar_limit_front_right_high{false};
@@ -279,18 +451,60 @@ struct TelemetrySnapshot {
   bool solar_limit_front_right_hit{false};
   bool solar_limit_all_hit{false};
 
+  HabitatPiecesState habitat_pieces_state{
+      HabitatPiecesState::WaitForStart};
+  HabitatPiecesStopReason habitat_pieces_stop_reason{
+      HabitatPiecesStopReason::ConfigurationIncomplete};
+  Milliseconds habitat_pieces_time_in_state_ms{0U};
+  float habitat_pieces_line_follow_duty{
+      kDefaultHabitatPiecesLineFollowDuty};
+  Milliseconds habitat_pieces_lss2_detection_delay_ms{0U};
+  Milliseconds habitat_pieces_lss2_detection_remaining_ms{0U};
+  Milliseconds habitat_pieces_run_timeout_ms{0U};
+  Milliseconds habitat_pieces_run_elapsed_ms{0U};
+  Milliseconds habitat_pieces_timeout_remaining_ms{0U};
+  float habitat_pieces_reverse_duty{0.0F};
+  Milliseconds habitat_pieces_reverse_duration_ms{0U};
+  Milliseconds habitat_pieces_reverse_elapsed_ms{0U};
+  Milliseconds habitat_pieces_reverse_remaining_ms{0U};
+  bool habitat_pieces_configuration_valid{false};
+  bool habitat_pieces_start_ready{false};
+  bool habitat_pieces_lss2_configured{false};
+  bool habitat_pieces_lss2_data_fresh{false};
+  bool habitat_pieces_lss2_detection_armed{false};
+  bool habitat_pieces_lss2_black{false};
+  bool habitat_pieces_should_stop{true};
+  bool habitat_pieces_target_reached{false};
+  bool habitat_pieces_line_following{false};
+  bool habitat_pieces_reversing{false};
+  bool habitat_pieces_timed_out{false};
+
+  HabitatPlacementState habitat_placement_state{
+      HabitatPlacementState::WaitForStart};
+  HabitatPlacementFaultReason habitat_placement_fault_reason{
+      HabitatPlacementFaultReason::None};
+  HabitatPlacementConfig habitat_placement_config{};
+  Milliseconds habitat_placement_time_in_state_ms{0U};
+  bool habitat_placement_configuration_valid{false};
+  bool habitat_placement_start_ready{false};
+  bool habitat_placement_counter_clockwise_heading_captured{false};
+  float habitat_placement_counter_clockwise_start_heading_deg{0.0F};
+  float habitat_placement_counter_clockwise_target_heading_deg{0.0F};
+
   TowerPiecesState tower_pieces_state{TowerPiecesState::WaitForStart};
   TowerPiecesFaultReason tower_pieces_fault_reason{
       TowerPiecesFaultReason::None};
   Milliseconds tower_pieces_time_in_state_ms{0};
   float tower_pieces_reverse_line_duty{0.0F};
   Milliseconds tower_pieces_side_line_timeout_ms{0};
+  Milliseconds tower_pieces_side_line_cooldown_ms{0};
+  Milliseconds tower_pieces_side_line_rearm_ms{0};
   Milliseconds tower_pieces_post_line_delay_ms{0};
   float tower_pieces_strafe_right_duty{0.0F};
   Milliseconds tower_pieces_strafe_right_duration_ms{0};
   Milliseconds tower_pieces_post_strafe_pause_ms{0};
   float tower_pieces_clockwise_rotation_duty{0.0F};
-  Milliseconds tower_pieces_clockwise_rotation_duration_ms{0};
+  float tower_pieces_clockwise_rotation_angle_deg{0.0F};
   Milliseconds tower_pieces_post_rotation_pause_ms{0};
   float tower_pieces_reverse_duty{0.0F};
   Milliseconds tower_pieces_reverse_duration_ms{0};
@@ -303,15 +517,20 @@ struct TelemetrySnapshot {
   Milliseconds tower_pieces_post_final_reverse_delay_ms{0};
   Milliseconds tower_pieces_post_winch_open_delay_ms{0};
   Milliseconds tower_pieces_post_claws_open_delay_ms{0};
+  Milliseconds tower_pieces_pre_stepper_bottom_delay_ms{0};
   std::uint32_t tower_pieces_stepper_down_speed_steps_per_second{0};
   Milliseconds tower_pieces_post_stepper_bottom_delay_ms{0};
   Milliseconds tower_pieces_post_claws_closed_delay_ms{0};
   std::uint32_t tower_pieces_stepper_up_speed_steps_per_second{0};
   std::uint8_t tower_pieces_side_line_count{0};
+  std::uint16_t tower_pieces_side_line_rejected_count{0};
   std::uint8_t tower_pieces_target_side_line_count{
       kTowerPiecesTargetSideLineCount};
   bool tower_pieces_side_line_sensor_configured{false};
   bool tower_pieces_side_line_sensor_high{false};
+  bool tower_pieces_side_line_armed{false};
+  bool tower_pieces_side_line_detection_accepted{false};
+  bool tower_pieces_side_line_detection_rejected{false};
   bool tower_pieces_line_following{false};
   bool tower_pieces_strafing_right{false};
   bool tower_pieces_rotating_clockwise{false};
@@ -328,7 +547,7 @@ struct TelemetrySnapshot {
       PegFinderFaultReason::None};
   Milliseconds peg_finder_time_in_state_ms{0};
   float peg_finder_clockwise_duty{0.0F};
-  Milliseconds peg_finder_clockwise_duration_ms{0};
+  float peg_finder_clockwise_angle_deg{0.0F};
   Milliseconds peg_finder_post_rotation_pause_ms{0};
   float peg_finder_reverse_duty{0.0F};
   Milliseconds peg_finder_reverse_duration_ms{0};
@@ -339,12 +558,19 @@ struct TelemetrySnapshot {
   Milliseconds peg_finder_funnel_forward_timeout_ms{0};
   Milliseconds peg_finder_post_funnel_limit_delay_ms{0};
   Milliseconds peg_finder_claw_open_interval_ms{0};
+  std::uint8_t peg_finder_claw_open_order_1{1U};
+  std::uint8_t peg_finder_claw_open_order_2{2U};
+  std::uint8_t peg_finder_claw_open_order_3{3U};
+  Milliseconds peg_finder_post_claws_open_delay_ms{0};
+  float peg_finder_funnel_reverse_duty{0.0F};
+  Milliseconds peg_finder_funnel_reverse_duration_ms{0};
   bool peg_finder_funnel_limit_configured{false};
   bool peg_finder_funnel_limit_high{false};
   bool peg_finder_rotating_clockwise{false};
   bool peg_finder_driving_backward{false};
   bool peg_finder_driving_forward{false};
   bool peg_finder_funnel_forward{false};
+  bool peg_finder_funnel_reverse{false};
   bool peg_finder_opening_claw_1{false};
   bool peg_finder_opening_claw_2{false};
   bool peg_finder_opening_claw_3{false};
@@ -363,7 +589,9 @@ struct TelemetrySnapshot {
   RearCommandTelemetry rear{};
   Esp1RemoteStatusTelemetry esp1{};
   UltrasonicTelemetry ultrasonic_1{};
+  LaserDistanceTelemetry laser_distance{};
   ServoClawBankTelemetry claws{};
+  SolarHookServoTelemetry solar_hook{};
 
   std::uint16_t ir_adc_average{0};
   std::uint16_t ir_adc_min{0};

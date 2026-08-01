@@ -92,5 +92,5 @@ qs('raw').textContent = JSON.stringify(j, null, 2)
 
 Pusher and mechanism limit fields are still placeholders in
 `TelemetrySnapshot`. The servo telemetry panel includes the three claws and the
-GPIO6 winch; movement remains gated by configured open/closed angles and the
+GPIO5 LEDC Habitat Pusher and GPIO6 MCPWM Winch; movement remains gated by configured open/closed angles and the
 PWM settings in `include/esp2/PinConfig.h`.

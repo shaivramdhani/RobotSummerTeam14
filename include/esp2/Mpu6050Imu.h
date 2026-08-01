@@ -23,12 +23,32 @@ enum class ImuInitializationError : std::uint8_t {
 
 const char* imuInitializationErrorName(ImuInitializationError error);
 
+enum class ImuReadFailureReason : std::uint8_t {
+  None = 0,
+  NotInitialized,
+  NotCalibrated,
+  I2cBufferOverflow,
+  I2cAddressNack,
+  I2cDataNack,
+  I2cBusError,
+  I2cTimeout,
+  I2cWriteFailed,
+  IncompleteRead,
+  RuntimeConfigurationMismatch,
+  InvalidYawRate,
+  InvalidHeading,
+  Unknown,
+};
+
+const char* imuReadFailureReasonName(ImuReadFailureReason reason);
+
 struct ImuState {
   bool configured{false};
   bool initialized{false};
   bool calibrated{false};
   bool healthy{false};
   bool device_acknowledged{false};
+  bool runtime_configuration_valid{false};
   bool register_reads_use_repeated_start{true};
 
   std::uint8_t address{0x68U};
@@ -38,6 +58,8 @@ struct ImuState {
   int last_wire_status{-1};
   ImuInitializationError initialization_error{
       ImuInitializationError::PinsUnassigned};
+  ImuReadFailureReason last_read_failure_reason{
+      ImuReadFailureReason::None};
 
   std::int16_t raw_gyro_z{0};
   float gyro_z_bias_dps{0.0F};
@@ -51,6 +73,11 @@ struct ImuState {
   std::uint32_t last_update_us{0U};
   std::uint32_t last_successful_read_us{0U};
   std::uint32_t last_sample_interval_us{0U};
+  std::uint32_t last_read_failure_us{0U};
+  std::uint32_t last_wire_lock_acquire_duration_us{0U};
+  std::uint32_t maximum_wire_lock_acquire_duration_us{0U};
+  std::uint32_t last_measurement_read_duration_us{0U};
+  std::uint32_t maximum_measurement_read_duration_us{0U};
 };
 
 class Mpu6050Imu {
@@ -70,11 +97,14 @@ class Mpu6050Imu {
   bool writeRegister(std::uint8_t register_address, std::uint8_t value);
   bool readRegisters(std::uint8_t start_register, std::uint8_t* output,
                      std::uint8_t length);
+  bool runtimeConfigurationMatches();
   bool readRawGyroZ(std::int16_t& raw_gyro_z);
-  void recordReadFailure();
+  void recordReadFailure(ImuReadFailureReason reason);
 
   TwoWire* wire_{nullptr};
   ImuState state_{};
+  ImuReadFailureReason pending_read_failure_reason_{
+      ImuReadFailureReason::None};
 };
 
 }  // namespace robot::esp2

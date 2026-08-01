@@ -48,12 +48,9 @@ const char* timeTrialStateName(const TimeTrialState state) {
 
 bool timeTrialConfigValid(const TimeTrialConfig& config,
                           const float maximum_allowed_duty) {
-  return std::isfinite(config.solar_to_tower_strafe_right_duty) &&
-         std::isfinite(maximum_allowed_duty) &&
-         config.solar_to_tower_strafe_right_duty >= 0.0F &&
-         config.solar_to_tower_strafe_right_duty <= maximum_allowed_duty &&
-         (config.solar_to_tower_strafe_right_duration_ms == 0U ||
-          config.solar_to_tower_strafe_right_duty > 0.0F);
+  (void)config;
+  return std::isfinite(maximum_allowed_duty) &&
+         maximum_allowed_duty > 0.0F;
 }
 
 void resetTimeTrialAutonomy(TimeTrialAutonomy& autonomy,
@@ -85,6 +82,10 @@ TimeTrialUpdate updateTimeTrialAutonomy(
     case TimeTrialState::AutonomousSolar:
       if (inputs.solar_fault) {
         failTimeTrialAutonomy(autonomy, now_ms);
+      } else if (inputs.solar_line_follow_ready) {
+        enterState(autonomy, TimeTrialState::TowerPieces, now_ms);
+        update.should_start_tower_pieces = true;
+        update.should_handoff_solar_line_follow = true;
       } else if (inputs.solar_complete) {
         enterState(autonomy, TimeTrialState::PostSolarDelay, now_ms);
       }

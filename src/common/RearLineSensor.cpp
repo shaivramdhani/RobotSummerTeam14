@@ -34,7 +34,17 @@ UartPacket makeRearLineSensorPacket(
   flags |= snapshot.right_electrical_high ? kRearLineSensorRightHighFlag : 0U;
   flags |= snapshot.side_configured ? kSideLineSensorConfiguredFlag : 0U;
   flags |= snapshot.side_electrical_high ? kSideLineSensorHighFlag : 0U;
+  flags |= snapshot.side_2_configured ? kSideLineSensor2ConfiguredFlag : 0U;
+  flags |= snapshot.side_2_electrical_high ? kSideLineSensor2HighFlag : 0U;
   packet.payload[4] = flags;
+  std::uint8_t side_3_flags = 0U;
+  side_3_flags |= snapshot.side_3_configured
+                      ? kSideLineSensor3ConfiguredFlag
+                      : 0U;
+  side_3_flags |= snapshot.side_3_electrical_high
+                      ? kSideLineSensor3HighFlag
+                      : 0U;
+  packet.payload[5] = side_3_flags;
   packet.header.integrity_crc16 = calculatePacketIntegrity(packet);
   return packet;
 }
@@ -43,7 +53,8 @@ bool decodeRearLineSensorPacket(const UartPacket& packet,
                                 RearLineSensorSnapshot& snapshot) {
   if (!packetLooksValid(packet) ||
       packet.header.message_type != UartMessageType::SensorSnapshot ||
-      packet.header.payload_size != kRearLineSensorPayloadSize) {
+      (packet.header.payload_size != kRearLineSensorPayloadSize &&
+       packet.header.payload_size != kLegacyRearLineSensorPayloadSize)) {
     snapshot = {};
     return false;
   }
@@ -59,6 +70,18 @@ bool decodeRearLineSensorPacket(const UartPacket& packet,
       (flags & kSideLineSensorConfiguredFlag) != 0U;
   snapshot.side_electrical_high =
       (flags & kSideLineSensorHighFlag) != 0U;
+  snapshot.side_2_configured =
+      (flags & kSideLineSensor2ConfiguredFlag) != 0U;
+  snapshot.side_2_electrical_high =
+      (flags & kSideLineSensor2HighFlag) != 0U;
+  const std::uint8_t side_3_flags =
+      packet.header.payload_size == kRearLineSensorPayloadSize
+          ? packet.payload[5]
+          : 0U;
+  snapshot.side_3_configured =
+      (side_3_flags & kSideLineSensor3ConfiguredFlag) != 0U;
+  snapshot.side_3_electrical_high =
+      (side_3_flags & kSideLineSensor3HighFlag) != 0U;
   return true;
 }
 

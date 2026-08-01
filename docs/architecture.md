@@ -4,12 +4,12 @@ The robot uses two ESP32-S3 processors in one PlatformIO monorepo.
 
 ESP1 is the mission controller. It owns the autonomous mission state machine,
 mission-level safety decisions, ESP1-local sensors, rear wheel outputs, the
-funnel motor, and one side of the UART link.
+funnel motor, Solar Hook servo, and one side of the UART link.
 
 ESP2 is the motion controller and mechanism node. It owns front line sensing,
 logical four-wheel motion calculation, front wheel outputs, the stepper, the
-servo mechanisms, mechanism limit switches, the I2C IMU, and one side of the
-UART link.
+remaining servo mechanisms, mechanism limit switches, the I2C IMU, and one
+side of the UART link.
 
 ## Command Flow
 
@@ -28,6 +28,11 @@ Use a small number of periodic or event-driven FreeRTOS tasks:
 
 - ESP1 mission task: mission state evaluation, command publication, health
   monitoring.
+- ESP1 sensor-acquisition task on core 0: sole owner of the ESP1 `Wire` bus and
+  VL53L0X on SDA GPIO10/SCL GPIO9. It polls measurement readiness without
+  waiting for a range to complete, shares the existing sensor task, and
+  publishes the newest complete `LaserDistanceSnapshot` through a static
+  one-element queue.
 - ESP2 motion task on core 1: line sensor acquisition, pure line observation,
   chassis control, mechanism coordination, and consumption of the latest IMU
   snapshot.
@@ -42,6 +47,29 @@ Do not create one task per sensor. The ESP2 sensor-acquisition task is the one
 shared acquisition path for work that must be isolated from control; add future
 bounded sensor work to that service instead of adding a task for each device.
 Sensor acquisition produces immutable snapshots that downstream logic consumes.
+
+ESP1 starts the VL53L0X in continuous timed ranging with the library's
+high-accuracy sensor profile, a 200 ms intermeasurement period, a 10 ms nonblocking service
+period, a 100 kHz bus, and a 5 ms I2C transaction timeout. A new result is sent
+to ESP2 in a dedicated CRC-protected UART frame; an unchanged startup or fault
+snapshot is resent every 100 ms as a heartbeat. ESP2 measures freshness from
+arrival of a new measurement sequence, not from receipt of that heartbeat.
+
+The current ESP1 mission state machine still emits only disabled chassis
+commands. ESP2's explicit `HABITAT_PIECES` mode line-follows with the front
+sensors at a separately adjustable duty. It ignores the ESP1-owned LSS2 input
+for a locked-by-default `lss2_detection_delay_ms`. A fresh black LSS2 snapshot
+after that delay transitions to a straight-backward
+open-loop mecanum command at configured `reverse_duty` for
+`reverse_duration_ms`; completion latches stop. `run_timeout_ms` bounds the
+LSS2 search and must be longer than the detection delay. LSS2 configuration and
+sensor-snapshot freshness are required through detection. The reverse remains
+bounded by its own duration and the normal motor/link command-expiry gates.
+Mission-state integration is still separate future work.
+
+The VL53L0X continues operating in its globally selected high-accuracy profile
+and remains available for telemetry, but Habitat Pieces no longer gates motion
+or stopping on laser data or profile acknowledgement.
 
 ESP2 initializes and calibrates the IMU during disabled startup, then transfers
 all runtime updates and heading-reset commands to the sensor-acquisition
@@ -58,13 +86,27 @@ only enqueue a reset on a separate static one-element queue. It cannot access
 mode, or issue a wheel command. Heading resets retain their separate queue and
 existing acknowledgement path.
 
-Stage 2 adds a separate, manual-only `IMU_TURN_TEST` mode. Its
+Stage 2 adds a shared IMU turn controller plus the manual `IMU_TURN_TEST` mode. Its
 hardware-independent PD controller captures one continuous relative-heading
 target, applies yaw-rate damping, and requires both angle and rate to remain
-inside their configured limits for the full settling time. Only this mode
-generates IMU-corrected wheel commands. It passes the resulting
-`FourWheelCommand` through `applyWheelCommand()` unchanged. Line following,
-autonomous states, and the line PID do not invoke the IMU controller.
+inside their configured limits for the full settling time. Tower Pieces and
+PegFinder supply their mode-specific clockwise angles to this same controller;
+all output limits, gains, tolerances, settling time, timeout, and polarity stay
+owned by the shared IMU Turn configuration. Resulting wheel commands pass
+through `applyWheelCommand()` unchanged.
+
+Stage 3 adds a shared heading-hold controller plus the manual
+`IMU_STRAFE_TEST` mode. Its
+hardware-independent PD heading controller captures the current continuous
+heading once when a held left/right strafe begins. The motion task combines
+the configured lateral duty with a limited yaw correction before calling the
+existing mecanum mixer, then passes the resulting `FourWheelCommand` through
+`applyWheelCommand()` unchanged. Solar lateral stages, the Tower initial
+strafe and shimmy, and the optional Time Trial transition use the same live
+Stage 3 configuration while retaining their mode-specific durations/timeouts.
+A dedicated browser heartbeat expires manual held tests after the existing
+command timeout. Autonomous uses state-machine durations and the normal
+communication expiry path.
 
 ## Shared Code
 

@@ -74,6 +74,13 @@ bool imuTurnActive(const ImuTurnControllerState& state) {
          state.state == ImuTurnState::Settling;
 }
 
+float clockwiseTurnRelativeAngleDeg(
+    const float clockwise_angle_deg,
+    const int yaw_command_polarity) {
+  return clockwise_angle_deg *
+         static_cast<float>(yaw_command_polarity);
+}
+
 void resetImuTurnController(ImuTurnControllerState& state) {
   state = {};
 }
@@ -114,6 +121,17 @@ void stopImuTurn(ImuTurnControllerState& state) {
   state.state = ImuTurnState::Stopped;
   state.fault_reason = ImuTurnFaultReason::None;
   state.settling_started_at_ms = 0U;
+}
+
+void deferImuTurnTimers(ImuTurnControllerState& state,
+                        const Milliseconds duration_ms) {
+  if (!imuTurnActive(state) || duration_ms == 0U) {
+    return;
+  }
+  state.started_at_ms += duration_ms;
+  if (state.state == ImuTurnState::Settling) {
+    state.settling_started_at_ms += duration_ms;
+  }
 }
 
 void faultImuTurn(ImuTurnControllerState& state,

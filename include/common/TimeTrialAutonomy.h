@@ -21,13 +21,16 @@ enum class TimeTrialState : std::uint8_t {
 struct TimeTrialConfig {
   // TODO(team): tune these transitions on the real robot.
   Milliseconds post_solar_delay_ms{0U};
-  float solar_to_tower_strafe_right_duty{0.0F};
   Milliseconds solar_to_tower_strafe_right_duration_ms{0U};
   Milliseconds post_tower_delay_ms{0U};
 };
 
 struct TimeTrialInputs {
   bool solar_complete{false};
+  // The solar routine has found the rear tape and initialized the reverse
+  // line follower. Time Trial can transfer that active follower directly to
+  // the Tower Pieces crossing-count phase without a stop/restart transition.
+  bool solar_line_follow_ready{false};
   bool solar_fault{false};
   bool tower_pieces_complete{false};
   bool tower_pieces_fault{false};
@@ -45,6 +48,7 @@ struct TimeTrialUpdate {
   bool should_start_solar{false};
   bool should_strafe_right{false};
   bool should_start_tower_pieces{false};
+  bool should_handoff_solar_line_follow{false};
   bool should_start_peg_finder{false};
 };
 

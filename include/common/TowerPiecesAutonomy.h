@@ -33,6 +33,7 @@ enum class TowerPiecesState : std::uint8_t {
   PostClawsClosedDelay = 21,
   MoveStepperTop = 22,
   WinchClosed = 23,
+  PreStepperBottomDelay = 24,
 };
 
 enum class TowerPiecesFaultReason : std::uint8_t {
@@ -47,30 +48,36 @@ enum class TowerPiecesFaultReason : std::uint8_t {
   StepperCommandFailed = 8,
   StepperLimitSearchFailed = 9,
   ConflictingLimitSwitches = 10,
+  ImuUnavailable = 11,
+  ImuStrafeFailed = 12,
+  ImuTurnFailed = 13,
+  ImuTurnTimeout = 14,
 };
 
 struct TowerPiecesConfig {
   // TODO(team): set all values from the telemetry panel after hardware tests.
   float reverse_line_duty{0.0F};
   Milliseconds side_line_timeout_ms{0U};
+  Milliseconds side_line_cooldown_ms{0U};
+  Milliseconds side_line_rearm_ms{0U};
   Milliseconds post_line_delay_ms{1000U};
   float strafe_right_duty{0.0F};
   Milliseconds strafe_right_duration_ms{0U};
   Milliseconds post_strafe_pause_ms{1000U};
-  float clockwise_rotation_duty{0.0F};
-  Milliseconds clockwise_rotation_duration_ms{0U};
+  float clockwise_rotation_angle_deg{0.0F};
   Milliseconds post_rotation_pause_ms{1000U};
   float reverse_duty{0.0F};
   Milliseconds reverse_duration_ms{0U};
-  float shimmy_duty{0.0F};
   Milliseconds shimmy_right_duration_ms{0U};
   Milliseconds shimmy_left_duration_ms{0U};
   Milliseconds shimmy_timeout_ms{0U};
+  float shimmy_duty{0.0F};
   float final_reverse_duty{0.0F};
   Milliseconds final_reverse_duration_ms{0U};
   Milliseconds post_final_reverse_delay_ms{1000U};
   Milliseconds post_winch_open_delay_ms{1000U};
   Milliseconds post_claws_open_delay_ms{1000U};
+  Milliseconds pre_stepper_bottom_delay_ms{0U};
   std::uint32_t stepper_down_speed_steps_per_second{2000U};
   Milliseconds post_stepper_bottom_delay_ms{1000U};
   Milliseconds post_claws_closed_delay_ms{1000U};
@@ -83,6 +90,7 @@ struct TowerPiecesInputs {
   bool back_right_line_high{false};
   bool bottom_limit_active{false};
   bool top_limit_active{false};
+  bool clockwise_turn_complete{false};
 };
 
 struct TowerPiecesAutonomy {
@@ -92,14 +100,25 @@ struct TowerPiecesAutonomy {
   Milliseconds started_at_ms{0U};
   Milliseconds shimmy_started_at_ms{0U};
   std::uint8_t side_line_count{0U};
+  std::uint16_t side_line_rejected_count{0U};
   bool previous_side_line_high{false};
+  bool side_line_armed{false};
+  bool side_line_off_timing{false};
+  bool last_side_line_detection_accepted{false};
+  bool last_side_line_detection_rejected{false};
+  Milliseconds side_line_off_started_at_ms{0U};
+  Milliseconds side_line_last_accepted_at_ms{0U};
 };
 
 struct TowerPiecesUpdate {
   TowerPiecesState state{TowerPiecesState::WaitForStart};
   TowerPiecesFaultReason fault_reason{TowerPiecesFaultReason::None};
   std::uint8_t side_line_count{0U};
+  std::uint16_t side_line_rejected_count{0U};
   bool side_line_rising_edge{false};
+  bool side_line_detection_accepted{false};
+  bool side_line_detection_rejected{false};
+  bool side_line_armed{false};
   bool should_line_follow{false};
   bool should_initial_strafe_right{false};
   bool should_rotate_clockwise{false};

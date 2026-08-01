@@ -8,7 +8,7 @@
 
 namespace robot {
 
-constexpr std::uint8_t kUartProtocolVersion = 1U;
+constexpr std::uint8_t kUartProtocolVersion = 2U;
 constexpr std::size_t kUartMaxPayloadSize = 48U;
 constexpr std::size_t kUartFrameOverheadSize = 10U;
 constexpr std::uint8_t kUartFrameMagic0 = 0xA5U;
@@ -22,6 +22,7 @@ enum class UartMessageType : std::uint8_t {
   SensorSnapshot = 5,
   HealthReport = 6,
   Fault = 7,
+  LaserDistanceSnapshot = 8,
 };
 
 struct UartPacketHeader {

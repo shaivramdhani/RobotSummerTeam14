@@ -21,6 +21,9 @@ enum class RobotTestMode : std::uint8_t {
   PegFinder = 13,
   TimeTrial = 14,
   ImuTurnTest = 15,
+  ImuStrafeTest = 16,
+  HabitatPieces = 17,
+  HabitatPlacement = 18,
 };
 
 const char* robotTestModeName(RobotTestMode mode);

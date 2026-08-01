@@ -41,4 +41,8 @@ bool RobotTestModeManager::acceptsImuTurnCommand() const {
   return current_mode_ == RobotTestMode::ImuTurnTest;
 }
 
+bool RobotTestModeManager::acceptsImuStrafeCommand() const {
+  return current_mode_ == RobotTestMode::ImuStrafeTest;
+}
+
 }  // namespace robot

@@ -30,7 +30,7 @@ constexpr float kGyroLsbPerDps = 65.5F;
 constexpr float kYawRateDeadbandDps = 0.0F;
 constexpr std::uint32_t kMaximumIntegrationIntervalUs = 100000U;
 constexpr std::uint32_t kUnhealthyConsecutiveReadCount = 3U;
-constexpr std::uint16_t kI2cFrequencyKhz = 100U;
+constexpr std::uint16_t kI2cFrequencyKhz = 50U;
 constexpr std::uint16_t kI2cTransactionTimeoutMs = 5U;
 constexpr std::uint16_t kResetDelayMs = 100U;
 constexpr std::uint16_t kWakeDelayMs = 10U;
@@ -84,6 +84,41 @@ const char* imuInitializationErrorName(
       return "MEASUREMENT_READ_FAILED";
   }
   return "UNKNOWN";
+}
+
+const char* imuReadFailureReasonName(
+    const ImuReadFailureReason reason) {
+  switch (reason) {
+    case ImuReadFailureReason::None:
+      return "NONE";
+    case ImuReadFailureReason::NotInitialized:
+      return "NOT_INITIALIZED";
+    case ImuReadFailureReason::NotCalibrated:
+      return "NOT_CALIBRATED";
+    case ImuReadFailureReason::I2cBufferOverflow:
+      return "I2C_BUFFER_OVERFLOW";
+    case ImuReadFailureReason::I2cAddressNack:
+      return "I2C_ADDRESS_NACK";
+    case ImuReadFailureReason::I2cDataNack:
+      return "I2C_DATA_NACK";
+    case ImuReadFailureReason::I2cBusError:
+      return "I2C_BUS_ERROR";
+    case ImuReadFailureReason::I2cTimeout:
+      return "I2C_TIMEOUT";
+    case ImuReadFailureReason::I2cWriteFailed:
+      return "I2C_WRITE_FAILED";
+    case ImuReadFailureReason::IncompleteRead:
+      return "INCOMPLETE_READ";
+    case ImuReadFailureReason::RuntimeConfigurationMismatch:
+      return "RUNTIME_CONFIGURATION_MISMATCH";
+    case ImuReadFailureReason::InvalidYawRate:
+      return "INVALID_YAW";
+    case ImuReadFailureReason::InvalidHeading:
+      return "INVALID_HEADING";
+    case ImuReadFailureReason::Unknown:
+      return "UNKNOWN_READ_FAILURE";
+  }
+  return "UNKNOWN_READ_FAILURE";
 }
 
 bool Mpu6050Imu::begin(TwoWire& wire, const int sda_gpio,
@@ -173,6 +208,7 @@ bool Mpu6050Imu::begin(TwoWire& wire, const int sda_gpio,
   }
 
   state_.initialized = true;
+  state_.runtime_configuration_valid = true;
   state_.initialization_error = ImuInitializationError::None;
   return true;
 }
@@ -199,7 +235,10 @@ bool Mpu6050Imu::calibrateGyroZ(const std::uint16_t sample_count) {
       state_.consecutive_failed_reads = 0U;
       state_.last_successful_read_us = micros();
     } else {
-      recordReadFailure();
+      recordReadFailure(
+          pending_read_failure_reason_ == ImuReadFailureReason::None
+              ? ImuReadFailureReason::Unknown
+              : pending_read_failure_reason_);
     }
     delay(kCalibrationSampleDelayMs);
   }
@@ -229,21 +268,47 @@ bool Mpu6050Imu::calibrateGyroZ(const std::uint16_t sample_count) {
 }
 
 bool Mpu6050Imu::update() {
-  if (!state_.initialized || !state_.calibrated) {
+  if (!state_.initialized) {
+    state_.last_read_failure_reason =
+        ImuReadFailureReason::NotInitialized;
+    state_.last_read_failure_us = micros();
     state_.healthy = false;
+    return false;
+  }
+  if (!state_.calibrated) {
+    state_.last_read_failure_reason =
+        ImuReadFailureReason::NotCalibrated;
+    state_.last_read_failure_us = micros();
+    state_.healthy = false;
+    return false;
+  }
+
+  const bool recovering_from_read_failure =
+      state_.consecutive_failed_reads > 0U;
+  if (recovering_from_read_failure &&
+      !runtimeConfigurationMatches()) {
+    recordReadFailure(
+        pending_read_failure_reason_ == ImuReadFailureReason::None
+            ? ImuReadFailureReason::RuntimeConfigurationMismatch
+            : pending_read_failure_reason_);
     return false;
   }
 
   std::int16_t raw_gyro_z = 0;
   if (!readRawGyroZ(raw_gyro_z)) {
-    recordReadFailure();
+    recordReadFailure(
+        pending_read_failure_reason_ == ImuReadFailureReason::None
+            ? ImuReadFailureReason::Unknown
+            : pending_read_failure_reason_);
     return false;
   }
 
   const std::uint32_t now_us = micros();
   const std::uint32_t previous_update_us = state_.last_update_us;
   const std::uint32_t interval_us =
-      previous_update_us == 0U ? 0U : now_us - previous_update_us;
+      previous_update_us == 0U || recovering_from_read_failure
+          ? 0U
+          : now_us - previous_update_us;
 
   state_.raw_gyro_z = raw_gyro_z;
   state_.last_update_us = now_us;
@@ -251,6 +316,7 @@ bool Mpu6050Imu::update() {
   state_.last_sample_interval_us = interval_us;
   ++state_.successful_read_count;
   state_.consecutive_failed_reads = 0U;
+  state_.runtime_configuration_valid = true;
 
   float corrected_rate =
       static_cast<float>(raw_gyro_z) / kGyroLsbPerDps -
@@ -260,6 +326,9 @@ bool Mpu6050Imu::update() {
   }
   if (!std::isfinite(corrected_rate)) {
     state_.yaw_rate_dps = 0.0F;
+    state_.last_read_failure_reason =
+        ImuReadFailureReason::InvalidYawRate;
+    state_.last_read_failure_us = micros();
     state_.healthy = false;
     return false;
   }
@@ -271,6 +340,9 @@ bool Mpu6050Imu::update() {
   }
   if (!std::isfinite(state_.heading_deg)) {
     state_.heading_deg = 0.0F;
+    state_.last_read_failure_reason =
+        ImuReadFailureReason::InvalidHeading;
+    state_.last_read_failure_us = micros();
     state_.healthy = false;
     return false;
   }
@@ -325,27 +397,71 @@ bool Mpu6050Imu::writeRegister(const std::uint8_t register_address,
 bool Mpu6050Imu::readRegisters(const std::uint8_t start_register,
                                std::uint8_t* const output,
                                const std::uint8_t length) {
+  pending_read_failure_reason_ = ImuReadFailureReason::None;
   if (wire_ == nullptr || output == nullptr || length == 0U) {
+    pending_read_failure_reason_ = ImuReadFailureReason::Unknown;
     return false;
   }
 
+  const std::uint32_t lock_acquire_started_us = micros();
   wire_->beginTransmission(state_.address);
+  state_.last_wire_lock_acquire_duration_us =
+      static_cast<std::uint32_t>(
+          micros() - lock_acquire_started_us);
+  if (state_.last_wire_lock_acquire_duration_us >
+      state_.maximum_wire_lock_acquire_duration_us) {
+    state_.maximum_wire_lock_acquire_duration_us =
+        state_.last_wire_lock_acquire_duration_us;
+  }
   if (wire_->write(start_register) != 1U) {
     state_.last_wire_status =
         static_cast<int>(wire_->endTransmission(true));
+    pending_read_failure_reason_ = ImuReadFailureReason::I2cWriteFailed;
     return false;
   }
   state_.last_wire_status =
       static_cast<int>(wire_->endTransmission(
           !state_.register_reads_use_repeated_start));
   if (state_.last_wire_status != 0) {
+    switch (state_.last_wire_status) {
+      case 1:
+        pending_read_failure_reason_ =
+            ImuReadFailureReason::I2cBufferOverflow;
+        break;
+      case 2:
+        pending_read_failure_reason_ =
+            ImuReadFailureReason::I2cAddressNack;
+        break;
+      case 3:
+        pending_read_failure_reason_ =
+            ImuReadFailureReason::I2cDataNack;
+        break;
+      case 5:
+        pending_read_failure_reason_ =
+            ImuReadFailureReason::I2cTimeout;
+        break;
+      default:
+        pending_read_failure_reason_ =
+            ImuReadFailureReason::I2cBusError;
+        break;
+    }
     return false;
   }
 
+  const std::uint32_t read_started_us = micros();
   const std::size_t received =
       wire_->requestFrom(state_.address,
                          static_cast<std::size_t>(length), true);
+  const std::uint32_t read_duration_us =
+      static_cast<std::uint32_t>(micros() - read_started_us);
   if (received != length) {
+    pending_read_failure_reason_ =
+        read_duration_us >=
+                static_cast<std::uint32_t>(
+                    kI2cTransactionTimeoutMs) *
+                    1000U
+            ? ImuReadFailureReason::I2cTimeout
+            : ImuReadFailureReason::IncompleteRead;
     while (wire_->available() > 0) {
       (void)wire_->read();
     }
@@ -354,6 +470,8 @@ bool Mpu6050Imu::readRegisters(const std::uint8_t start_register,
 
   for (std::uint8_t index = 0U; index < length; ++index) {
     if (wire_->available() <= 0) {
+      pending_read_failure_reason_ =
+          ImuReadFailureReason::IncompleteRead;
       return false;
     }
     output[index] = static_cast<std::uint8_t>(wire_->read());
@@ -362,9 +480,19 @@ bool Mpu6050Imu::readRegisters(const std::uint8_t start_register,
 }
 
 bool Mpu6050Imu::readRawGyroZ(std::int16_t& raw_gyro_z) {
+  const std::uint32_t read_started_us = micros();
   std::uint8_t measurements[kMeasurementByteCount]{};
-  if (!readRegisters(kAccelXoutHighRegister, measurements,
-                     kMeasurementByteCount)) {
+  const bool read_succeeded =
+      readRegisters(kAccelXoutHighRegister, measurements,
+                    kMeasurementByteCount);
+  state_.last_measurement_read_duration_us =
+      static_cast<std::uint32_t>(micros() - read_started_us);
+  if (state_.last_measurement_read_duration_us >
+      state_.maximum_measurement_read_duration_us) {
+    state_.maximum_measurement_read_duration_us =
+        state_.last_measurement_read_duration_us;
+  }
+  if (!read_succeeded) {
     return false;
   }
   raw_gyro_z =
@@ -373,9 +501,37 @@ bool Mpu6050Imu::readRawGyroZ(std::int16_t& raw_gyro_z) {
   return true;
 }
 
-void Mpu6050Imu::recordReadFailure() {
+bool Mpu6050Imu::runtimeConfigurationMatches() {
+  std::uint8_t identity = 0U;
+  std::uint8_t filter_and_ranges[3]{};
+  std::uint8_t power_management = 0U;
+  const bool reads_succeeded =
+      readRegisters(kWhoAmIRegister, &identity, 1U) &&
+      readRegisters(kConfigRegister, filter_and_ranges,
+                    sizeof(filter_and_ranges)) &&
+      readRegisters(kPowerManagement1Register, &power_management, 1U);
+  state_.runtime_configuration_valid =
+      reads_succeeded && supportedIdentity(identity) &&
+      filter_and_ranges[0] == kModerateDigitalLowPassFilter &&
+      filter_and_ranges[1] == kGyroRange500Dps &&
+      filter_and_ranges[2] == kAccelRange4G &&
+      power_management == kGyroClockSource;
+  if (reads_succeeded && !state_.runtime_configuration_valid) {
+    pending_read_failure_reason_ =
+        ImuReadFailureReason::RuntimeConfigurationMismatch;
+  }
+  return state_.runtime_configuration_valid;
+}
+
+void Mpu6050Imu::recordReadFailure(
+    const ImuReadFailureReason reason) {
   ++state_.failed_read_count;
   ++state_.consecutive_failed_reads;
+  state_.last_read_failure_reason =
+      reason == ImuReadFailureReason::None
+          ? ImuReadFailureReason::Unknown
+          : reason;
+  state_.last_read_failure_us = micros();
   if (state_.consecutive_failed_reads >= kUnhealthyConsecutiveReadCount) {
     state_.healthy = false;
   }

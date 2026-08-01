@@ -68,11 +68,19 @@ bool imuTurnConfigValid(const ImuTurnConfig& config,
                         float maximum_allowed_duty);
 bool imuTurnActive(const ImuTurnControllerState& state);
 
+// Converts a positive physical clockwise request into the IMU heading sign.
+// With the same polarity applied to the controller output, the chassis yaw
+// command is positive (clockwise) for either valid sensor mounting polarity.
+float clockwiseTurnRelativeAngleDeg(float clockwise_angle_deg,
+                                    int yaw_command_polarity);
+
 void resetImuTurnController(ImuTurnControllerState& state);
 bool startImuTurn(ImuTurnControllerState& state, float current_heading_deg,
                   float relative_angle_deg, const ImuTurnConfig& config,
                   float maximum_allowed_duty, Milliseconds now_ms);
 void stopImuTurn(ImuTurnControllerState& state);
+void deferImuTurnTimers(ImuTurnControllerState& state,
+                        Milliseconds duration_ms);
 void faultImuTurn(ImuTurnControllerState& state,
                   ImuTurnFaultReason reason);
 ImuTurnUpdate updateImuTurn(ImuTurnControllerState& state,

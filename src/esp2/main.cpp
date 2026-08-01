@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <driver/mcpwm.h>
 #include <esp_system.h>
 
 #include <array>
@@ -17,10 +18,15 @@
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
 #include "common/FunnelCommand.h"
+#include "common/HabitatPiecesAutonomy.h"
+#include "common/HabitatPlacementAutonomy.h"
+#include "common/ImuHeadingHoldController.h"
+#include "common/ImuRecovery.h"
 #include "common/ImuTurnController.h"
 #include "common/LineFollower.h"
 #include "common/LineObservation.h"
 #include "common/LineSensor.h"
+#include "common/LaserDistance.h"
 #include "common/MotionDiagnostics.h"
 #include "common/MotorOutput.h"
 #include "common/PegFinderAutonomy.h"
@@ -28,6 +34,7 @@
 #include "common/RearLineSensor.h"
 #include "common/RobotCommandValidation.h"
 #include "common/RobotTestModeManager.h"
+#include "common/SolarHookServo.h"
 #include "common/SolarPanelAutonomy.h"
 #include "common/TelemetrySnapshot.h"
 #include "common/TimeTrialAutonomy.h"
@@ -54,16 +61,27 @@ constexpr BaseType_t kTaskCore = 1;
 constexpr UBaseType_t kSensorAcquisitionTaskPriority = 1U;
 constexpr BaseType_t kSensorAcquisitionTaskCore = 0;
 constexpr std::size_t kSerialCommandBufferSize = 128U;
-constexpr std::size_t kJsonBufferSize = 16384U;
+constexpr std::size_t kJsonBufferSize = 20480U;
 constexpr std::size_t kClawServoCount = 3U;
-constexpr std::size_t kMechanismServoCount = 4U;
-constexpr std::size_t kWinchServoIndex = 3U;
+constexpr std::size_t kMechanismServoCount = 5U;
+constexpr std::size_t kHabitatPusherServoIndex = 3U;
+constexpr std::size_t kWinchServoIndex = 4U;
 constexpr int kClawServoUnsetAngleDeg = -1;
 constexpr int kLegacyClawServoRotationDeg = 90;
 constexpr std::uint8_t kImuI2cAddress = 0x68U;
 constexpr std::uint16_t kImuCalibrationSampleCount = 500U;
 constexpr std::uint32_t kImuFreshnessTimeoutUs = 75000U;
+// Reuse the established maximum timed-motion bound while all wheel outputs
+// are disabled. Three confirmations match the driver's unhealthy threshold.
+constexpr robot::ImuRecoveryConfig kAutonomousImuRecoveryConfig{
+    kMaxTimedTestDurationMs, 3U};
 constexpr robot::Milliseconds kPreCalibrationStopSettleMs = 20U;
+static_assert(kAutonomousImuRecoveryConfig.maximum_pause_ms > 0U,
+              "autonomous IMU recovery must remain bounded");
+static_assert(
+    kAutonomousImuRecoveryConfig
+            .consecutive_fresh_samples_required > 0U,
+    "autonomous IMU recovery requires fresh-sample confirmation");
 
 // Solar-panel first-stage tuning. TEMPORARY DEFAULTS: tune with the real
 // beacon, sensor, lighting, and motors running before driving at speed.
@@ -82,7 +100,7 @@ constexpr robot::Milliseconds SOLAR_SLOW_AFTER_MS = 7500U;
 constexpr float SOLAR_SLOW_BASE_DUTY = 0.12F;
 constexpr robot::Milliseconds SOLAR_CONTACT_TIMEOUT_MS =
     SOLAR_SEARCH_TIMEOUT_MS;
-constexpr float SOLAR_CONTACT_STRAFE_DUTY = SOLAR_SLOW_BASE_DUTY;
+constexpr float SOLAR_RETRY_FORWARD_DUTY = SOLAR_SLOW_BASE_DUTY;
 constexpr robot::Milliseconds SOLAR_STRAFE_START_DELAY_MS = 300U;
 // TODO(team): tune both adjustment durations on the real robot. Zero keeps the
 // new motion phases disabled until values are applied through telemetry.
@@ -91,11 +109,9 @@ constexpr robot::Milliseconds SOLAR_RETRY_FORWARD_DURATION_MS = 150U;
 constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_TIMEOUT_MS =
     SOLAR_CONTACT_TIMEOUT_MS;
 constexpr robot::Milliseconds SOLAR_POST_CONTACT_FORWARD_DURATION_MS = 1300U;
-constexpr float SOLAR_LINE_REACQUIRE_STRAFE_DUTY =
-    SOLAR_CONTACT_STRAFE_DUTY;
 constexpr robot::Milliseconds SOLAR_POST_CONTACT_FORWARD_START_DELAY_MS = 500U;
 constexpr robot::Milliseconds SOLAR_LINE_REACQUIRE_STRAFE_START_DELAY_MS = 500U;
-constexpr float SOLAR_POST_CONTACT_FORWARD_DUTY = SOLAR_CONTACT_STRAFE_DUTY;
+constexpr float SOLAR_POST_CONTACT_FORWARD_DUTY = SOLAR_RETRY_FORWARD_DUTY;
 // Team wiring report: raw HIGH means the solar side switch has been hit.
 constexpr bool SOLAR_LIMIT_SWITCH_HIT_WHEN_HIGH = true;
 constexpr robot::SolarPanelAutonomyConfig kSolarPanelAutonomyConfig{
@@ -104,16 +120,20 @@ constexpr robot::SolarPanelAutonomyConfig kSolarPanelAutonomyConfig{
     SOLAR_SEARCH_TIMEOUT_MS};
 constexpr robot::SolarPanelContactConfig kSolarPanelContactConfig{
     SOLAR_CONTACT_TIMEOUT_MS,
-    SOLAR_CONTACT_STRAFE_DUTY,
+    0.0F,  // TODO(team): tune each strafe duty in telemetry.
+    0.0F,
+    0.0F,
+    SOLAR_RETRY_FORWARD_DUTY,
     SOLAR_STRAFE_START_DELAY_MS,
     SOLAR_RETRY_STRAFE_LEFT_DURATION_MS,
     SOLAR_RETRY_FORWARD_DURATION_MS,
     SOLAR_RETRY_STRAFE_TIMEOUT_MS,
     SOLAR_POST_CONTACT_FORWARD_DURATION_MS,
-    SOLAR_LINE_REACQUIRE_STRAFE_DUTY,
     SOLAR_POST_CONTACT_FORWARD_START_DELAY_MS,
     SOLAR_LINE_REACQUIRE_STRAFE_START_DELAY_MS,
-    SOLAR_POST_CONTACT_FORWARD_DUTY};
+    SOLAR_POST_CONTACT_FORWARD_DUTY,
+    0.0F,  // TODO(team): tune the rear-line strafe duty in telemetry.
+    0U};   // TODO(team): tune the backward PID duration in telemetry.
 
 static_assert(IR_BEACON_RELEASE_THRESHOLD_1KHZ <=
                   IR_BEACON_DETECT_THRESHOLD_1KHZ,
@@ -132,16 +152,13 @@ static_assert(SOLAR_SLOW_BASE_DUTY >= 0.0F && SOLAR_SLOW_BASE_DUTY <= 1.0F,
               "solar slow base duty must be in [0, 1]");
 static_assert(SOLAR_CONTACT_TIMEOUT_MS > 0U,
               "solar contact timeout must be nonzero");
-static_assert(SOLAR_CONTACT_STRAFE_DUTY >= 0.0F &&
-                  SOLAR_CONTACT_STRAFE_DUTY <= 1.0F,
-              "solar contact strafe duty must be in [0, 1]");
+static_assert(SOLAR_RETRY_FORWARD_DUTY >= 0.0F &&
+                  SOLAR_RETRY_FORWARD_DUTY <= 1.0F,
+              "solar retry forward duty must be in [0, 1]");
 static_assert(SOLAR_STRAFE_START_DELAY_MS > 0U,
               "solar strafe start delay must be nonzero");
 static_assert(SOLAR_RETRY_STRAFE_TIMEOUT_MS > 0U,
               "solar retry strafe timeout must be nonzero");
-static_assert(SOLAR_LINE_REACQUIRE_STRAFE_DUTY >= 0.0F &&
-                  SOLAR_LINE_REACQUIRE_STRAFE_DUTY <= 1.0F,
-              "solar line-reacquire strafe duty must be in [0, 1]");
 static_assert(SOLAR_POST_CONTACT_FORWARD_DUTY >= 0.0F &&
                   SOLAR_POST_CONTACT_FORWARD_DUTY <= 1.0F,
               "solar post-contact forward duty must be in [0, 1]");
@@ -256,16 +273,78 @@ std::uint32_t pwmMaxDuty(const std::uint8_t resolution_bits) {
 
 bool servoOutputConfigComplete(
     const robot::esp2::ServoOutputConfig& config) {
-  if (!gpioAssigned(config.gpio) || config.pwm_channel < 0 ||
-      config.pwm_frequency_hz == 0U || config.pwm_resolution_bits == 0U ||
-      config.pwm_resolution_bits >= 31U ||
+  if (!gpioAssigned(config.gpio) ||
+      config.backend == robot::esp2::ServoPwmBackend::Unconfigured ||
+      config.pwm_frequency_hz == 0U ||
       config.minimum_pulse_us == 0U ||
       config.maximum_pulse_us <= config.minimum_pulse_us) {
     return false;
   }
 
   const std::uint32_t period_us = 1000000UL / config.pwm_frequency_hz;
-  return period_us > config.maximum_pulse_us;
+  if (period_us <= config.maximum_pulse_us) {
+    return false;
+  }
+
+  if (config.backend == robot::esp2::ServoPwmBackend::Ledc) {
+    return config.ledc_channel >= 0 &&
+           config.ledc_resolution_bits > 0U &&
+           config.ledc_resolution_bits < 31U;
+  }
+  if (config.backend == robot::esp2::ServoPwmBackend::Mcpwm) {
+    return config.mcpwm_unit >= 0 &&
+           config.mcpwm_unit < static_cast<int>(MCPWM_UNIT_MAX) &&
+           config.mcpwm_timer >= 0 &&
+           config.mcpwm_timer < static_cast<int>(MCPWM_TIMER_MAX) &&
+           config.mcpwm_generator >= 0 &&
+           config.mcpwm_generator < static_cast<int>(MCPWM_GEN_MAX) &&
+           config.mcpwm_timer_resolution_hz > 0U;
+  }
+  return false;
+}
+
+mcpwm_unit_t mcpwmUnit(
+    const robot::esp2::ServoOutputConfig& config) {
+  return static_cast<mcpwm_unit_t>(config.mcpwm_unit);
+}
+
+mcpwm_timer_t mcpwmTimer(
+    const robot::esp2::ServoOutputConfig& config) {
+  return static_cast<mcpwm_timer_t>(config.mcpwm_timer);
+}
+
+mcpwm_generator_t mcpwmGenerator(
+    const robot::esp2::ServoOutputConfig& config) {
+  return static_cast<mcpwm_generator_t>(config.mcpwm_generator);
+}
+
+bool mcpwmSignal(const robot::esp2::ServoOutputConfig& config,
+                 mcpwm_io_signals_t& signal) {
+  if (config.mcpwm_timer == 0 && config.mcpwm_generator == 0) {
+    signal = MCPWM0A;
+    return true;
+  }
+  if (config.mcpwm_timer == 0 && config.mcpwm_generator == 1) {
+    signal = MCPWM0B;
+    return true;
+  }
+  if (config.mcpwm_timer == 1 && config.mcpwm_generator == 0) {
+    signal = MCPWM1A;
+    return true;
+  }
+  if (config.mcpwm_timer == 1 && config.mcpwm_generator == 1) {
+    signal = MCPWM1B;
+    return true;
+  }
+  if (config.mcpwm_timer == 2 && config.mcpwm_generator == 0) {
+    signal = MCPWM2A;
+    return true;
+  }
+  if (config.mcpwm_timer == 2 && config.mcpwm_generator == 1) {
+    signal = MCPWM2B;
+    return true;
+  }
+  return false;
 }
 
 const char* resetReasonName(const esp_reset_reason_t reason) {
@@ -508,6 +587,18 @@ class RearCommandLink {
     return sendPacket(packet);
   }
 
+  bool send(const robot::SolarHookCommand& command) {
+    if (!configured_) {
+      healthy_ = false;
+      return false;
+    }
+
+    const std::uint16_t sequence = next_sequence_++;
+    const robot::UartPacket packet =
+        robot::makeSolarHookCommandPacket(command, sequence);
+    return sendPacket(packet);
+  }
+
  private:
   bool sendPacket(const robot::UartPacket& packet) {
     std::uint8_t frame[robot::kUartFrameOverheadSize +
@@ -564,6 +655,29 @@ class RearCommandLink {
           } else {
             ++packet_error_count_;
           }
+        } else if (packet.header.message_type ==
+                   robot::UartMessageType::LaserDistanceSnapshot) {
+          robot::LaserDistanceSnapshot snapshot{};
+          if (robot::decodeLaserDistancePacket(packet, snapshot)) {
+            if (laser_snapshot_available_ &&
+                packet.header.sequence == last_laser_packet_sequence_) {
+              ++packet_error_count_;
+            } else {
+              const bool new_measurement =
+                  !laser_snapshot_available_ ||
+                  snapshot.measurement_sequence !=
+                      latest_laser_snapshot_.measurement_sequence;
+              latest_laser_snapshot_ = snapshot;
+              last_laser_packet_sequence_ = packet.header.sequence;
+              last_laser_snapshot_received_at_ms_ = now_ms;
+              if (new_measurement) {
+                last_laser_measurement_received_at_ms_ = now_ms;
+              }
+              laser_snapshot_available_ = true;
+            }
+          } else {
+            ++packet_error_count_;
+          }
         } else {
           ++packet_error_count_;
         }
@@ -611,6 +725,21 @@ class RearCommandLink {
   std::uint16_t lastRearLineSequence() const {
     return last_rear_line_sequence_;
   }
+  bool laserSnapshotAvailable() const {
+    return laser_snapshot_available_;
+  }
+  const robot::LaserDistanceSnapshot& latestLaserSnapshot() const {
+    return latest_laser_snapshot_;
+  }
+  robot::Milliseconds lastLaserSnapshotReceivedAtMs() const {
+    return last_laser_snapshot_received_at_ms_;
+  }
+  robot::Milliseconds lastLaserMeasurementReceivedAtMs() const {
+    return last_laser_measurement_received_at_ms_;
+  }
+  std::uint16_t lastLaserPacketSequence() const {
+    return last_laser_packet_sequence_;
+  }
 
  private:
   const robot::esp2::UartConfig& config_;
@@ -621,13 +750,18 @@ class RearCommandLink {
   bool healthy_{false};
   bool status_available_{false};
   bool rear_line_snapshot_available_{false};
+  bool laser_snapshot_available_{false};
   robot::Milliseconds last_rear_sent_at_ms_{0};
   robot::Milliseconds last_status_received_at_ms_{0};
   robot::Milliseconds last_rear_line_received_at_ms_{0};
+  robot::Milliseconds last_laser_snapshot_received_at_ms_{0};
+  robot::Milliseconds last_laser_measurement_received_at_ms_{0};
   std::uint32_t packet_error_count_{0};
   std::uint16_t last_rear_line_sequence_{0};
+  std::uint16_t last_laser_packet_sequence_{0};
   robot::Esp1StatusReport latest_status_{};
   robot::RearLineSensorSnapshot latest_rear_line_snapshot_{};
+  robot::LaserDistanceSnapshot latest_laser_snapshot_{};
 };
 
 enum class ClawServoPositionRequest : std::uint8_t {
@@ -643,13 +777,19 @@ enum class ClawServoCommandResult : std::uint8_t {
   ClosedAngleUnset = 4,
   OpenAngleOutOfRange = 5,
   ClosedAngleOutOfRange = 6,
+  PwmWriteFailed = 7,
 };
 
 struct ClawServoSettings {
   std::array<int, kMechanismServoCount> open_angle_deg{
-      {23, 40, 80, 0}};
+      {23, 40, 80, kClawServoUnsetAngleDeg, 0}};
   std::array<int, kMechanismServoCount> closed_angle_deg{
-      {110, 100, 180, 180}};
+      {110, 100, 180, kClawServoUnsetAngleDeg, 180}};
+};
+
+struct SolarHookServoSettings {
+  int open_angle_deg{kClawServoUnsetAngleDeg};
+  int closed_angle_deg{kClawServoUnsetAngleDeg};
 };
 
 const char* clawServoResultReason(const ClawServoCommandResult result) {
@@ -668,6 +808,8 @@ const char* clawServoResultReason(const ClawServoCommandResult result) {
       return "servo open angle must be 0..180 degrees";
     case ClawServoCommandResult::ClosedAngleOutOfRange:
       return "servo closed angle must be 0..180 degrees";
+    case ClawServoCommandResult::PwmWriteFailed:
+      return "servo PWM peripheral write failed";
   }
   return "servo command rejected";
 }
@@ -679,19 +821,13 @@ class ClawServoBank {
   ClawServoBank(const robot::esp2::ServoOutputConfig& claw_1,
                 const robot::esp2::ServoOutputConfig& claw_2,
                 const robot::esp2::ServoOutputConfig& claw_3,
+                const robot::esp2::ServoOutputConfig& habitat_pusher,
                 const robot::esp2::ServoOutputConfig& winch)
-      : configs_{{&claw_1, &claw_2, &claw_3, &winch}} {}
+      : configs_{{&claw_1, &claw_2, &claw_3, &habitat_pusher, &winch}} {}
 
   void initializeDisabled() {
     for (std::size_t index = 0U; index < kMechanismServoCount; ++index) {
-      hardware_configured_[index] =
-          servoOutputConfigComplete(*configs_[index]);
-      if (hardware_configured_[index]) {
-        ledcSetup(configs_[index]->pwm_channel,
-                  configs_[index]->pwm_frequency_hz,
-                  configs_[index]->pwm_resolution_bits);
-        pinMode(configs_[index]->gpio, INPUT);
-      }
+      hardware_configured_[index] = initializeOutput(index);
     }
     disable();
   }
@@ -716,8 +852,10 @@ class ClawServoBank {
       const int target_angle_deg =
           commanded_open_[index] ? settings_.open_angle_deg[index]
                                  : settings_.closed_angle_deg[index];
-      if (angleConfigured(target_angle_deg)) {
-        writeAngle(index, target_angle_deg);
+      if (angleConfigured(target_angle_deg) &&
+          !writeAngle(index, target_angle_deg)) {
+        disableOutput(index);
+        return ClawServoCommandResult::PwmWriteFailed;
       }
     }
     return ClawServoCommandResult::Accepted;
@@ -726,7 +864,7 @@ class ClawServoBank {
   const ClawServoSettings& settings() const { return settings_; }
 
   bool allTargetsConfigured() const {
-    for (std::size_t index = 0U; index < kMechanismServoCount; ++index) {
+    for (std::size_t index = 0U; index < kClawServoCount; ++index) {
       int target_angle_deg = kClawServoUnsetAngleDeg;
       if (targetAngle(index, ClawServoPositionRequest::Open,
                       target_angle_deg) !=
@@ -737,7 +875,37 @@ class ClawServoBank {
         return false;
       }
     }
-    return true;
+    int target_angle_deg = kClawServoUnsetAngleDeg;
+    return targetAngle(kWinchServoIndex, ClawServoPositionRequest::Open,
+                       target_angle_deg) ==
+               ClawServoCommandResult::Accepted &&
+           targetAngle(kWinchServoIndex, ClawServoPositionRequest::Closed,
+                       target_angle_deg) ==
+               ClawServoCommandResult::Accepted;
+  }
+
+  bool habitatPusherTargetsConfigured() const {
+    int target_angle_deg = kClawServoUnsetAngleDeg;
+    return targetAngle(kHabitatPusherServoIndex,
+                       ClawServoPositionRequest::Open,
+                       target_angle_deg) ==
+               ClawServoCommandResult::Accepted &&
+           targetAngle(kHabitatPusherServoIndex,
+                       ClawServoPositionRequest::Closed,
+                       target_angle_deg) ==
+               ClawServoCommandResult::Accepted;
+  }
+
+  bool habitatPusherCommandedOpen() const {
+    return output_enabled_[kHabitatPusherServoIndex] &&
+           commanded_open_[kHabitatPusherServoIndex];
+  }
+
+  bool habitatPusherCommandedClosed() const {
+    return output_enabled_[kHabitatPusherServoIndex] &&
+           !commanded_open_[kHabitatPusherServoIndex] &&
+           commanded_angle_deg_[kHabitatPusherServoIndex] !=
+               kClawServoUnsetAngleDeg;
   }
 
   bool allClawOpenTargetsConfigured() const {
@@ -761,7 +929,10 @@ class ClawServoBank {
     if (result != ClawServoCommandResult::Accepted) {
       return result;
     }
-    writeAngle(index, target_angle_deg);
+    if (!writeAngle(index, target_angle_deg)) {
+      disableOutput(index);
+      return ClawServoCommandResult::PwmWriteFailed;
+    }
     commanded_open_[index] = request == ClawServoPositionRequest::Open;
     return ClawServoCommandResult::Accepted;
   }
@@ -779,7 +950,10 @@ class ClawServoBank {
       }
     }
     for (std::size_t index = 0U; index < kClawServoCount; ++index) {
-      writeAngle(index, target_angles_deg[index]);
+      if (!writeAngle(index, target_angles_deg[index])) {
+        disableOutput(index);
+        return ClawServoCommandResult::PwmWriteFailed;
+      }
       commanded_open_[index] = request == ClawServoPositionRequest::Open;
     }
     return ClawServoCommandResult::Accepted;
@@ -790,10 +964,47 @@ class ClawServoBank {
     fillClawTelemetry(output.claw_1, 0U);
     fillClawTelemetry(output.claw_2, 1U);
     fillClawTelemetry(output.claw_3, 2U);
+    fillClawTelemetry(output.habitat_pusher,
+                      kHabitatPusherServoIndex);
     fillClawTelemetry(output.winch, kWinchServoIndex);
   }
 
  private:
+  bool initializeOutput(const std::size_t index) {
+    if (index >= kMechanismServoCount ||
+        !servoOutputConfigComplete(*configs_[index])) {
+      return false;
+    }
+    const robot::esp2::ServoOutputConfig& config = *configs_[index];
+    pinMode(config.gpio, INPUT);
+    if (config.backend == robot::esp2::ServoPwmBackend::Ledc) {
+      ledcSetup(config.ledc_channel, config.pwm_frequency_hz,
+                config.ledc_resolution_bits);
+      return true;
+    }
+    if (config.backend != robot::esp2::ServoPwmBackend::Mcpwm) {
+      return false;
+    }
+
+    mcpwm_config_t mcpwm_config{};
+    mcpwm_config.frequency = config.pwm_frequency_hz;
+    mcpwm_config.cmpr_a = 0.0F;
+    mcpwm_config.cmpr_b = 0.0F;
+    mcpwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+    mcpwm_config.counter_mode = MCPWM_UP_COUNTER;
+    const mcpwm_unit_t unit = mcpwmUnit(config);
+    const mcpwm_timer_t timer = mcpwmTimer(config);
+    const mcpwm_generator_t generator = mcpwmGenerator(config);
+    if (mcpwm_timer_set_resolution(
+            unit, timer, config.mcpwm_timer_resolution_hz) != ESP_OK ||
+        mcpwm_init(unit, timer, &mcpwm_config) != ESP_OK ||
+        mcpwm_set_signal_low(unit, timer, generator) != ESP_OK) {
+      pinMode(config.gpio, INPUT);
+      return false;
+    }
+    return true;
+  }
+
   static bool angleConfigured(const int angle_deg) {
     return angle_deg != kClawServoUnsetAngleDeg;
   }
@@ -860,20 +1071,43 @@ class ClawServoBank {
                                const std::uint32_t pulse_us) const {
     const robot::esp2::ServoOutputConfig& config = *configs_[index];
     const std::uint32_t period_us = 1000000UL / config.pwm_frequency_hz;
-    return ((pulse_us * pwmMaxDuty(config.pwm_resolution_bits)) +
+    return ((pulse_us * pwmMaxDuty(config.ledc_resolution_bits)) +
             (period_us / 2U)) /
            period_us;
   }
 
-  void writeAngle(const std::size_t index, const int angle_deg) {
+  bool writeAngle(const std::size_t index, const int angle_deg) {
     const robot::esp2::ServoOutputConfig& config = *configs_[index];
-    ledcSetup(config.pwm_channel, config.pwm_frequency_hz,
-              config.pwm_resolution_bits);
-    ledcAttachPin(config.gpio, config.pwm_channel);
-    ledcWrite(config.pwm_channel,
-              dutyForPulseUs(index, pulseUsForAngle(index, angle_deg)));
+    const std::uint32_t pulse_us = pulseUsForAngle(index, angle_deg);
+    if (config.backend == robot::esp2::ServoPwmBackend::Ledc) {
+      ledcSetup(config.ledc_channel, config.pwm_frequency_hz,
+                config.ledc_resolution_bits);
+      ledcAttachPin(config.gpio, config.ledc_channel);
+      ledcWrite(config.ledc_channel,
+                dutyForPulseUs(index, pulse_us));
+    } else if (config.backend == robot::esp2::ServoPwmBackend::Mcpwm) {
+      mcpwm_io_signals_t signal = MCPWM0A;
+      if (!mcpwmSignal(config, signal)) {
+        return false;
+      }
+      const mcpwm_unit_t unit = mcpwmUnit(config);
+      const mcpwm_timer_t timer = mcpwmTimer(config);
+      const mcpwm_generator_t generator = mcpwmGenerator(config);
+      if (mcpwm_set_signal_low(unit, timer, generator) != ESP_OK ||
+          mcpwm_set_duty_in_us(unit, timer, generator, pulse_us) != ESP_OK ||
+          mcpwm_gpio_init(unit, signal, config.gpio) != ESP_OK ||
+          mcpwm_set_duty_type(
+              unit, timer, generator, MCPWM_DUTY_MODE_0) != ESP_OK) {
+        (void)mcpwm_set_signal_low(unit, timer, generator);
+        pinMode(config.gpio, INPUT);
+        return false;
+      }
+    } else {
+      return false;
+    }
     output_enabled_[index] = true;
     commanded_angle_deg_[index] = angle_deg;
+    return true;
   }
 
   void disableOutput(const std::size_t index) {
@@ -881,9 +1115,15 @@ class ClawServoBank {
       return;
     }
     if (hardware_configured_[index]) {
-      ledcWrite(configs_[index]->pwm_channel, 0U);
-      ledcDetachPin(configs_[index]->gpio);
-      pinMode(configs_[index]->gpio, INPUT);
+      const robot::esp2::ServoOutputConfig& config = *configs_[index];
+      if (config.backend == robot::esp2::ServoPwmBackend::Ledc) {
+        ledcWrite(config.ledc_channel, 0U);
+        ledcDetachPin(config.gpio);
+      } else if (config.backend == robot::esp2::ServoPwmBackend::Mcpwm) {
+        (void)mcpwm_set_signal_low(
+            mcpwmUnit(config), mcpwmTimer(config), mcpwmGenerator(config));
+      }
+      pinMode(config.gpio, INPUT);
     }
     output_enabled_[index] = false;
     commanded_angle_deg_[index] = kClawServoUnsetAngleDeg;
@@ -894,7 +1134,16 @@ class ClawServoBank {
                          const std::size_t index) const {
     const int open_angle_deg = settings_.open_angle_deg[index];
     const int closed_angle_deg = settings_.closed_angle_deg[index];
+    const robot::esp2::ServoOutputConfig& config = *configs_[index];
     output.hardware_configured = hardware_configured_[index];
+    output.gpio = config.gpio;
+    output.ledc_channel = config.ledc_channel;
+    output.mcpwm_unit = config.mcpwm_unit;
+    output.mcpwm_timer = config.mcpwm_timer;
+    output.mcpwm_generator = config.mcpwm_generator;
+    output.pwm_frequency_hz = config.pwm_frequency_hz;
+    output.mcpwm_timer_resolution_hz =
+        config.mcpwm_timer_resolution_hz;
     output.open_configured = angleConfigured(open_angle_deg);
     output.closed_configured = angleConfigured(closed_angle_deg);
     output.output_enabled = output_enabled_[index];
@@ -908,14 +1157,15 @@ class ClawServoBank {
       configs_;
   ClawServoSettings settings_{};
   std::array<bool, kMechanismServoCount> hardware_configured_{
-      {false, false, false, false}};
+      {false, false, false, false, false}};
   std::array<bool, kMechanismServoCount> output_enabled_{
-      {false, false, false, false}};
+      {false, false, false, false, false}};
   std::array<int, kMechanismServoCount> commanded_angle_deg_{
       {kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg,
-       kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg}};
+       kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg,
+       kClawServoUnsetAngleDeg}};
   std::array<bool, kMechanismServoCount> commanded_open_{
-      {false, false, false, false}};
+      {false, false, false, false, false}};
 };
 
 struct SolarIrThresholds {
@@ -929,6 +1179,46 @@ struct SolarLineFollowSpeedConfig {
   float start_base_duty{SOLAR_START_BASE_DUTY};
   robot::Milliseconds slow_after_ms{SOLAR_SLOW_AFTER_MS};
   float slow_base_duty{SOLAR_SLOW_BASE_DUTY};
+};
+
+struct ImuTurnAvailabilityFaultCapture {
+  bool valid{false};
+  bool configured{false};
+  bool initialized{false};
+  bool calibrated{false};
+  bool healthy{false};
+  bool sample_valid{false};
+  bool data_fresh{false};
+  bool acquisition_running{false};
+  bool shared_snapshot_available{false};
+  bool front_left_configured{false};
+  bool front_right_configured{false};
+  bool rear_link_configured{false};
+  bool rear_status_available{false};
+  bool rear_status_fresh{false};
+  bool newest_snapshot_available{false};
+  bool cached_snapshot_matches_newest{false};
+  char origin[robot::kTelemetryImuDiagnosticReasonSize]{};
+  char reason[robot::kTelemetryImuDiagnosticReasonSize]{};
+  std::uint32_t evaluated_at_us{0U};
+  robot::Milliseconds evaluated_at_ms{0U};
+  std::uint32_t published_at_us{0U};
+  std::uint32_t last_successful_read_us{0U};
+  std::uint32_t sample_age_us{0U};
+  std::uint32_t snapshot_age_us{0U};
+  std::uint32_t freshness_timeout_us{0U};
+  std::uint32_t cached_snapshot_sequence{0U};
+  std::uint32_t newest_snapshot_sequence{0U};
+  std::uint32_t cached_successful_sample_sequence{0U};
+  std::uint32_t newest_successful_sample_sequence{0U};
+  std::uint32_t cached_snapshot_fetched_at_us{0U};
+  std::uint32_t cached_snapshot_fetch_to_gate_us{0U};
+  std::uint32_t successful_sample_publication_gap_us{0U};
+  std::uint32_t maximum_successful_sample_publication_gap_us{0U};
+  std::uint32_t current_observed_publication_gap_us{0U};
+  std::uint32_t maximum_observed_publication_gap_us{0U};
+  robot::Milliseconds rear_last_status_received_at_ms{0U};
+  robot::Milliseconds rear_status_age_ms{0U};
 };
 
 struct RuntimeContext {
@@ -948,6 +1238,7 @@ struct RuntimeContext {
   robot::SolarPanelAutonomyConfig solar_config{kSolarPanelAutonomyConfig};
   SolarIrThresholds solar_thresholds{};
   SolarLineFollowSpeedConfig solar_speed_config{};
+  SolarHookServoSettings solar_hook_servo_settings{};
   robot::SolarPanelContactConfig solar_contact_config{
       kSolarPanelContactConfig};
   robot::SolarBeaconDetectorState solar_detector{};
@@ -956,8 +1247,15 @@ struct RuntimeContext {
       robot::SolarPanelAutonomyState::WaitForStart};
   robot::SolarPanelFaultReason autonomous_fault_reason{
       robot::SolarPanelFaultReason::None};
+  robot::HabitatPiecesConfig habitat_pieces_config{};
+  robot::HabitatPiecesAutonomy habitat_pieces{};
+  robot::HabitatPiecesUpdate last_habitat_pieces_update{};
+  robot::HabitatPlacementConfig habitat_placement_config{};
+  robot::HabitatPlacementAutonomy habitat_placement{};
+  robot::HabitatPlacementUpdate last_habitat_placement_update{};
   robot::TowerPiecesConfig tower_pieces_config{};
   robot::TowerPiecesAutonomy tower_pieces{};
+  robot::TowerPiecesUpdate last_tower_pieces_update{};
   robot::PegFinderConfig peg_finder_config{};
   robot::PegFinderAutonomy peg_finder{};
   robot::TimeTrialConfig time_trial_config{};
@@ -965,7 +1263,13 @@ struct RuntimeContext {
   robot::ImuTurnConfig imu_turn_config{};
   robot::ImuTurnControllerState imu_turn_state{};
   robot::ImuTurnUpdate last_imu_turn_update{};
+  robot::ImuHeadingHoldConfig imu_heading_hold_config{};
+  robot::ImuHeadingHoldControllerState imu_heading_hold_state{};
+  robot::ImuHeadingHoldUpdate last_imu_heading_hold_update{};
+  robot::ImuRecoveryState imu_turn_recovery{};
+  robot::ImuRecoveryState imu_strafe_recovery{};
   robot::esp2::ImuAcquisitionSnapshot latest_imu_snapshot{};
+  ImuTurnAvailabilityFaultCapture imu_turn_availability_fault{};
   std::uint32_t imu_heading_reset_pending_sequence{0U};
   robot::Milliseconds autonomous_state_entered_at_ms{0};
   char command_buffer[kSerialCommandBufferSize]{};
@@ -982,12 +1286,22 @@ struct RuntimeContext {
   std::int8_t rear_line_sensor_last_known_side{0};
   bool command_deadman_armed{false};
   bool solar_start_requested{false};
+  bool habitat_pieces_start_requested{false};
+  bool habitat_placement_start_requested{false};
   bool tower_pieces_start_requested{false};
   bool peg_finder_start_requested{false};
   bool time_trial_start_requested{false};
+  bool solar_hook_commanded_open{false};
   bool fault_active{false};
-  bool imu_health_observed{false};
-  bool imu_was_healthy{false};
+  bool imu_disconnect_active{false};
+  bool imu_disconnect_observed{false};
+  bool imu_shared_snapshot_available{false};
+  std::uint32_t imu_shared_snapshot_fetched_at_us{0U};
+  std::uint32_t maximum_observed_imu_publication_gap_us{0U};
+  std::uint32_t imu_disconnect_count{0U};
+  robot::Milliseconds last_imu_disconnect_at_ms{0U};
+  char last_imu_disconnect_reason[
+      robot::kTelemetryImuDiagnosticReasonSize]{};
   bool diagnostic_motion_was_active{false};
   bool diagnostic_web_stop_seen{false};
   robot::MotionDiagnosticTrigger diagnostic_freeze_pending{
@@ -1021,6 +1335,21 @@ bool imuTurnRuntimeConfigValid(const robot::ImuTurnConfig& config) {
          config.timeout_ms <= kMaxTimedTestDurationMs;
 }
 
+bool imuHeadingHoldRuntimeConfigValid(
+    const robot::ImuHeadingHoldConfig& config) {
+  return robot::imuHeadingHoldConfigValid(config, hardwareDutyCap());
+}
+
+bool imuReadyForAutonomousMotion(const RuntimeContext& context);
+
+bool autonomousStrafeDutyValid(const RuntimeContext& context,
+                               const float duty) {
+  robot::ImuHeadingHoldConfig config =
+      context.imu_heading_hold_config;
+  config.maximum_strafe_duty = duty;
+  return imuHeadingHoldRuntimeConfigValid(config);
+}
+
 float activeMotionDutyCap(const RuntimeContext& context) {
   return clampFloat(context.config.maxDuty, 0.0F, hardwareDutyCap());
 }
@@ -1031,6 +1360,13 @@ float rearMotionDutyCap(const RuntimeContext& context) {
 
 float funnelMotionDutyCap() {
   return clampFloat(kSingleMotorDutyCap, 0.0F, hardwareDutyCap());
+}
+
+robot::LineFollowerConfig habitatPiecesLineFollowerConfig(
+    const RuntimeContext& context) {
+  robot::LineFollowerConfig config = context.config;
+  config.baseDuty = context.habitat_pieces_config.line_follow_duty;
+  return config;
 }
 
 robot::LineFollowerConfig reverseRearLineFollowerConfig(
@@ -1044,6 +1380,12 @@ robot::LineFollowerConfig towerPiecesLineFollowerConfig(
   config.baseDuty =
       clampFloat(base_duty, 0.0F, rearMotionDutyCap(context));
   return robot::makeReverseTravelLineFollowerConfig(config);
+}
+
+robot::LineFollowerConfig habitatPlacementLineFollowerConfig(
+    const RuntimeContext& context) {
+  return towerPiecesLineFollowerConfig(
+      context, context.habitat_placement_config.reverse_line_follow_duty);
 }
 
 robot::Milliseconds remoteStatusTimeoutMs(
@@ -1164,6 +1506,29 @@ void resetSolarPanelAutonomy(RuntimeContext& context,
   context.autonomous_fault_reason = robot::SolarPanelFaultReason::None;
   context.autonomous_state_entered_at_ms = now_ms;
   context.solar_start_requested = false;
+  robot::resetImuHeadingHoldController(context.imu_heading_hold_state);
+  context.last_imu_heading_hold_update = {};
+  robot::cancelImuRecovery(context.imu_strafe_recovery);
+}
+
+void resetHabitatPieces(RuntimeContext& context,
+                        const robot::Milliseconds now_ms) {
+  robot::resetHabitatPiecesAutonomy(context.habitat_pieces, now_ms);
+  context.last_habitat_pieces_update = {};
+  context.habitat_pieces_start_requested = false;
+}
+
+void resetHabitatPlacement(RuntimeContext& context,
+                           const robot::Milliseconds now_ms) {
+  if (g_runtime.stepper != nullptr) {
+    g_runtime.stepper->stop();
+  }
+  robot::resetHabitatPlacementAutonomy(context.habitat_placement, now_ms);
+  context.last_habitat_placement_update = {};
+  context.habitat_placement_start_requested = false;
+  robot::resetImuTurnController(context.imu_turn_state);
+  context.last_imu_turn_update = {};
+  robot::cancelImuRecovery(context.imu_turn_recovery);
 }
 
 void resetTowerPieces(RuntimeContext& context,
@@ -1173,23 +1538,42 @@ void resetTowerPieces(RuntimeContext& context,
   }
   robot::resetTowerPiecesAutonomy(context.tower_pieces, now_ms);
   context.tower_pieces_start_requested = false;
+  robot::resetImuTurnController(context.imu_turn_state);
+  context.last_imu_turn_update = {};
+  robot::resetImuHeadingHoldController(context.imu_heading_hold_state);
+  context.last_imu_heading_hold_update = {};
+  robot::cancelImuRecovery(context.imu_turn_recovery);
+  robot::cancelImuRecovery(context.imu_strafe_recovery);
 }
 
 void resetPegFinder(RuntimeContext& context,
                     const robot::Milliseconds now_ms) {
   robot::resetPegFinderAutonomy(context.peg_finder, now_ms);
   context.peg_finder_start_requested = false;
+  robot::resetImuTurnController(context.imu_turn_state);
+  context.last_imu_turn_update = {};
+  robot::cancelImuRecovery(context.imu_turn_recovery);
 }
 
 void resetTimeTrial(RuntimeContext& context,
                     const robot::Milliseconds now_ms) {
   robot::resetTimeTrialAutonomy(context.time_trial, now_ms);
   context.time_trial_start_requested = false;
+  robot::resetImuHeadingHoldController(context.imu_heading_hold_state);
+  context.last_imu_heading_hold_update = {};
+  robot::cancelImuRecovery(context.imu_strafe_recovery);
 }
 
 void resetImuTurn(RuntimeContext& context) {
   robot::resetImuTurnController(context.imu_turn_state);
   context.last_imu_turn_update = {};
+  robot::cancelImuRecovery(context.imu_turn_recovery);
+}
+
+void resetImuHeadingHold(RuntimeContext& context) {
+  robot::resetImuHeadingHoldController(context.imu_heading_hold_state);
+  context.last_imu_heading_hold_update = {};
+  robot::cancelImuRecovery(context.imu_strafe_recovery);
 }
 
 void enterSolarPanelAutonomyState(
@@ -1218,45 +1602,6 @@ robot::MotorCommand makeTimedMotorCommand(
   return command;
 }
 
-robot::FourWheelCommand makeSolarStrafeRightCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty =
-      clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
-                 activeMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(1.0F, 0.0F, 0.0F, duty, now_ms,
-                                   context.config.remoteCommandTimeoutMs);
-}
-
-robot::FourWheelCommand makeTowerPiecesStrafeRightCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty =
-      clampFloat(context.tower_pieces_config.strafe_right_duty, 0.0F,
-                 rearMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(
-      1.0F, 0.0F, 0.0F, duty, now_ms,
-      context.rear_config.remoteCommandTimeoutMs);
-}
-
-robot::FourWheelCommand makeTimeTrialStrafeRightCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty = clampFloat(
-      context.time_trial_config.solar_to_tower_strafe_right_duty, 0.0F,
-      rearMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(
-      1.0F, 0.0F, 0.0F, duty, now_ms,
-      context.rear_config.remoteCommandTimeoutMs);
-}
-
-robot::FourWheelCommand makeTowerPiecesClockwiseRotationCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty =
-      clampFloat(context.tower_pieces_config.clockwise_rotation_duty, 0.0F,
-                 rearMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(
-      0.0F, 0.0F, 1.0F, duty, now_ms,
-      context.rear_config.remoteCommandTimeoutMs);
-}
-
 robot::FourWheelCommand makeTowerPiecesBackwardCommand(
     const RuntimeContext& context, const robot::Milliseconds now_ms) {
   const float duty =
@@ -1267,24 +1612,34 @@ robot::FourWheelCommand makeTowerPiecesBackwardCommand(
       context.rear_config.remoteCommandTimeoutMs);
 }
 
-robot::FourWheelCommand makeTowerPiecesShimmyCommand(
-    const RuntimeContext& context, const bool strafe_right,
-    const robot::Milliseconds now_ms) {
+robot::FourWheelCommand makeHabitatPiecesBackwardCommand(
+    const RuntimeContext& context, const robot::Milliseconds now_ms) {
   const float duty =
-      clampFloat(context.tower_pieces_config.shimmy_duty, 0.0F,
-                 rearMotionDutyCap(context));
+      clampFloat(context.habitat_pieces_config.reverse_duty, 0.0F,
+                 activeMotionDutyCap(context));
   return robot::mixOpenLoopMecanum(
-      strafe_right ? 1.0F : -1.0F, 0.0F, 0.0F, duty, now_ms,
+      0.0F, -1.0F, 0.0F, duty, now_ms,
+      context.config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeHabitatPlacementTranslationCommand(
+    const RuntimeContext& context, const float vx, const float vy,
+    const float duty, const robot::Milliseconds now_ms) {
+  return robot::mixOpenLoopMecanum(
+      vx, vy, 0.0F,
+      clampFloat(duty, 0.0F, rearMotionDutyCap(context)), now_ms,
       context.rear_config.remoteCommandTimeoutMs);
 }
 
-robot::FourWheelCommand makePegFinderClockwiseCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty =
-      clampFloat(context.peg_finder_config.clockwise_duty, 0.0F,
-                 rearMotionDutyCap(context));
+robot::FourWheelCommand makeImuTurnCommand(
+    const RuntimeContext& context, const float rotation_command,
+    const robot::Milliseconds now_ms) {
+  const float signed_yaw_command =
+      rotation_command *
+      static_cast<float>(context.imu_turn_config.yaw_command_polarity);
   return robot::mixOpenLoopMecanum(
-      0.0F, 0.0F, 1.0F, duty, now_ms,
+      0.0F, 0.0F, signed_yaw_command < 0.0F ? -1.0F : 1.0F,
+      std::fabs(signed_yaw_command), now_ms,
       context.rear_config.remoteCommandTimeoutMs);
 }
 
@@ -1318,28 +1673,10 @@ robot::FourWheelCommand makePegFinderForwardCommand(
       context.rear_config.remoteCommandTimeoutMs);
 }
 
-robot::FourWheelCommand makeSolarStrafeLeftCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty =
-      clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
-                 activeMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(-1.0F, 0.0F, 0.0F, duty, now_ms,
-                                   context.config.remoteCommandTimeoutMs);
-}
-
-robot::FourWheelCommand makeSolarLineReacquireStrafeLeftCommand(
-    const RuntimeContext& context, const robot::Milliseconds now_ms) {
-  const float duty =
-      clampFloat(context.solar_contact_config.line_reacquire_strafe_duty,
-                 0.0F, activeMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(-1.0F, 0.0F, 0.0F, duty, now_ms,
-                                   context.config.remoteCommandTimeoutMs);
-}
-
 robot::FourWheelCommand makeSolarForwardCommand(
     const RuntimeContext& context, const robot::Milliseconds now_ms) {
   const float duty =
-      clampFloat(context.solar_contact_config.strafe_duty, 0.0F,
+      clampFloat(context.solar_contact_config.retry_forward_duty, 0.0F,
                  activeMotionDutyCap(context));
   return robot::mixOpenLoopMecanum(0.0F, 1.0F, 0.0F, duty, now_ms,
                                    context.config.remoteCommandTimeoutMs);
@@ -1356,11 +1693,14 @@ robot::FourWheelCommand makeSolarPostContactForwardCommand(
 
 bool sendStoppedRearCommand(RearCommandLink& rear_link,
                             const robot::LineFollowerConfig& config,
-                            const robot::Milliseconds now_ms) {
+                            const robot::Milliseconds now_ms,
+                            const robot::LaserDistanceProfile laser_profile =
+                                robot::LaserDistanceProfile::HighAccuracy) {
   robot::RearDriveCommand command{};
   command.enabled = false;
   command.sender_timestamp_ms = now_ms;
   command.timeout_ms = config.remoteCommandTimeoutMs;
+  command.laser_profile = laser_profile;
   return rear_link.send(command);
 }
 
@@ -1383,11 +1723,20 @@ bool sendStoppedFunnelCommand(RearCommandLink& rear_link,
                                 now_ms);
 }
 
+bool sendStoppedSolarHookCommand(RearCommandLink& rear_link) {
+  robot::SolarHookCommand command{};
+  command.enabled = false;
+  command.angle_deg = 0U;
+  return rear_link.send(command);
+}
+
 bool disableMotionActuators(RuntimeContext& context,
                             robot::IMotorOutput& front_left,
                             robot::IMotorOutput& front_right,
                             RearCommandLink& rear_link,
-                            const robot::Milliseconds now_ms) {
+                            const robot::Milliseconds now_ms,
+                            const robot::LaserDistanceProfile laser_profile =
+                                robot::LaserDistanceProfile::HighAccuracy) {
   robot::stopLineFollower(context.follower_state);
   context.requested_command = robot::disabledFourWheelCommand();
   context.last_commanded_wheels = robot::disabledFourWheelCommand();
@@ -1395,7 +1744,8 @@ bool disableMotionActuators(RuntimeContext& context,
   context.mode_expires_at_ms = 0U;
   front_left.disable();
   front_right.disable();
-  return sendStoppedRearCommand(rear_link, context.config, now_ms);
+  return sendStoppedRearCommand(rear_link, context.config, now_ms,
+                                laser_profile);
 }
 
 bool stopAutonomyDriveAndFunnel(RuntimeContext& context,
@@ -1419,6 +1769,7 @@ void disableActuators(RuntimeContext& context, robot::IMotorOutput& front_left,
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   context.requested_funnel_command = robot::disabledMotorCommand();
   sendStoppedFunnelCommand(rear_link, context.config, now_ms);
+  sendStoppedSolarHookCommand(rear_link);
   if (g_runtime.claws != nullptr) {
     g_runtime.claws->disable();
   }
@@ -1433,10 +1784,13 @@ void emergencyStop(RuntimeContext& context, robot::IMotorOutput& front_left,
   context.modes.emergencyStop(now_ms);
   if (g_runtime.stepper != nullptr) g_runtime.stepper->stop();
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
   resetImuTurn(context);
+  resetImuHeadingHold(context);
   setFault(context, robot::FaultCode::None, "");
   logEvent(context, now_ms, robot::EventSeverity::Warn, source,
            "emergency stop requested");
@@ -1534,8 +1888,18 @@ void recordMotionDiagnostic(
           : elapsedSince(now_ms, context.last_command_ms);
 
   sample.imu_turn_state = context.imu_turn_state.state;
-  sample.target_heading_deg = context.imu_turn_state.target_heading_deg;
-  sample.rotation_command = context.last_imu_turn_update.rotation_command;
+  if (context.modes.currentMode() ==
+      robot::RobotTestMode::ImuStrafeTest) {
+    sample.target_heading_deg =
+        context.imu_heading_hold_state.target_heading_deg;
+    sample.rotation_command =
+        context.last_imu_heading_hold_update.yaw_correction_duty;
+  } else {
+    sample.target_heading_deg =
+        context.imu_turn_state.target_heading_deg;
+    sample.rotation_command =
+        context.last_imu_turn_update.rotation_command;
+  }
   if (imu != nullptr) {
     sample.heading_deg = imu->state.heading_deg;
     sample.angle_error_deg =
@@ -1570,6 +1934,7 @@ bool diagnosticMotionActive(const RuntimeContext& context,
                             const RearCommandLink& rear_link) {
   if (context.command_deadman_armed ||
       robot::imuTurnActive(context.imu_turn_state) ||
+      robot::imuHeadingHoldActive(context.imu_heading_hold_state) ||
       driveCommandMagnitudeMilli(context.requested_command) > 0U ||
       front_left.lastAppliedCommand().enabled ||
       front_right.lastAppliedCommand().enabled) {
@@ -1594,6 +1959,37 @@ bool startRequirementsMet(const DigitalFrontLineSensorReader& sensors,
          rear_link.remoteStatusFresh(now_ms,
                                      remoteStatusTimeoutMs(context.config)) &&
          context.config.maxDuty > 0.0F && hardwareDutyCap() > 0.0F;
+}
+
+bool habitatPiecesMotionRequirementsMet(
+    const DigitalFrontLineSensorReader& sensors,
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  const robot::LineFollowerConfig line_config =
+      habitatPiecesLineFollowerConfig(context);
+  return startRequirementsMet(sensors, front_left, front_right, rear_link,
+                              now_ms, context) &&
+         robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
+             .accepted &&
+         robot::habitatPiecesConfigValid(context.habitat_pieces_config,
+                                         activeMotionDutyCap(context));
+}
+
+bool habitatPiecesStartRequirementsMet(
+    const DigitalFrontLineSensorReader& sensors,
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  return habitatPiecesMotionRequirementsMet(
+             sensors, front_left, front_right, rear_link, now_ms, context) &&
+         rear_link.rearLineSnapshotFresh(
+             now_ms, context.config.remoteCommandTimeoutMs) &&
+         rear_link.latestRearLineSnapshot().side_2_configured;
 }
 
 bool rearLineStartRequirementsMet(
@@ -1631,9 +2027,72 @@ bool towerPiecesStartRequirementsMet(
          gpioAssigned(robot::esp2::kPins.limit_switch_stepper_top) &&
          stepper.maximumPositionSteps() > 0 &&
          !(stepper.lowerLimitActive() && stepper.upperLimitActive()) &&
+         imuReadyForAutonomousMotion(context) &&
+         imuHeadingHoldRuntimeConfigValid(
+             context.imu_heading_hold_config) &&
+         autonomousStrafeDutyValid(
+             context, context.tower_pieces_config.strafe_right_duty) &&
+         autonomousStrafeDutyValid(
+             context, context.tower_pieces_config.shimmy_duty) &&
+         imuTurnRuntimeConfigValid(context.imu_turn_config) &&
          robot::towerPiecesConfigValid(context.tower_pieces_config,
                                        rearMotionDutyCap(context),
                                        stepper.maximumSpeedStepsPerSecond());
+}
+
+bool habitatPlacementStartRequirementsMet(
+    const DigitalFrontLineSensorReader& sensors,
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const ClawServoBank& claws,
+    const robot::esp2::StepperAxis& stepper,
+    const robot::Milliseconds now_ms,
+    const RuntimeContext& context) {
+  const robot::HabitatPlacementConfig& config =
+      context.habitat_placement_config;
+  const bool bounded_timings =
+      config.lss1_timeout_ms <= kMaxTimedTestDurationMs &&
+      config.post_lss1_delay_ms <= kMaxTimedTestDurationMs &&
+      config.counter_clockwise_timeout_ms <= kMaxTimedTestDurationMs &&
+      config.forward_to_slide_duration_ms <= kMaxTimedTestDurationMs &&
+      config.stepper_down_timeout_ms <= kMaxTimedTestDurationMs &&
+      config.pusher_open_settle_ms <= kMaxTimedTestDurationMs &&
+      config.push_forward_duration_ms <= kMaxTimedTestDurationMs &&
+      config.reverse_retreat_duration_ms <= kMaxTimedTestDurationMs &&
+      config.clockwise_timeout_ms <= kMaxTimedTestDurationMs &&
+      config.post_clockwise_reverse_duration_ms <=
+          kMaxTimedTestDurationMs &&
+      config.post_clockwise_strafe_left_duration_ms <=
+          kMaxTimedTestDurationMs &&
+      config.post_clockwise_delay_ms <= kMaxTimedTestDurationMs &&
+      config.exit_forward_duration_ms <= kMaxTimedTestDurationMs &&
+      config.post_forward_delay_ms <= kMaxTimedTestDurationMs &&
+      config.strafe_right_timeout_ms <= kMaxTimedTestDurationMs;
+  robot::ImuTurnConfig ccw_turn_config = context.imu_turn_config;
+  ccw_turn_config.timeout_ms = config.counter_clockwise_timeout_ms;
+  robot::ImuTurnConfig cw_turn_config = context.imu_turn_config;
+  cw_turn_config.timeout_ms = config.clockwise_timeout_ms;
+  return sensors.configured() &&
+         rearLineStartRequirementsMet(front_left, front_right, rear_link,
+                                      now_ms, context) &&
+         rear_link.latestRearLineSnapshot().side_configured &&
+         claws.habitatPusherTargetsConfigured() &&
+         gpioAssigned(robot::esp2::kPins.stepper_sleep) &&
+         gpioAssigned(robot::esp2::kPins.stepper_dir) &&
+         gpioAssigned(robot::esp2::kPins.stepper_step) &&
+         gpioAssigned(robot::esp2::kPins.limit_switch_stepper_bottom) &&
+         !(stepper.lowerLimitActive() && stepper.upperLimitActive()) &&
+         imuReadyForAutonomousMotion(context) &&
+         imuTurnRuntimeConfigValid(ccw_turn_config) &&
+         imuTurnRuntimeConfigValid(cw_turn_config) && bounded_timings &&
+         robot::validateLineFollowerConfig(
+             habitatPlacementLineFollowerConfig(context),
+             hardwareDutyCap())
+             .accepted &&
+         robot::habitatPlacementConfigValid(
+             config, rearMotionDutyCap(context),
+             stepper.maximumSpeedStepsPerSecond());
 }
 
 bool pegFinderStartRequirementsMet(
@@ -1651,6 +2110,12 @@ bool pegFinderStartRequirementsMet(
          rear_link.latestStatus().funnel_configured &&
          funnel_limit.configured() &&
          claws.allClawOpenTargetsConfigured() &&
+         context.imu_heading_reset_pending_sequence == 0U &&
+         std::strcmp(robot::esp2::imuDisconnectReason(
+                         context.latest_imu_snapshot, micros(),
+                         kImuFreshnessTimeoutUs),
+                     "NONE") == 0 &&
+         imuTurnRuntimeConfigValid(context.imu_turn_config) &&
          context.rear_config.maxDuty > 0.0F && hardwareDutyCap() > 0.0F &&
          robot::pegFinderConfigValid(context.peg_finder_config,
                                      rearMotionDutyCap(context),
@@ -1669,7 +2134,25 @@ bool solarPanelStartRequirementsMet(
          solarPanelLimitSwitchesReady(rear_link, now_ms, context) &&
          rear_link.rearLineSnapshotFresh(
              now_ms, context.rear_config.remoteCommandTimeoutMs) &&
-         rear_link.latestRearLineSnapshot().configured;
+         rear_link.latestRearLineSnapshot().configured &&
+         imuReadyForAutonomousMotion(context) &&
+         imuHeadingHoldRuntimeConfigValid(
+             context.imu_heading_hold_config) &&
+         robot::solarPanelContactConfigValid(
+             context.solar_contact_config) &&
+         autonomousStrafeDutyValid(
+             context,
+             context.solar_contact_config.initial_strafe_right_duty) &&
+         autonomousStrafeDutyValid(
+             context,
+             context.solar_contact_config.retry_strafe_left_duty) &&
+         autonomousStrafeDutyValid(
+             context,
+             context.solar_contact_config.retry_strafe_right_duty) &&
+         autonomousStrafeDutyValid(
+             context,
+             context.solar_contact_config
+                 .line_reacquire_strafe_duty);
 }
 
 bool timeTrialStartRequirementsMet(
@@ -1693,13 +2176,16 @@ bool timeTrialStartRequirementsMet(
 bool sendRearWheelCommand(RearCommandLink& rear_link,
                           const robot::FourWheelCommand& wheels,
                           const robot::LineFollowerConfig& config,
-                          const robot::Milliseconds now_ms) {
+                          const robot::Milliseconds now_ms,
+                          const robot::LaserDistanceProfile laser_profile =
+                              robot::LaserDistanceProfile::HighAccuracy) {
   robot::RearDriveCommand rear{};
   rear.enabled = wheels.back_left.enabled || wheels.back_right.enabled;
   rear.back_left_command_milli = wheels.back_left.duty_command_milli;
   rear.back_right_command_milli = wheels.back_right.duty_command_milli;
   rear.sender_timestamp_ms = now_ms;
   rear.timeout_ms = config.remoteCommandTimeoutMs;
+  rear.laser_profile = laser_profile;
   return rear_link.send(rear);
 }
 
@@ -1709,11 +2195,409 @@ bool applyWheelCommand(RuntimeContext& context,
                        RearCommandLink& rear_link,
                        const robot::FourWheelCommand& wheels,
                        const robot::LineFollowerConfig& command_config,
-                       const robot::Milliseconds now_ms) {
+                       const robot::Milliseconds now_ms,
+                       const robot::LaserDistanceProfile laser_profile =
+                           robot::LaserDistanceProfile::HighAccuracy) {
   context.last_commanded_wheels = wheels;
   front_left.apply(wheels.front_left);
   front_right.apply(wheels.front_right);
-  return sendRearWheelCommand(rear_link, wheels, command_config, now_ms);
+  return sendRearWheelCommand(rear_link, wheels, command_config, now_ms,
+                              laser_profile);
+}
+
+enum class AutonomousImuMotionResult {
+  Running,
+  Complete,
+  InvalidConfiguration,
+  ImuUnavailable,
+  MotorUnavailable,
+  RearLinkUnavailable,
+  ControllerFault,
+  Timeout,
+  CommandFailed,
+};
+
+enum class AutonomousImuRecoveryResult {
+  Continue,
+  Paused,
+  TimedOut,
+  StopCommandFailed,
+};
+
+struct AutonomousImuRecoveryUpdate {
+  AutonomousImuRecoveryResult result{
+      AutonomousImuRecoveryResult::Continue};
+  robot::Milliseconds timer_adjustment_ms{0U};
+};
+
+const char* imuUnavailableReason(const RuntimeContext& context) {
+  const robot::esp2::ImuState& imu_state =
+      context.latest_imu_snapshot.state;
+  if (context.imu_heading_reset_pending_sequence != 0U) {
+    return "HEADING_RESET_PENDING";
+  }
+  if (!imu_state.configured || !imu_state.initialized ||
+      !imu_state.calibrated) {
+    return robot::esp2::imuDisconnectReason(
+        context.latest_imu_snapshot, micros(),
+        kImuFreshnessTimeoutUs);
+  }
+  if (!imu_state.runtime_configuration_valid) {
+    return "RUNTIME_CONFIGURATION_INVALID";
+  }
+  return robot::esp2::imuDisconnectReason(
+      context.latest_imu_snapshot, micros(),
+      kImuFreshnessTimeoutUs);
+}
+
+bool imuReadyForAutonomousMotion(const RuntimeContext& context) {
+  return std::strcmp(imuUnavailableReason(context), "NONE") == 0;
+}
+
+void recordImuAvailabilityDiagnostics(
+    RuntimeContext& context, const robot::Milliseconds now_ms) {
+  const char* const reason = imuUnavailableReason(context);
+  const bool disconnected = std::strcmp(reason, "NONE") != 0;
+  const bool reason_changed =
+      std::strcmp(context.last_imu_disconnect_reason, reason) != 0;
+
+  if (disconnected &&
+      (!context.imu_disconnect_observed ||
+       !context.imu_disconnect_active || reason_changed)) {
+    ++context.imu_disconnect_count;
+    context.last_imu_disconnect_at_ms = now_ms;
+    copyText(context.last_imu_disconnect_reason,
+             sizeof(context.last_imu_disconnect_reason), reason);
+
+    char event_message[robot::kEventMessageSize]{};
+    std::snprintf(event_message, sizeof(event_message),
+                  "IMU disconnected: %s", reason);
+    logEvent(context, now_ms, robot::EventSeverity::Warn,
+             robot::EventSource::System, event_message);
+
+    const robot::esp2::ImuAcquisitionSnapshot& snapshot =
+        context.latest_imu_snapshot;
+    const std::uint32_t now_us = micros();
+    const std::uint32_t sample_age_us =
+        snapshot.state.last_successful_read_us == 0U
+            ? 0U
+            : now_us - snapshot.state.last_successful_read_us;
+    const std::uint32_t snapshot_age_us =
+        snapshot.published_at_us == 0U
+            ? 0U
+            : now_us - snapshot.published_at_us;
+    Serial.printf(
+        "IMU_DISCONNECT reason=%s wire=%d sample_age_us=%lu "
+        "snapshot_age_us=%lu reads_ok=%lu reads_failed=%lu "
+        "consecutive_failures=%lu\n",
+        reason, snapshot.state.last_wire_status,
+        static_cast<unsigned long>(sample_age_us),
+        static_cast<unsigned long>(snapshot_age_us),
+        static_cast<unsigned long>(
+            snapshot.lifetime_successful_acquisitions),
+        static_cast<unsigned long>(
+            snapshot.lifetime_failed_acquisitions),
+        static_cast<unsigned long>(
+            snapshot.consecutive_acquisition_failures));
+  } else if (!disconnected && context.imu_disconnect_observed &&
+             context.imu_disconnect_active) {
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::System, "IMU recovered");
+    Serial.printf("IMU_RECOVERED previous_reason=%s\n",
+                  context.last_imu_disconnect_reason);
+  }
+
+  context.imu_disconnect_observed = true;
+  context.imu_disconnect_active = disconnected;
+}
+
+AutonomousImuRecoveryUpdate serviceAutonomousImuRecovery(
+    RuntimeContext& context, robot::ImuRecoveryState& recovery,
+    const bool is_turn, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::LineFollowerConfig& command_config,
+    const robot::Milliseconds now_ms) {
+  AutonomousImuRecoveryUpdate service_update{};
+  const robot::esp2::ImuState& imu_state =
+      context.latest_imu_snapshot.state;
+  const robot::ImuRecoveryUpdate recovery_update =
+      robot::updateImuRecovery(
+          recovery, kAutonomousImuRecoveryConfig,
+          imuReadyForAutonomousMotion(context),
+          imu_state.successful_read_count, imu_state.heading_deg,
+          now_ms);
+  service_update.timer_adjustment_ms =
+      recovery_update.timer_adjustment_ms;
+
+  if (is_turn) {
+    robot::deferImuTurnTimers(
+        context.imu_turn_state,
+        recovery_update.timer_adjustment_ms);
+  } else {
+    robot::deferImuHeadingHoldTimer(
+        context.imu_heading_hold_state,
+        recovery_update.timer_adjustment_ms);
+  }
+
+  if (recovery_update.pause_started) {
+    logEvent(
+        context, now_ms, robot::EventSeverity::Warn,
+        robot::EventSource::System,
+        is_turn
+            ? "IMU I2C reads lost: autonomous turn paused with wheels disabled"
+            : "IMU I2C reads lost: autonomous strafe paused with wheels disabled");
+  }
+  if (recovery_update.decision ==
+      robot::ImuRecoveryDecision::Recovered) {
+    logEvent(
+        context, now_ms, robot::EventSeverity::Info,
+        robot::EventSource::System,
+        is_turn
+            ? "IMU I2C reads recovered: autonomous turn resumed"
+            : "IMU I2C reads recovered: autonomous strafe resumed");
+    return service_update;
+  }
+  if (recovery_update.decision ==
+      robot::ImuRecoveryDecision::Continue) {
+    return service_update;
+  }
+
+  const bool outputs_stopped =
+      stopAutonomyDriveAndFunnel(
+          context, front_left, front_right, rear_link, now_ms);
+  const bool rear_link_healthy =
+      rear_link.configured() &&
+      rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(command_config)) &&
+      (!rear_link.statusAvailable() ||
+       !rear_link.latestStatus().fault_active ||
+       rear_link.latestStatus().fault_code !=
+           robot::FaultCode::CommunicationStale);
+  if (!outputs_stopped || !rear_link_healthy) {
+    service_update.result =
+        AutonomousImuRecoveryResult::StopCommandFailed;
+    return service_update;
+  }
+  service_update.result =
+      recovery_update.decision ==
+              robot::ImuRecoveryDecision::TimedOut
+          ? AutonomousImuRecoveryResult::TimedOut
+          : AutonomousImuRecoveryResult::Paused;
+  return service_update;
+}
+
+void stopAutonomousImuStrafe(RuntimeContext& context) {
+  robot::cancelImuRecovery(context.imu_strafe_recovery);
+  if (robot::imuHeadingHoldActive(context.imu_heading_hold_state)) {
+    robot::stopImuHeadingHold(context.imu_heading_hold_state);
+    context.last_imu_heading_hold_update = {};
+    context.last_imu_heading_hold_update.state =
+        context.imu_heading_hold_state.state;
+  }
+}
+
+AutonomousImuMotionResult runAutonomousImuStrafe(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::LineFollowerConfig& command_config,
+    const int lateral_direction, const float strafe_duty,
+    const robot::Milliseconds now_ms) {
+  robot::ImuHeadingHoldConfig active_config =
+      context.imu_heading_hold_config;
+  active_config.maximum_strafe_duty = strafe_duty;
+  if (!imuHeadingHoldRuntimeConfigValid(active_config)) {
+    return AutonomousImuMotionResult::InvalidConfiguration;
+  }
+  if (!imuReadyForAutonomousMotion(context)) {
+    return AutonomousImuMotionResult::ImuUnavailable;
+  }
+  if (!front_left.configured() || !front_right.configured()) {
+    return AutonomousImuMotionResult::MotorUnavailable;
+  }
+  if (!rear_link.configured() ||
+      !rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(command_config))) {
+    return AutonomousImuMotionResult::RearLinkUnavailable;
+  }
+
+  if (!robot::imuHeadingHoldActive(context.imu_heading_hold_state) ||
+      context.imu_heading_hold_state.lateral_direction !=
+          lateral_direction) {
+    const robot::esp2::ImuState& imu_state =
+        context.latest_imu_snapshot.state;
+    if (!robot::startImuHeadingHold(
+            context.imu_heading_hold_state, imu_state.heading_deg,
+            lateral_direction, active_config,
+            hardwareDutyCap(), now_ms)) {
+      return AutonomousImuMotionResult::ControllerFault;
+    }
+    context.last_imu_heading_hold_update = {};
+    context.last_imu_heading_hold_update.state =
+        context.imu_heading_hold_state.state;
+    context.last_imu_heading_hold_update.current_heading_deg =
+        imu_state.heading_deg;
+    context.last_imu_heading_hold_update.target_heading_deg =
+        context.imu_heading_hold_state.target_heading_deg;
+    context.last_imu_heading_hold_update.yaw_rate_dps =
+        imu_state.yaw_rate_dps;
+    context.last_imu_heading_hold_update.lateral_direction =
+        lateral_direction;
+    context.last_imu_heading_hold_update.should_strafe = true;
+  }
+
+  const robot::esp2::ImuState& imu_state =
+      context.latest_imu_snapshot.state;
+  context.last_imu_heading_hold_update =
+      robot::updateImuHeadingHold(
+          context.imu_heading_hold_state, imu_state.heading_deg,
+          imu_state.yaw_rate_dps, active_config,
+          hardwareDutyCap(), now_ms);
+  if (context.last_imu_heading_hold_update.faulted) {
+    return AutonomousImuMotionResult::ControllerFault;
+  }
+
+  const float lateral_duty =
+      static_cast<float>(lateral_direction) *
+      active_config.maximum_strafe_duty;
+  const float signed_yaw_correction =
+      context.last_imu_heading_hold_update.yaw_correction_duty *
+      static_cast<float>(
+          active_config.yaw_command_polarity);
+  const robot::FourWheelCommand wheels = robot::mixOpenLoopMecanum(
+      lateral_duty, 0.0F, signed_yaw_correction, 1.0F, now_ms,
+      command_config.remoteCommandTimeoutMs);
+  context.requested_command = wheels;
+  if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                         wheels, command_config, now_ms)) {
+    robot::faultImuHeadingHold(
+        context.imu_heading_hold_state,
+        robot::ImuHeadingHoldFaultReason::CommandFailed);
+    return AutonomousImuMotionResult::CommandFailed;
+  }
+
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = true;
+  context.mode_expires_at_ms = 0U;
+  return AutonomousImuMotionResult::Running;
+}
+
+void stopAutonomousImuTurn(RuntimeContext& context) {
+  robot::cancelImuRecovery(context.imu_turn_recovery);
+  if (robot::imuTurnActive(context.imu_turn_state)) {
+    robot::stopImuTurn(context.imu_turn_state);
+    context.last_imu_turn_update = {};
+    context.last_imu_turn_update.state =
+        context.imu_turn_state.state;
+  }
+}
+
+AutonomousImuMotionResult runAutonomousImuTurn(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::LineFollowerConfig& command_config,
+    const float relative_angle_deg, const robot::Milliseconds now_ms,
+    const robot::Milliseconds timeout_override_ms = 0U) {
+  robot::ImuTurnConfig active_config = context.imu_turn_config;
+  if (timeout_override_ms > 0U) {
+    active_config.timeout_ms = timeout_override_ms;
+  }
+  if (!imuTurnRuntimeConfigValid(active_config)) {
+    return AutonomousImuMotionResult::InvalidConfiguration;
+  }
+  if (!imuReadyForAutonomousMotion(context)) {
+    return AutonomousImuMotionResult::ImuUnavailable;
+  }
+  if (!front_left.configured() || !front_right.configured()) {
+    return AutonomousImuMotionResult::MotorUnavailable;
+  }
+  if (!rear_link.configured() ||
+      !rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(command_config))) {
+    return AutonomousImuMotionResult::RearLinkUnavailable;
+  }
+
+  if (context.imu_turn_state.state == robot::ImuTurnState::Complete) {
+    return AutonomousImuMotionResult::Complete;
+  }
+  if (context.imu_turn_state.state == robot::ImuTurnState::Fault) {
+    return context.imu_turn_state.fault_reason ==
+                   robot::ImuTurnFaultReason::Timeout
+               ? AutonomousImuMotionResult::Timeout
+               : AutonomousImuMotionResult::ControllerFault;
+  }
+  if (!robot::imuTurnActive(context.imu_turn_state)) {
+    const robot::esp2::ImuState& imu_state =
+        context.latest_imu_snapshot.state;
+    if (!robot::startImuTurn(
+            context.imu_turn_state, imu_state.heading_deg,
+            relative_angle_deg, active_config,
+            hardwareDutyCap(), now_ms)) {
+      return AutonomousImuMotionResult::ControllerFault;
+    }
+    context.last_imu_turn_update = {};
+    context.last_imu_turn_update.state =
+        context.imu_turn_state.state;
+    context.last_imu_turn_update.current_heading_deg =
+        imu_state.heading_deg;
+    context.last_imu_turn_update.target_heading_deg =
+        context.imu_turn_state.target_heading_deg;
+    context.last_imu_turn_update.angle_error_deg =
+        relative_angle_deg;
+    context.last_imu_turn_update.yaw_rate_dps =
+        imu_state.yaw_rate_dps;
+  }
+
+  const robot::esp2::ImuState& imu_state =
+      context.latest_imu_snapshot.state;
+  context.last_imu_turn_update = robot::updateImuTurn(
+      context.imu_turn_state, imu_state.heading_deg,
+      imu_state.yaw_rate_dps, active_config,
+      hardwareDutyCap(), now_ms);
+  if (context.last_imu_turn_update.faulted) {
+    return context.imu_turn_state.fault_reason ==
+                   robot::ImuTurnFaultReason::Timeout
+               ? AutonomousImuMotionResult::Timeout
+               : AutonomousImuMotionResult::ControllerFault;
+  }
+  if (context.last_imu_turn_update.completed) {
+    const robot::FourWheelCommand stopped =
+        robot::disabledFourWheelCommand();
+    context.requested_command = stopped;
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           stopped, command_config, now_ms)) {
+      robot::faultImuTurn(context.imu_turn_state,
+                          robot::ImuTurnFaultReason::CommandFailed);
+      return AutonomousImuMotionResult::CommandFailed;
+    }
+    return AutonomousImuMotionResult::Complete;
+  }
+  if (!context.last_imu_turn_update.should_rotate) {
+    const robot::FourWheelCommand stopped =
+        robot::disabledFourWheelCommand();
+    context.requested_command = stopped;
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           stopped, command_config, now_ms)) {
+      robot::faultImuTurn(context.imu_turn_state,
+                          robot::ImuTurnFaultReason::CommandFailed);
+      return AutonomousImuMotionResult::CommandFailed;
+    }
+    return AutonomousImuMotionResult::Running;
+  }
+
+  const robot::FourWheelCommand wheels = makeImuTurnCommand(
+      context, context.last_imu_turn_update.rotation_command, now_ms);
+  context.requested_command = wheels;
+  if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                         wheels, command_config, now_ms)) {
+    robot::faultImuTurn(context.imu_turn_state,
+                        robot::ImuTurnFaultReason::CommandFailed);
+    return AutonomousImuMotionResult::CommandFailed;
+  }
+
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = true;
+  context.mode_expires_at_ms = 0U;
+  return AutonomousImuMotionResult::Running;
 }
 
 void enterImuTurnFault(RuntimeContext& context,
@@ -1748,11 +2632,198 @@ void enterImuTurnFault(RuntimeContext& context,
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
 }
 
+void captureImuTurnAvailabilityFault(
+    RuntimeContext& context,
+    const robot::esp2::ImuAcquisitionSnapshot& imu,
+    const DualPwmMotorOutput& front_left,
+    const DualPwmMotorOutput& front_right,
+    const RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const std::uint32_t now_us, const char* const origin,
+    const char* const reason) {
+  ImuTurnAvailabilityFaultCapture& capture =
+      context.imu_turn_availability_fault;
+  capture = {};
+  capture.valid = true;
+  capture.configured = imu.state.configured;
+  capture.initialized = imu.state.initialized;
+  capture.calibrated = imu.state.calibrated;
+  capture.healthy = imu.state.healthy;
+  capture.sample_valid = imu.state.last_successful_read_us != 0U;
+  capture.data_fresh = robot::esp2::imuSnapshotFresh(
+      imu, now_us, kImuFreshnessTimeoutUs);
+  capture.acquisition_running = imu.acquisition_running;
+  capture.shared_snapshot_available =
+      context.imu_shared_snapshot_available;
+  capture.front_left_configured = front_left.configured();
+  capture.front_right_configured = front_right.configured();
+  capture.rear_link_configured = rear_link.configured();
+  capture.rear_status_available = rear_link.statusAvailable();
+  capture.rear_status_fresh = rear_link.remoteStatusFresh(
+      now_ms, remoteStatusTimeoutMs(context.config));
+  copyText(capture.origin, sizeof(capture.origin), origin);
+  copyText(capture.reason, sizeof(capture.reason), reason);
+  capture.evaluated_at_us = now_us;
+  capture.evaluated_at_ms = now_ms;
+  capture.published_at_us = imu.published_at_us;
+  capture.last_successful_read_us =
+      imu.state.last_successful_read_us;
+  capture.sample_age_us =
+      capture.sample_valid
+          ? now_us - imu.state.last_successful_read_us
+          : 0U;
+  capture.snapshot_age_us =
+      imu.published_at_us == 0U ? 0U
+                               : now_us - imu.published_at_us;
+  capture.freshness_timeout_us = kImuFreshnessTimeoutUs;
+  capture.cached_snapshot_sequence = imu.publication_sequence;
+  capture.cached_successful_sample_sequence =
+      imu.successful_sample_sequence;
+  capture.cached_snapshot_fetched_at_us =
+      context.imu_shared_snapshot_fetched_at_us;
+  capture.cached_snapshot_fetch_to_gate_us =
+      context.imu_shared_snapshot_fetched_at_us == 0U
+          ? 0U
+          : now_us -
+                context.imu_shared_snapshot_fetched_at_us;
+
+  robot::esp2::ImuAcquisitionSnapshot newest_snapshot{};
+  capture.newest_snapshot_available =
+      g_runtime.imu_acquisition != nullptr &&
+      g_runtime.imu_acquisition->latest(newest_snapshot);
+  capture.newest_snapshot_sequence =
+      capture.newest_snapshot_available
+          ? newest_snapshot.publication_sequence
+          : 0U;
+  capture.newest_successful_sample_sequence =
+      capture.newest_snapshot_available
+          ? newest_snapshot.successful_sample_sequence
+          : 0U;
+  capture.cached_snapshot_matches_newest =
+      capture.newest_snapshot_available &&
+      capture.cached_snapshot_sequence ==
+          capture.newest_snapshot_sequence;
+  const robot::esp2::ImuAcquisitionSnapshot& timing_snapshot =
+      capture.newest_snapshot_available ? newest_snapshot : imu;
+  capture.successful_sample_publication_gap_us =
+      timing_snapshot.successful_sample_publication_gap_us;
+  capture.maximum_successful_sample_publication_gap_us =
+      timing_snapshot
+          .maximum_successful_sample_publication_gap_us;
+  capture.current_observed_publication_gap_us =
+      imu.last_successful_sample_published_at_us == 0U
+          ? 0U
+          : now_us -
+                imu.last_successful_sample_published_at_us;
+  if (capture.current_observed_publication_gap_us >
+      context.maximum_observed_imu_publication_gap_us) {
+    context.maximum_observed_imu_publication_gap_us =
+        capture.current_observed_publication_gap_us;
+  }
+  capture.maximum_observed_publication_gap_us =
+      context.maximum_observed_imu_publication_gap_us;
+  capture.rear_last_status_received_at_ms =
+      rear_link.lastStatusReceivedAtMs();
+  capture.rear_status_age_ms =
+      capture.rear_status_available
+          ? elapsedSince(now_ms,
+                         capture.rear_last_status_received_at_ms)
+          : 0U;
+
+  Serial.printf(
+      "IMU_TURN_AVAILABILITY_FAULT origin=%s reason=%s "
+      "configured=%u initialized=%u calibrated=%u healthy=%u "
+      "sample_valid=%u data_fresh=%u acquisition_running=%u "
+      "shared_snapshot_available=%u evaluated_at_us=%lu "
+      "published_at_us=%lu last_successful_read_us=%lu "
+      "sample_age_us=%lu snapshot_age_us=%lu freshness_timeout_us=%lu "
+      "front_left_configured=%u front_right_configured=%u "
+      "rear_link_configured=%u rear_status_available=%u "
+      "rear_status_fresh=%u evaluated_at_ms=%lu "
+      "rear_last_status_received_at_ms=%lu rear_status_age_ms=%lu "
+      "acq_loop_us=%lu acq_loop_max_us=%lu sync_us=%lu "
+      "sync_max_us=%lu i2c_read_us=%lu i2c_read_max_us=%lu "
+      "wire_lock_us=%lu wire_lock_max_us=%lu "
+      "read_to_publish_us=%lu read_to_publish_max_us=%lu "
+      "publish_queue_us=%lu publish_queue_max_us=%lu "
+      "publication_gap_us=%lu publication_gap_max_us=%lu "
+      "observed_open_publication_gap_us=%lu "
+      "observed_publication_gap_max_us=%lu "
+      "cached_seq=%lu newest_available=%u newest_seq=%lu "
+      "cached_matches_newest=%u cached_fetched_at_us=%lu "
+      "cached_fetch_to_gate_us=%lu\n",
+      capture.origin, capture.reason,
+      static_cast<unsigned>(capture.configured),
+      static_cast<unsigned>(capture.initialized),
+      static_cast<unsigned>(capture.calibrated),
+      static_cast<unsigned>(capture.healthy),
+      static_cast<unsigned>(capture.sample_valid),
+      static_cast<unsigned>(capture.data_fresh),
+      static_cast<unsigned>(capture.acquisition_running),
+      static_cast<unsigned>(capture.shared_snapshot_available),
+      static_cast<unsigned long>(capture.evaluated_at_us),
+      static_cast<unsigned long>(capture.published_at_us),
+      static_cast<unsigned long>(capture.last_successful_read_us),
+      static_cast<unsigned long>(capture.sample_age_us),
+      static_cast<unsigned long>(capture.snapshot_age_us),
+      static_cast<unsigned long>(capture.freshness_timeout_us),
+      static_cast<unsigned>(capture.front_left_configured),
+      static_cast<unsigned>(capture.front_right_configured),
+      static_cast<unsigned>(capture.rear_link_configured),
+      static_cast<unsigned>(capture.rear_status_available),
+      static_cast<unsigned>(capture.rear_status_fresh),
+      static_cast<unsigned long>(capture.evaluated_at_ms),
+      static_cast<unsigned long>(
+          capture.rear_last_status_received_at_ms),
+      static_cast<unsigned long>(capture.rear_status_age_ms),
+      static_cast<unsigned long>(imu.acquisition_loop_interval_us),
+      static_cast<unsigned long>(
+          imu.maximum_acquisition_loop_interval_us),
+      static_cast<unsigned long>(imu.synchronization_duration_us),
+      static_cast<unsigned long>(
+          imu.maximum_synchronization_duration_us),
+      static_cast<unsigned long>(
+          imu.state.last_measurement_read_duration_us),
+      static_cast<unsigned long>(
+          imu.state.maximum_measurement_read_duration_us),
+      static_cast<unsigned long>(
+          imu.state.last_wire_lock_acquire_duration_us),
+      static_cast<unsigned long>(
+          imu.state.maximum_wire_lock_acquire_duration_us),
+      static_cast<unsigned long>(
+          imu.successful_read_to_publication_us),
+      static_cast<unsigned long>(
+          imu.maximum_successful_read_to_publication_us),
+      static_cast<unsigned long>(
+          imu.publication_queue_duration_us),
+      static_cast<unsigned long>(
+          imu.maximum_publication_queue_duration_us),
+      static_cast<unsigned long>(
+          capture.successful_sample_publication_gap_us),
+      static_cast<unsigned long>(
+          capture.maximum_successful_sample_publication_gap_us),
+      static_cast<unsigned long>(
+          capture.current_observed_publication_gap_us),
+      static_cast<unsigned long>(
+          capture.maximum_observed_publication_gap_us),
+      static_cast<unsigned long>(
+          capture.cached_snapshot_sequence),
+      static_cast<unsigned>(capture.newest_snapshot_available),
+      static_cast<unsigned long>(
+          capture.newest_snapshot_sequence),
+      static_cast<unsigned>(
+          capture.cached_snapshot_matches_newest),
+      static_cast<unsigned long>(
+          capture.cached_snapshot_fetched_at_us),
+      static_cast<unsigned long>(
+          capture.cached_snapshot_fetch_to_gate_us));
+}
+
 void runImuTurnTest(RuntimeContext& context,
                     DualPwmMotorOutput& front_left,
                     DualPwmMotorOutput& front_right,
                     RearCommandLink& rear_link,
-                    const robot::esp2::ImuAcquisitionSnapshot& imu,
+                    robot::esp2::ImuAcquisitionService& imu_acquisition,
                     const robot::Milliseconds now_ms) {
   if (!robot::imuTurnActive(context.imu_turn_state)) {
     disableMotionActuators(context, front_left, front_right, rear_link,
@@ -1770,11 +2841,21 @@ void runImuTurnTest(RuntimeContext& context,
     return;
   }
 
+  context.imu_shared_snapshot_available =
+      imu_acquisition.latest(context.latest_imu_snapshot);
+  context.imu_shared_snapshot_fetched_at_us = micros();
+  const robot::esp2::ImuAcquisitionSnapshot& imu =
+      context.latest_imu_snapshot;
   const robot::esp2::ImuState& imu_state = imu.state;
-  if (!imu_state.configured || !imu_state.initialized ||
-      !imu_state.calibrated || !imu_state.healthy ||
-      !robot::esp2::imuSnapshotFresh(
-          imu, micros(), kImuFreshnessTimeoutUs)) {
+  const std::uint32_t imu_availability_now_us = micros();
+  const char* const imu_availability_reason =
+      robot::esp2::imuDisconnectReason(
+          imu, imu_availability_now_us, kImuFreshnessTimeoutUs);
+  if (std::strcmp(imu_availability_reason, "NONE") != 0) {
+    captureImuTurnAvailabilityFault(
+        context, imu, front_left, front_right, rear_link, now_ms,
+        imu_availability_now_us, "ACTIVE_TURN_RUNTIME_GATE",
+        imu_availability_reason);
     enterImuTurnFault(context, front_left, front_right, rear_link,
                       robot::ImuTurnFaultReason::ImuUnavailable,
                       robot::FaultCode::HardwareNotConfigured,
@@ -1882,6 +2963,128 @@ void runImuTurnTest(RuntimeContext& context,
   context.mode_expires_at_ms = 0U;
 }
 
+void enterImuHeadingHoldFault(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::ImuHeadingHoldFaultReason reason,
+    const robot::FaultCode fault_code, const char* message,
+    const robot::EventSource source,
+    const robot::Milliseconds now_ms) {
+  const bool already_faulted =
+      context.imu_heading_hold_state.state ==
+      robot::ImuHeadingHoldState::Fault;
+  robot::faultImuHeadingHold(context.imu_heading_hold_state, reason);
+  context.last_imu_heading_hold_update = {};
+  context.last_imu_heading_hold_update.state =
+      context.imu_heading_hold_state.state;
+  context.last_imu_heading_hold_update.fault_reason =
+      context.imu_heading_hold_state.fault_reason;
+  disableMotionActuators(context, front_left, front_right, rear_link,
+                         now_ms);
+  setFault(context, fault_code, message);
+  if (!already_faulted) {
+    logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
+  }
+}
+
+void runImuHeadingHoldTest(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    robot::esp2::ImuAcquisitionService& imu_acquisition,
+    const robot::Milliseconds now_ms) {
+  if (!robot::imuHeadingHoldActive(context.imu_heading_hold_state)) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
+  if (!imuHeadingHoldRuntimeConfigValid(
+          context.imu_heading_hold_config)) {
+    enterImuHeadingHoldFault(
+        context, front_left, front_right, rear_link,
+        robot::ImuHeadingHoldFaultReason::InvalidConfiguration,
+        robot::FaultCode::InvalidCommand,
+        "IMU strafe stopped: invalid configuration",
+        robot::EventSource::System, now_ms);
+    return;
+  }
+
+  context.imu_shared_snapshot_available =
+      imu_acquisition.latest(context.latest_imu_snapshot);
+  context.imu_shared_snapshot_fetched_at_us = micros();
+  const robot::esp2::ImuAcquisitionSnapshot& imu =
+      context.latest_imu_snapshot;
+  const robot::esp2::ImuState& imu_state = imu.state;
+  if (std::strcmp(robot::esp2::imuDisconnectReason(
+                      imu, micros(), kImuFreshnessTimeoutUs),
+                  "NONE") != 0) {
+    enterImuHeadingHoldFault(
+        context, front_left, front_right, rear_link,
+        robot::ImuHeadingHoldFaultReason::ImuUnavailable,
+        robot::FaultCode::HardwareNotConfigured,
+        "IMU strafe stopped: IMU unavailable",
+        robot::EventSource::System, now_ms);
+    return;
+  }
+  if (!front_left.configured() || !front_right.configured()) {
+    enterImuHeadingHoldFault(
+        context, front_left, front_right, rear_link,
+        robot::ImuHeadingHoldFaultReason::CommandFailed,
+        robot::FaultCode::HardwareNotConfigured,
+        "IMU strafe stopped: front motors unavailable",
+        robot::EventSource::Motor, now_ms);
+    return;
+  }
+  if (!rear_link.configured() ||
+      !rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config))) {
+    enterImuHeadingHoldFault(
+        context, front_left, front_right, rear_link,
+        robot::ImuHeadingHoldFaultReason::RearLinkUnavailable,
+        robot::FaultCode::CommunicationStale,
+        "IMU strafe stopped: rear link unavailable",
+        robot::EventSource::Uart, now_ms);
+    return;
+  }
+
+  context.last_imu_heading_hold_update =
+      robot::updateImuHeadingHold(
+          context.imu_heading_hold_state, imu_state.heading_deg,
+          imu_state.yaw_rate_dps, context.imu_heading_hold_config,
+          hardwareDutyCap(), now_ms);
+  if (context.last_imu_heading_hold_update.faulted) {
+    enterImuHeadingHoldFault(
+        context, front_left, front_right, rear_link,
+        context.imu_heading_hold_state.fault_reason,
+        robot::FaultCode::InvalidCommand,
+        "IMU strafe stopped: controller fault",
+        robot::EventSource::System, now_ms);
+    return;
+  }
+
+  const float lateral_duty =
+      static_cast<float>(
+          context.imu_heading_hold_state.lateral_direction) *
+      context.imu_heading_hold_config.maximum_strafe_duty;
+  const float signed_yaw_correction =
+      context.last_imu_heading_hold_update.yaw_correction_duty *
+      static_cast<float>(
+          context.imu_heading_hold_config.yaw_command_polarity);
+  const robot::FourWheelCommand wheels = robot::mixOpenLoopMecanum(
+      lateral_duty, 0.0F, signed_yaw_correction, 1.0F, now_ms,
+      context.config.remoteCommandTimeoutMs);
+  context.requested_command = wheels;
+  if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                         wheels, context.config, now_ms)) {
+    enterImuHeadingHoldFault(
+        context, front_left, front_right, rear_link,
+        robot::ImuHeadingHoldFaultReason::CommandFailed,
+        robot::FaultCode::CommunicationStale,
+        "IMU strafe stopped: rear command failed",
+        robot::EventSource::Uart, now_ms);
+  }
+}
+
 void printTelemetry(RuntimeContext& context,
                     const DigitalFrontLineSensorReader& sensors,
                     const RearCommandLink& rear_link,
@@ -1900,6 +3103,8 @@ void requestSolarPanelAutonomyStart(RuntimeContext& context,
   disableActuators(context, front_left, front_right, rear_link, now_ms);
   context.modes.setMode(robot::RobotTestMode::AutonomousSolarPanel, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
@@ -1907,6 +3112,46 @@ void requestSolarPanelAutonomyStart(RuntimeContext& context,
   clearFault(context);
   logEvent(context, now_ms, robot::EventSeverity::Info, source,
            "solar autonomy start requested");
+}
+
+void requestHabitatPiecesStart(RuntimeContext& context,
+                               robot::IMotorOutput& front_left,
+                               robot::IMotorOutput& front_right,
+                               RearCommandLink& rear_link,
+                               const robot::Milliseconds now_ms,
+                               const robot::EventSource source) {
+  disableActuators(context, front_left, front_right, rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::HabitatPieces, now_ms);
+  resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
+  resetTowerPieces(context, now_ms);
+  resetPegFinder(context, now_ms);
+  resetTimeTrial(context, now_ms);
+  context.habitat_pieces_start_requested = true;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info, source,
+           "Habitat Pieces start requested");
+}
+
+void requestHabitatPlacementStart(
+    RuntimeContext& context, robot::IMotorOutput& front_left,
+    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms,
+    const robot::EventSource source) {
+  (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
+                                   rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::HabitatPlacement, now_ms);
+  resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
+  resetTowerPieces(context, now_ms);
+  resetPegFinder(context, now_ms);
+  resetTimeTrial(context, now_ms);
+  context.habitat_placement_start_requested = true;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info, source,
+           "Habitat Placement start requested");
 }
 
 void requestTowerPiecesStart(RuntimeContext& context,
@@ -1919,6 +3164,8 @@ void requestTowerPiecesStart(RuntimeContext& context,
                                    rear_link, now_ms);
   context.modes.setMode(robot::RobotTestMode::AutonomousTowerPieces, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
@@ -1938,6 +3185,8 @@ void requestPegFinderStart(RuntimeContext& context,
                                    rear_link, now_ms);
   context.modes.setMode(robot::RobotTestMode::PegFinder, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
@@ -1956,6 +3205,8 @@ void requestTimeTrialStart(RuntimeContext& context,
   disableActuators(context, front_left, front_right, rear_link, now_ms);
   context.modes.setMode(robot::RobotTestMode::TimeTrial, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
@@ -1963,6 +3214,603 @@ void requestTimeTrialStart(RuntimeContext& context,
   clearFault(context);
   logEvent(context, now_ms, robot::EventSeverity::Info, source,
            "Time Trial start requested");
+}
+
+void enterHabitatPiecesFault(
+    RuntimeContext& context, robot::IMotorOutput& front_left,
+    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::HabitatPiecesStopReason stop_reason,
+    const robot::FaultCode fault_code, const char* const message,
+    const robot::EventSource source,
+    const robot::Milliseconds now_ms) {
+  disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  robot::failHabitatPiecesAutonomy(context.habitat_pieces, stop_reason,
+                                   now_ms);
+  context.last_habitat_pieces_update.state =
+      robot::HabitatPiecesState::Fault;
+  context.last_habitat_pieces_update.stop_reason = stop_reason;
+  context.last_habitat_pieces_update.should_stop = true;
+  context.last_habitat_pieces_update.should_line_follow = false;
+  setFault(context, fault_code, message);
+  logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
+}
+
+void runHabitatPieces(
+    RuntimeContext& context, DigitalFrontLineSensorReader& sensors,
+    DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
+    RearCommandLink& rear_link, const robot::Milliseconds now_ms) {
+  if (context.habitat_pieces.state ==
+      robot::HabitatPiecesState::WaitForStart) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    if (!context.habitat_pieces_start_requested) {
+      return;
+    }
+    context.habitat_pieces_start_requested = false;
+    if (!rear_link.rearLineSnapshotFresh(
+            now_ms, context.config.remoteCommandTimeoutMs)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::Lss2DataStale,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces start rejected: LSS2 sensor data stale",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    if (!rear_link.latestRearLineSnapshot().side_2_configured) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::Lss2Unavailable,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Pieces start rejected: LSS2 GPIO is not configured",
+          robot::EventSource::Line, now_ms);
+      return;
+    }
+    if (!habitatPiecesStartRequirementsMet(
+            sensors, front_left, front_right, rear_link, now_ms, context)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::ConfigurationIncomplete,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Pieces start rejected: config or hardware incomplete",
+          robot::EventSource::System, now_ms);
+      return;
+    }
+    robot::startHabitatPiecesAutonomy(context.habitat_pieces, now_ms);
+    robot::startLineFollower(context.follower_state, now_ms);
+    context.last_update = {};
+    clearFault(context);
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::System,
+             "Habitat Pieces front line follow started; LSS2 detection delay active");
+  }
+
+  if (context.habitat_pieces.state ==
+          robot::HabitatPiecesState::Complete ||
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::Fault) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
+  if (!habitatPiecesMotionRequirementsMet(
+          sensors, front_left, front_right, rear_link, now_ms, context)) {
+    enterHabitatPiecesFault(
+        context, front_left, front_right, rear_link,
+        robot::HabitatPiecesStopReason::ConfigurationIncomplete,
+        robot::FaultCode::CommunicationStale,
+        "Habitat Pieces stopped: motion hardware or rear link unavailable",
+        robot::EventSource::Uart, now_ms);
+    return;
+  }
+
+  bool lss2_black = false;
+  if (context.habitat_pieces.state ==
+      robot::HabitatPiecesState::LineFollowing) {
+    if (!rear_link.rearLineSnapshotFresh(
+            now_ms, context.config.remoteCommandTimeoutMs)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::Lss2DataStale,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: LSS2 sensor data stale",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    const robot::RearLineSensorSnapshot& line_sensors =
+        rear_link.latestRearLineSnapshot();
+    if (!line_sensors.side_2_configured) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::Lss2Unavailable,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Pieces stopped: LSS2 is not configured",
+          robot::EventSource::Line, now_ms);
+      return;
+    }
+    lss2_black = line_sensors.side_2_electrical_high;
+  }
+
+  context.last_habitat_pieces_update =
+      robot::updateHabitatPiecesAutonomy(
+          context.habitat_pieces, context.habitat_pieces_config,
+          lss2_black, now_ms);
+
+  if (context.last_habitat_pieces_update.should_reverse) {
+    robot::stopLineFollower(context.follower_state);
+    if (context.last_habitat_pieces_update.transitioned) {
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Line,
+               "Habitat Pieces LSS2 detected black line; reversing");
+    }
+    const robot::FourWheelCommand wheels =
+        makeHabitatPiecesBackwardCommand(context, now_ms);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: reverse command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    printTelemetry(context, sensors, rear_link, now_ms);
+    return;
+  }
+
+  if (!context.last_habitat_pieces_update.should_line_follow) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    if (context.habitat_pieces.state ==
+            robot::HabitatPiecesState::Complete &&
+        context.last_habitat_pieces_update.target_reached) {
+      clearFault(context);
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::System,
+               "Habitat Pieces reverse duration complete; stopped");
+    } else if (context.habitat_pieces.timed_out) {
+      setFault(context, robot::FaultCode::SearchTimeout,
+               "Habitat Pieces stopped: LSS2 detection timeout reached");
+      logEvent(context, now_ms, robot::EventSeverity::Fault,
+               robot::EventSource::System,
+               "Habitat Pieces stopped: LSS2 detection timeout reached");
+    } else {
+      setFault(context, robot::FaultCode::InvalidCommand,
+               "Habitat Pieces stopped: LSS2 gate unsafe");
+      logEvent(context, now_ms, robot::EventSeverity::Fault,
+               robot::EventSource::Line,
+               "Habitat Pieces stopped: LSS2 gate unsafe");
+    }
+    return;
+  }
+
+  const robot::LineFollowerConfig line_config =
+      habitatPiecesLineFollowerConfig(context);
+  context.last_update = robot::updateLineFollower(
+      context.follower_state, context.last_line_observation.left_black,
+      context.last_line_observation.right_black, line_config, now_ms);
+  if (!context.follower_state.enabled ||
+      !context.last_update.observation.safe_to_drive) {
+    enterHabitatPiecesFault(
+        context, front_left, front_right, rear_link,
+        robot::HabitatPiecesStopReason::FrontLineLost,
+        robot::FaultCode::InvalidCommand,
+        "Habitat Pieces stopped: front line lost without history",
+        robot::EventSource::Line, now_ms);
+    return;
+  }
+  if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                         context.last_update.wheel_command, line_config,
+                         now_ms,
+                         robot::LaserDistanceProfile::HighAccuracy)) {
+    enterHabitatPiecesFault(
+        context, front_left, front_right, rear_link,
+        robot::HabitatPiecesStopReason::RearCommandFailed,
+        robot::FaultCode::CommunicationStale,
+        "Habitat Pieces stopped: rear command failed",
+        robot::EventSource::Uart, now_ms);
+    return;
+  }
+  context.last_command_ms = now_ms;
+  printTelemetry(context, sensors, rear_link, now_ms);
+}
+
+void enterHabitatPlacementFault(
+    RuntimeContext& context, robot::IMotorOutput& front_left,
+    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
+    robot::esp2::StepperAxis& stepper,
+    const robot::HabitatPlacementFaultReason reason,
+    const robot::FaultCode fault_code, const char* message,
+    const robot::EventSource source,
+    const robot::Milliseconds now_ms) {
+  stopAutonomousImuTurn(context);
+  stepper.stop();
+  (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
+                                   rear_link, now_ms);
+  robot::failHabitatPlacementAutonomy(context.habitat_placement, reason,
+                                      now_ms);
+  context.last_habitat_placement_update = {};
+  context.last_habitat_placement_update.state =
+      robot::HabitatPlacementState::Fault;
+  context.last_habitat_placement_update.fault_reason = reason;
+  context.last_habitat_placement_update.faulted = true;
+  setFault(context, fault_code, message);
+  logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
+}
+
+void runHabitatPlacement(
+    RuntimeContext& context, DigitalFrontLineSensorReader& sensors,
+    DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
+    RearCommandLink& rear_link, ClawServoBank& claws,
+    robot::esp2::StepperAxis& stepper,
+    const robot::Milliseconds now_ms) {
+  if (context.habitat_placement.state ==
+      robot::HabitatPlacementState::WaitForStart) {
+    stepper.stop();
+    (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
+                                     rear_link, now_ms);
+    if (!context.habitat_placement_start_requested) {
+      return;
+    }
+    context.habitat_placement_start_requested = false;
+    if (!habitatPlacementStartRequirementsMet(
+            sensors, front_left, front_right, rear_link, claws, stepper,
+            now_ms, context)) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::HardwareNotReady,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Placement start rejected: configure drive, rear/LSS1/front sensors, IMU turns, stepper, pusher, duties, angles, and timings",
+          robot::EventSource::System, now_ms);
+      return;
+    }
+    robot::startHabitatPlacementAutonomy(context.habitat_placement,
+                                         now_ms);
+    robot::startLineFollower(context.follower_state, now_ms);
+    context.last_rear_update = {};
+    context.last_command_ms = now_ms;
+    context.command_deadman_armed = true;
+    context.mode_expires_at_ms = 0U;
+    clearFault(context);
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::Line,
+             "Habitat Placement reverse rear-line follow started");
+  }
+
+  if (context.habitat_placement.state ==
+          robot::HabitatPlacementState::Complete ||
+      context.habitat_placement.state ==
+          robot::HabitatPlacementState::Fault) {
+    stopAutonomousImuTurn(context);
+    stepper.stop();
+    (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
+                                     rear_link, now_ms);
+    return;
+  }
+
+  if (!rear_link.configured() ||
+      !rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.rear_config))) {
+    enterHabitatPlacementFault(
+        context, front_left, front_right, rear_link, stepper,
+        robot::HabitatPlacementFaultReason::RearLinkStale,
+        robot::FaultCode::CommunicationStale,
+        "Habitat Placement stopped: ESP1 link stale",
+        robot::EventSource::Uart, now_ms);
+    return;
+  }
+
+  if (context.habitat_placement.state ==
+      robot::HabitatPlacementState::ReverseLineFollow) {
+    if (!rear_link.rearLineSnapshotFresh(
+            now_ms, context.rear_config.remoteCommandTimeoutMs)) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::RearLineDataStale,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Placement stopped: rear/LSS1 data stale",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    const robot::RearLineSensorSnapshot& rear =
+        rear_link.latestRearLineSnapshot();
+    if (!rear.configured || !rear.side_configured) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::HardwareNotReady,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Placement stopped: rear line sensors or LSS1 unavailable",
+          robot::EventSource::Line, now_ms);
+      return;
+    }
+  }
+
+  if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
+    enterHabitatPlacementFault(
+        context, front_left, front_right, rear_link, stepper,
+        robot::HabitatPlacementFaultReason::ConflictingLimitSwitches,
+        robot::FaultCode::LimitSwitchConflict,
+        "Habitat Placement stopped: stepper limits conflict",
+        robot::EventSource::Motor, now_ms);
+    return;
+  }
+  if (context.habitat_placement.state ==
+          robot::HabitatPlacementState::LowerSlide &&
+      !stepper.lowerLimitActive() &&
+      (stepper.motionState() ==
+           robot::esp2::StepperMotionState::LimitSearchFailed ||
+       stepper.motionState() ==
+           robot::esp2::StepperMotionState::Stopped)) {
+    enterHabitatPlacementFault(
+        context, front_left, front_right, rear_link, stepper,
+        robot::HabitatPlacementFaultReason::StepperCommandFailed,
+        robot::FaultCode::SearchTimeout,
+        "Habitat Placement stopped: slide stopped before bottom limit",
+        robot::EventSource::Motor, now_ms);
+    return;
+  }
+
+  const robot::HabitatPlacementState previous_state =
+      context.habitat_placement.state;
+  const robot::RearLineSensorSnapshot& rear =
+      rear_link.latestRearLineSnapshot();
+  const robot::HabitatPlacementInputs inputs{
+      rear.side_configured && rear.side_electrical_high,
+      previous_state ==
+              robot::HabitatPlacementState::TurnCounterClockwise &&
+          context.imu_turn_state.state == robot::ImuTurnState::Complete,
+      stepper.lowerLimitActive(),
+      stepper.upperLimitActive(),
+      claws.habitatPusherCommandedOpen(),
+      previous_state == robot::HabitatPlacementState::TurnClockwise &&
+          context.imu_turn_state.state == robot::ImuTurnState::Complete,
+      context.last_line_observation.left_black ||
+          context.last_line_observation.right_black,
+      claws.habitatPusherCommandedClosed()};
+  context.last_habitat_placement_update =
+      robot::updateHabitatPlacementAutonomy(
+          context.habitat_placement, inputs,
+          context.habitat_placement_config, now_ms);
+  const robot::HabitatPlacementUpdate& update =
+      context.last_habitat_placement_update;
+
+  if (update.faulted) {
+    const bool lss_timeout =
+        update.fault_reason ==
+        robot::HabitatPlacementFaultReason::Lss1Timeout;
+    const bool front_timeout =
+        update.fault_reason ==
+        robot::HabitatPlacementFaultReason::FrontLineTimeout;
+    const bool stepper_timeout =
+        update.fault_reason ==
+        robot::HabitatPlacementFaultReason::StepperTimeout;
+    enterHabitatPlacementFault(
+        context, front_left, front_right, rear_link, stepper,
+        update.fault_reason, robot::FaultCode::SearchTimeout,
+        lss_timeout
+            ? "Habitat Placement stopped: LSS1 search timed out"
+            : (front_timeout
+                   ? "Habitat Placement stopped: front-line strafe timed out"
+                   : (stepper_timeout
+                          ? "Habitat Placement stopped: bottom-limit search timed out"
+                          : "Habitat Placement stopped: autonomous state fault")),
+        robot::EventSource::System, now_ms);
+    return;
+  }
+
+  if (update.state != previous_state) {
+    if (update.state ==
+            robot::HabitatPlacementState::TurnCounterClockwise ||
+        update.state == robot::HabitatPlacementState::TurnClockwise) {
+      robot::resetImuTurnController(context.imu_turn_state);
+      context.last_imu_turn_update = {};
+    }
+    if (update.state == robot::HabitatPlacementState::LowerSlide) {
+      const bool accepted = stepper.setLimitSearchSpeed(
+                                context.habitat_placement_config
+                                    .stepper_down_speed_steps_per_second) &&
+                            (stepper.lowerLimitActive() ||
+                             stepper.moveToLowerLimit());
+      if (!accepted) {
+        enterHabitatPlacementFault(
+            context, front_left, front_right, rear_link, stepper,
+            robot::HabitatPlacementFaultReason::StepperCommandFailed,
+            robot::FaultCode::InvalidCommand,
+            "Habitat Placement stopped: slide-down command rejected",
+            robot::EventSource::Motor, now_ms);
+        return;
+      }
+    } else if (previous_state ==
+               robot::HabitatPlacementState::LowerSlide) {
+      stepper.stop();
+    }
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::System,
+             robot::habitatPlacementStateName(update.state));
+  }
+
+  if (update.should_open_pusher || update.should_close_pusher) {
+    const ClawServoCommandResult result = claws.command(
+        kHabitatPusherServoIndex,
+        update.should_open_pusher ? ClawServoPositionRequest::Open
+                                  : ClawServoPositionRequest::Closed);
+    if (result != ClawServoCommandResult::Accepted) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::PusherCommandFailed,
+          clawFaultCode(result), clawServoResultReason(result),
+          robot::EventSource::Motor, now_ms);
+      return;
+    }
+  }
+
+  if (update.should_reverse_line_follow) {
+    const robot::LineFollowerConfig line_config =
+        habitatPlacementLineFollowerConfig(context);
+    context.last_rear_update = robot::updateLineFollower(
+        context.follower_state,
+        context.last_rear_line_observation.left_black,
+        context.last_rear_line_observation.right_black, line_config,
+        now_ms);
+    if (!context.follower_state.enabled ||
+        !context.last_rear_update.observation.safe_to_drive) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::LineLost,
+          robot::FaultCode::InvalidCommand,
+          "Habitat Placement stopped: rear line lost without history",
+          robot::EventSource::Line, now_ms);
+      return;
+    }
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           context.last_rear_update.wheel_command,
+                           line_config, now_ms)) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::DriveCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Placement stopped: reverse line command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    return;
+  }
+
+  robot::stopLineFollower(context.follower_state);
+  if (update.should_turn_counter_clockwise || update.should_turn_clockwise) {
+    const bool clockwise = update.should_turn_clockwise;
+    const float physical_angle_deg =
+        clockwise ? context.habitat_placement_config.clockwise_angle_deg
+                  : context.habitat_placement_config
+                        .counter_clockwise_angle_deg;
+    float relative_angle_deg = robot::clockwiseTurnRelativeAngleDeg(
+        physical_angle_deg, context.imu_turn_config.yaw_command_polarity);
+    if (!clockwise) {
+      relative_angle_deg = -relative_angle_deg;
+    }
+    const robot::Milliseconds timeout_ms =
+        clockwise ? context.habitat_placement_config.clockwise_timeout_ms
+                  : context.habitat_placement_config
+                        .counter_clockwise_timeout_ms;
+    const AutonomousImuMotionResult result = runAutonomousImuTurn(
+        context, front_left, front_right, rear_link, context.rear_config,
+        relative_angle_deg, now_ms, timeout_ms);
+    if (!clockwise &&
+        !context.habitat_placement
+             .counter_clockwise_heading_captured &&
+        (robot::imuTurnActive(context.imu_turn_state) ||
+         context.imu_turn_state.state == robot::ImuTurnState::Complete)) {
+      context.habitat_placement.counter_clockwise_heading_captured = true;
+      context.habitat_placement.counter_clockwise_start_heading_deg =
+          context.imu_turn_state.start_heading_deg;
+      context.habitat_placement.counter_clockwise_target_heading_deg =
+          context.imu_turn_state.target_heading_deg;
+    }
+    if (result != AutonomousImuMotionResult::Running &&
+        result != AutonomousImuMotionResult::Complete) {
+      const bool unavailable =
+          result == AutonomousImuMotionResult::ImuUnavailable ||
+          result == AutonomousImuMotionResult::MotorUnavailable;
+      const bool timed_out = result == AutonomousImuMotionResult::Timeout;
+      const bool link_failed =
+          result == AutonomousImuMotionResult::RearLinkUnavailable ||
+          result == AutonomousImuMotionResult::CommandFailed;
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          unavailable
+              ? robot::HabitatPlacementFaultReason::ImuUnavailable
+              : (timed_out
+                     ? robot::HabitatPlacementFaultReason::ImuTurnTimeout
+                     : robot::HabitatPlacementFaultReason::ImuTurnFailed),
+          unavailable
+              ? robot::FaultCode::HardwareNotConfigured
+              : (link_failed ? robot::FaultCode::CommunicationStale
+                             : robot::FaultCode::InvalidCommand),
+          "Habitat Placement stopped: IMU turn failed",
+          link_failed ? robot::EventSource::Uart
+                      : robot::EventSource::System,
+          now_ms);
+    }
+    return;
+  }
+
+  bool moving = false;
+  robot::FourWheelCommand wheels = robot::disabledFourWheelCommand();
+  if (update.should_drive_forward_to_slide) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 0.0F, 1.0F,
+        context.habitat_placement_config.forward_to_slide_duty, now_ms);
+  } else if (update.should_drive_forward_push) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 0.0F, 1.0F,
+        context.habitat_placement_config.push_forward_duty, now_ms);
+  } else if (update.should_drive_reverse_retreat) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 0.0F, -1.0F,
+        context.habitat_placement_config.reverse_retreat_duty, now_ms);
+  } else if (update.should_drive_reverse_after_clockwise) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 0.0F, -1.0F,
+        context.habitat_placement_config
+            .post_clockwise_reverse_duty,
+        now_ms);
+  } else if (update.should_strafe_left_after_clockwise) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, -1.0F, 0.0F,
+        context.habitat_placement_config
+            .post_clockwise_strafe_left_duty,
+        now_ms);
+  } else if (update.should_drive_forward_exit) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 0.0F, 1.0F,
+        context.habitat_placement_config.exit_forward_duty, now_ms);
+  } else if (update.should_strafe_right) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 1.0F, 0.0F,
+        context.habitat_placement_config.strafe_right_duty, now_ms);
+  }
+
+  if (moving) {
+    stopAutonomousImuTurn(context);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.rear_config, now_ms)) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::DriveCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Placement stopped: drive command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    return;
+  }
+
+  stopAutonomousImuTurn(context);
+  if (!stopAutonomyDriveAndFunnel(context, front_left, front_right,
+                                  rear_link, now_ms)) {
+    enterHabitatPlacementFault(
+        context, front_left, front_right, rear_link, stepper,
+        robot::HabitatPlacementFaultReason::DriveCommandFailed,
+        robot::FaultCode::CommunicationStale,
+        "Habitat Placement stopped: stop command failed",
+        robot::EventSource::Uart, now_ms);
+    return;
+  }
+  if (update.complete) {
+    clearFault(context);
+  }
 }
 
 void enterTowerPiecesFault(
@@ -1973,12 +3821,65 @@ void enterTowerPiecesFault(
     const robot::TowerPiecesFaultReason reason,
     const robot::FaultCode fault_code, const char* message,
     const robot::EventSource source) {
+  stopAutonomousImuStrafe(context);
+  stopAutonomousImuTurn(context);
   stepper.stop();
   (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
                                    rear_link, now_ms);
   robot::failTowerPiecesAutonomy(context.tower_pieces, reason, now_ms);
   setFault(context, fault_code, message);
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
+}
+
+void enterTowerPiecesImuMotionFault(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    robot::esp2::StepperAxis& stepper,
+    const AutonomousImuMotionResult result, const bool is_turn,
+    const robot::Milliseconds now_ms) {
+  const bool imu_unavailable =
+      result == AutonomousImuMotionResult::ImuUnavailable;
+  const bool link_failed =
+      result == AutonomousImuMotionResult::RearLinkUnavailable ||
+      result == AutonomousImuMotionResult::CommandFailed;
+  const bool timed_out =
+      result == AutonomousImuMotionResult::Timeout;
+  const robot::TowerPiecesFaultReason reason =
+      imu_unavailable
+          ? robot::TowerPiecesFaultReason::ImuUnavailable
+          : (link_failed
+                 ? robot::TowerPiecesFaultReason::RearCommandFailed
+                 : (is_turn
+                        ? (timed_out
+                               ? robot::TowerPiecesFaultReason::
+                                     ImuTurnTimeout
+                               : robot::TowerPiecesFaultReason::
+                                     ImuTurnFailed)
+                        : robot::TowerPiecesFaultReason::
+                              ImuStrafeFailed));
+  const robot::FaultCode fault_code =
+      imu_unavailable ||
+              result == AutonomousImuMotionResult::MotorUnavailable
+          ? robot::FaultCode::HardwareNotConfigured
+          : (link_failed
+                 ? robot::FaultCode::CommunicationStale
+                 : (timed_out ? robot::FaultCode::SearchTimeout
+                              : robot::FaultCode::InvalidCommand));
+  const char* message =
+      imu_unavailable
+          ? "tower pieces stopped: IMU unavailable"
+          : (link_failed
+                 ? "tower pieces stopped: IMU motion rear command failed"
+                 : (is_turn
+                        ? (timed_out
+                               ? "tower pieces stopped: IMU clockwise turn timed out"
+                               : "tower pieces stopped: IMU clockwise turn failed")
+                        : "tower pieces stopped: IMU strafe failed"));
+  enterTowerPiecesFault(
+      context, front_left, front_right, rear_link, stepper, now_ms,
+      reason, fault_code, message,
+      link_failed ? robot::EventSource::Uart
+                  : robot::EventSource::System);
 }
 
 bool stopTowerPiecesOutputsOrFault(
@@ -2030,7 +3931,7 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
             context, front_left, front_right, rear_link, stepper, now_ms,
             robot::TowerPiecesFaultReason::HardwareNotReady,
             robot::FaultCode::HardwareNotConfigured,
-            "tower pieces start rejected: configure motion, rear/side sensors, servos, stepper, timings, and link",
+            "tower pieces start rejected: configure motion, shared IMU turn/strafe tuning, rear/side sensors, servos, stepper, timings, and link",
             robot::EventSource::System);
         return;
       }
@@ -2063,6 +3964,7 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
     case robot::TowerPiecesState::PostWinchOpenDelay:
     case robot::TowerPiecesState::ClawsOpen:
     case robot::TowerPiecesState::PostClawsOpenDelay:
+    case robot::TowerPiecesState::PreStepperBottomDelay:
     case robot::TowerPiecesState::MoveStepperBottom:
     case robot::TowerPiecesState::PostStepperBottomDelay:
     case robot::TowerPiecesState::ClawsClosed:
@@ -2072,10 +3974,60 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       break;
     case robot::TowerPiecesState::Complete:
     case robot::TowerPiecesState::Fault:
+      stopAutonomousImuStrafe(context);
+      stopAutonomousImuTurn(context);
       stepper.stop();
       (void)stopAutonomyDriveAndFunnel(
           context, front_left, front_right, rear_link, now_ms);
       return;
+  }
+
+  const bool imu_turn_phase =
+      context.tower_pieces.state ==
+      robot::TowerPiecesState::RotateClockwise;
+  const bool imu_strafe_phase =
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::StrafeRight ||
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::ShimmyLeft ||
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::ShimmyRight;
+  if (imu_turn_phase || imu_strafe_phase) {
+    robot::ImuRecoveryState& recovery =
+        imu_turn_phase ? context.imu_turn_recovery
+                       : context.imu_strafe_recovery;
+    const AutonomousImuRecoveryUpdate recovery_update =
+        serviceAutonomousImuRecovery(
+            context, recovery, imu_turn_phase, front_left, front_right,
+            rear_link, context.rear_config, now_ms);
+    context.tower_pieces.state_entered_at_ms +=
+        recovery_update.timer_adjustment_ms;
+    context.tower_pieces.started_at_ms +=
+        recovery_update.timer_adjustment_ms;
+    if (context.tower_pieces.state ==
+            robot::TowerPiecesState::ShimmyLeft ||
+        context.tower_pieces.state ==
+            robot::TowerPiecesState::ShimmyRight) {
+      context.tower_pieces.shimmy_started_at_ms +=
+          recovery_update.timer_adjustment_ms;
+    }
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::Paused) {
+      return;
+    }
+    if (recovery_update.result ==
+            AutonomousImuRecoveryResult::TimedOut ||
+        recovery_update.result ==
+            AutonomousImuRecoveryResult::StopCommandFailed) {
+      enterTowerPiecesImuMotionFault(
+          context, front_left, front_right, rear_link, stepper,
+          recovery_update.result ==
+                  AutonomousImuRecoveryResult::TimedOut
+              ? AutonomousImuMotionResult::ImuUnavailable
+              : AutonomousImuMotionResult::CommandFailed,
+          imu_turn_phase, now_ms);
+      return;
+    }
   }
 
   if (!rear_link.remoteStatusFresh(
@@ -2178,10 +4130,15 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       line_sensors.left_electrical_high,
       line_sensors.right_electrical_high,
       stepper.lowerLimitActive(),
-      stepper.upperLimitActive()};
+      stepper.upperLimitActive(),
+      context.tower_pieces.state ==
+              robot::TowerPiecesState::RotateClockwise &&
+          context.imu_turn_state.state ==
+              robot::ImuTurnState::Complete};
   const robot::TowerPiecesUpdate tower_update =
       robot::updateTowerPiecesAutonomy(context.tower_pieces, inputs,
                                        context.tower_pieces_config, now_ms);
+  context.last_tower_pieces_update = tower_update;
   if (tower_update.state == robot::TowerPiecesState::Fault &&
       tower_update.fault_reason ==
           robot::TowerPiecesFaultReason::ConflictingLimitSwitches) {
@@ -2264,6 +4221,8 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
                  robot::EventSource::Motor, "tower pieces claws opened");
         break;
       case robot::TowerPiecesState::PostClawsOpenDelay:
+      case robot::TowerPiecesState::PreStepperBottomDelay:
+        break;
         break;
       case robot::TowerPiecesState::MoveStepperBottom:
         logEvent(context, now_ms, robot::EventSeverity::Info,
@@ -2347,6 +4306,7 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       case robot::TowerPiecesState::PostFinalReverseDelay:
       case robot::TowerPiecesState::PostWinchOpenDelay:
       case robot::TowerPiecesState::PostClawsOpenDelay:
+      case robot::TowerPiecesState::PreStepperBottomDelay:
       case robot::TowerPiecesState::PostStepperBottomDelay:
       case robot::TowerPiecesState::PostClawsClosedDelay:
       case robot::TowerPiecesState::Complete:
@@ -2425,18 +4385,20 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
     case robot::TowerPiecesState::PostWinchOpenDelay:
     case robot::TowerPiecesState::ClawsOpen:
     case robot::TowerPiecesState::PostClawsOpenDelay:
+    case robot::TowerPiecesState::PreStepperBottomDelay:
     case robot::TowerPiecesState::MoveStepperBottom:
     case robot::TowerPiecesState::PostStepperBottomDelay:
     case robot::TowerPiecesState::ClawsClosed:
     case robot::TowerPiecesState::PostClawsClosedDelay:
     case robot::TowerPiecesState::MoveStepperTop:
     case robot::TowerPiecesState::WinchClosed:
+      stopAutonomousImuStrafe(context);
+      stopAutonomousImuTurn(context);
       (void)stopTowerPiecesOutputsOrFault(
           context, front_left, front_right, rear_link, stepper, now_ms);
       return;
 
     case robot::TowerPiecesState::StrafeRight:
-    case robot::TowerPiecesState::RotateClockwise:
     case robot::TowerPiecesState::ReverseTimed:
     case robot::TowerPiecesState::ShimmyLeft:
     case robot::TowerPiecesState::ShimmyRight:
@@ -2452,19 +4414,43 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
             robot::EventSource::Uart);
         return;
       }
-      robot::FourWheelCommand wheels{};
       if (tower_update.should_initial_strafe_right) {
-        wheels = makeTowerPiecesStrafeRightCommand(context, now_ms);
-      } else if (tower_update.should_rotate_clockwise) {
-        wheels = makeTowerPiecesClockwiseRotationCommand(context, now_ms);
-      } else if (tower_update.should_drive_backward) {
-        wheels = makeTowerPiecesBackwardCommand(context, now_ms);
-      } else if (tower_update.should_drive_final_reverse) {
-        wheels = makeTowerPiecesFinalBackwardCommand(context, now_ms);
-      } else {
-        wheels = makeTowerPiecesShimmyCommand(
-            context, tower_update.should_shimmy_right, now_ms);
+        const AutonomousImuMotionResult result =
+            runAutonomousImuStrafe(
+                context, front_left, front_right, rear_link,
+                context.rear_config, 1,
+                context.tower_pieces_config.strafe_right_duty, now_ms);
+        if (result != AutonomousImuMotionResult::Running) {
+          enterTowerPiecesImuMotionFault(
+              context, front_left, front_right, rear_link, stepper,
+              result, false, now_ms);
+          return;
+        }
+        break;
       }
+
+      if (tower_update.should_shimmy_left ||
+          tower_update.should_shimmy_right) {
+        const AutonomousImuMotionResult result =
+            runAutonomousImuStrafe(
+                context, front_left, front_right, rear_link,
+                context.rear_config,
+                tower_update.should_shimmy_right ? 1 : -1,
+                context.tower_pieces_config.shimmy_duty, now_ms);
+        if (result != AutonomousImuMotionResult::Running) {
+          enterTowerPiecesImuMotionFault(
+              context, front_left, front_right, rear_link, stepper,
+              result, false, now_ms);
+          return;
+        }
+        break;
+      }
+
+      stopAutonomousImuStrafe(context);
+      const robot::FourWheelCommand wheels =
+          tower_update.should_drive_final_reverse
+              ? makeTowerPiecesFinalBackwardCommand(context, now_ms)
+              : makeTowerPiecesBackwardCommand(context, now_ms);
       if (!applyWheelCommand(context, front_left, front_right, rear_link,
                              wheels, context.rear_config, now_ms)) {
         enterTowerPiecesFault(
@@ -2478,7 +4464,47 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       break;
     }
 
+    case robot::TowerPiecesState::RotateClockwise: {
+      stopAutonomousImuStrafe(context);
+      context.requested_funnel_command = robot::disabledMotorCommand();
+      if (!sendStoppedFunnelCommand(rear_link, context.rear_config,
+                                    now_ms)) {
+        enterTowerPiecesFault(
+            context, front_left, front_right, rear_link, stepper, now_ms,
+            robot::TowerPiecesFaultReason::RearCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "tower pieces stopped: funnel stop command failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      const AutonomousImuMotionResult result =
+          runAutonomousImuTurn(
+              context, front_left, front_right, rear_link,
+              context.rear_config,
+              robot::clockwiseTurnRelativeAngleDeg(
+                  context.tower_pieces_config
+                      .clockwise_rotation_angle_deg,
+                  context.imu_turn_config.yaw_command_polarity),
+              now_ms);
+      if (result != AutonomousImuMotionResult::Running &&
+          result != AutonomousImuMotionResult::Complete) {
+        enterTowerPiecesImuMotionFault(
+            context, front_left, front_right, rear_link, stepper,
+            result, true, now_ms);
+        return;
+      }
+      if (result == AutonomousImuMotionResult::Complete) {
+        (void)stopTowerPiecesOutputsOrFault(
+            context, front_left, front_right, rear_link, stepper,
+            now_ms);
+        return;
+      }
+      break;
+    }
+
     case robot::TowerPiecesState::Complete:
+      stopAutonomousImuStrafe(context);
+      stopAutonomousImuTurn(context);
       stepper.stop();
       (void)stopAutonomyDriveAndFunnel(
           context, front_left, front_right, rear_link, now_ms);
@@ -2488,6 +4514,8 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       return;
 
     case robot::TowerPiecesState::Fault:
+      stopAutonomousImuStrafe(context);
+      stopAutonomousImuTurn(context);
       stepper.stop();
       (void)stopAutonomyDriveAndFunnel(
           context, front_left, front_right, rear_link, now_ms);
@@ -2508,6 +4536,8 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       return;
 
     case robot::TowerPiecesState::WaitForStart:
+      stopAutonomousImuStrafe(context);
+      stopAutonomousImuTurn(context);
       stepper.stop();
       (void)stopAutonomyDriveAndFunnel(
           context, front_left, front_right, rear_link, now_ms);
@@ -2527,6 +4557,14 @@ void enterPegFinderFault(
     const robot::PegFinderFaultReason reason,
     const robot::FaultCode fault_code, const char* message,
     const robot::EventSource source) {
+  robot::cancelImuRecovery(context.imu_turn_recovery);
+  if (robot::imuTurnActive(context.imu_turn_state)) {
+    robot::stopImuTurn(context.imu_turn_state);
+    context.last_imu_turn_update.state =
+        context.imu_turn_state.state;
+    context.last_imu_turn_update.fault_reason =
+        context.imu_turn_state.fault_reason;
+  }
   (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
                                    rear_link, now_ms);
   robot::failPegFinderAutonomy(context.peg_finder, reason, now_ms);
@@ -2583,10 +4621,12 @@ void runPegFinder(RuntimeContext& context,
             context, front_left, front_right, rear_link, now_ms,
             robot::PegFinderFaultReason::HardwareNotReady,
             robot::FaultCode::HardwareNotConfigured,
-            "PegFinder start rejected: configure drive, funnel, GPIO 47 limit, claw open angles, duties, timings, and ESP1 link",
+            "PegFinder start rejected: configure drive, funnel, IMU turn tuning, clockwise angle, GPIO 47 limit, claw open angles, timings, and ESP1 link",
             robot::EventSource::System);
         return;
       }
+      context.last_imu_turn_update = {};
+      robot::resetImuTurnController(context.imu_turn_state);
       robot::startPegFinderAutonomy(context.peg_finder, now_ms);
       context.last_command_ms = now_ms;
       context.command_deadman_armed = true;
@@ -2610,6 +4650,8 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::OpenClaw2:
     case robot::PegFinderState::PostClaw2OpenDelay:
     case robot::PegFinderState::OpenClaw3:
+    case robot::PegFinderState::PostClawsOpenDelay:
+    case robot::PegFinderState::FunnelReverse:
       break;
     case robot::PegFinderState::Complete:
       (void)stopAutonomyDriveAndFunnel(
@@ -2619,6 +4661,40 @@ void runPegFinder(RuntimeContext& context,
       (void)stopAutonomyDriveAndFunnel(
           context, front_left, front_right, rear_link, now_ms);
       return;
+  }
+
+  if (context.peg_finder.state ==
+      robot::PegFinderState::RotateClockwise) {
+    const AutonomousImuRecoveryUpdate recovery_update =
+        serviceAutonomousImuRecovery(
+            context, context.imu_turn_recovery, true, front_left,
+            front_right, rear_link, context.rear_config, now_ms);
+    context.peg_finder.state_entered_at_ms +=
+        recovery_update.timer_adjustment_ms;
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::Paused) {
+      return;
+    }
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::TimedOut) {
+      enterPegFinderFault(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::PegFinderFaultReason::ImuUnavailable,
+          robot::FaultCode::HardwareNotConfigured,
+          "PegFinder stopped: IMU I2C recovery timed out during clockwise turn",
+          robot::EventSource::System);
+      return;
+    }
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::StopCommandFailed) {
+      enterPegFinderFault(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::PegFinderFaultReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "PegFinder stopped: failed to hold wheel outputs disabled during IMU recovery",
+          robot::EventSource::Uart);
+      return;
+    }
   }
 
   if (!rear_link.remoteStatusFresh(
@@ -2652,8 +4728,61 @@ void runPegFinder(RuntimeContext& context,
     return;
   }
 
+  bool clockwise_turn_complete = false;
+  if (context.peg_finder.state ==
+      robot::PegFinderState::RotateClockwise) {
+    const AutonomousImuMotionResult turn_result =
+        runAutonomousImuTurn(
+            context, front_left, front_right, rear_link,
+            context.rear_config,
+            robot::clockwiseTurnRelativeAngleDeg(
+                context.peg_finder_config.clockwise_angle_deg,
+                context.imu_turn_config.yaw_command_polarity),
+            now_ms);
+    if (turn_result != AutonomousImuMotionResult::Running &&
+        turn_result != AutonomousImuMotionResult::Complete) {
+      const bool timed_out =
+          turn_result == AutonomousImuMotionResult::Timeout;
+      const bool imu_unavailable =
+          turn_result == AutonomousImuMotionResult::ImuUnavailable;
+      const bool link_failed =
+          turn_result == AutonomousImuMotionResult::RearLinkUnavailable ||
+          turn_result == AutonomousImuMotionResult::CommandFailed;
+      enterPegFinderFault(
+          context, front_left, front_right, rear_link, now_ms,
+          imu_unavailable
+              ? robot::PegFinderFaultReason::ImuUnavailable
+              : (link_failed
+                     ? robot::PegFinderFaultReason::RearCommandFailed
+                     : (timed_out
+                            ? robot::PegFinderFaultReason::ImuTurnTimeout
+                            : robot::PegFinderFaultReason::ImuTurnFailed)),
+          imu_unavailable ||
+                  turn_result ==
+                      AutonomousImuMotionResult::MotorUnavailable
+              ? robot::FaultCode::HardwareNotConfigured
+              : (link_failed
+                     ? robot::FaultCode::CommunicationStale
+                     : (timed_out ? robot::FaultCode::SearchTimeout
+                                  : robot::FaultCode::InvalidCommand)),
+          imu_unavailable
+              ? "PegFinder stopped: IMU unavailable during clockwise turn"
+              : (link_failed
+                     ? "PegFinder stopped: IMU turn rear command failed"
+                     : (timed_out
+                            ? "PegFinder stopped: IMU clockwise turn timed out"
+                            : "PegFinder stopped: IMU clockwise turn controller fault")),
+          link_failed ? robot::EventSource::Uart
+                      : robot::EventSource::System);
+      return;
+    }
+    clockwise_turn_complete =
+        turn_result == AutonomousImuMotionResult::Complete;
+  }
+
   const robot::PegFinderState previous_state = context.peg_finder.state;
-  const robot::PegFinderInputs inputs{funnel_limit.active()};
+  const robot::PegFinderInputs inputs{
+      funnel_limit.active(), clockwise_turn_complete};
   const robot::PegFinderUpdate update = robot::updatePegFinderAutonomy(
       context.peg_finder, inputs, context.peg_finder_config, now_ms);
   if (update.state == robot::PegFinderState::Fault &&
@@ -2671,14 +4800,16 @@ void runPegFinder(RuntimeContext& context,
         ClawServoCommandResult::Accepted;
     switch (update.state) {
       case robot::PegFinderState::OpenClaw1:
-        servo_result = claws.command(0U, ClawServoPositionRequest::Open);
-        break;
       case robot::PegFinderState::OpenClaw2:
-        servo_result = claws.command(1U, ClawServoPositionRequest::Open);
+      case robot::PegFinderState::OpenClaw3: {
+        const std::size_t claw_index =
+            update.should_open_claw_1
+                ? 0U
+                : (update.should_open_claw_2 ? 1U : 2U);
+        servo_result =
+            claws.command(claw_index, ClawServoPositionRequest::Open);
         break;
-      case robot::PegFinderState::OpenClaw3:
-        servo_result = claws.command(2U, ClawServoPositionRequest::Open);
-        break;
+      }
       case robot::PegFinderState::WaitForStart:
       case robot::PegFinderState::RotateClockwise:
       case robot::PegFinderState::PostRotationPause:
@@ -2689,6 +4820,8 @@ void runPegFinder(RuntimeContext& context,
       case robot::PegFinderState::PostFunnelLimitDelay:
       case robot::PegFinderState::PostClaw1OpenDelay:
       case robot::PegFinderState::PostClaw2OpenDelay:
+      case robot::PegFinderState::PostClawsOpenDelay:
+      case robot::PegFinderState::FunnelReverse:
       case robot::PegFinderState::Complete:
       case robot::PegFinderState::Fault:
         break;
@@ -2724,17 +4857,23 @@ void runPegFinder(RuntimeContext& context,
             "PegFinder funnel limit pressed; funnel stopped and delay started";
         break;
       case robot::PegFinderState::OpenClaw1:
-        message = "PegFinder claw 1 opened";
+      case robot::PegFinderState::OpenClaw2:
+      case robot::PegFinderState::OpenClaw3:
+        message = update.should_open_claw_1
+                      ? "PegFinder claw 1 opened"
+                      : (update.should_open_claw_2
+                             ? "PegFinder claw 2 opened"
+                             : "PegFinder claw 3 opened");
         break;
       case robot::PegFinderState::PostClaw1OpenDelay:
-        break;
-      case robot::PegFinderState::OpenClaw2:
-        message = "PegFinder claw 2 opened";
-        break;
       case robot::PegFinderState::PostClaw2OpenDelay:
         break;
-      case robot::PegFinderState::OpenClaw3:
-        message = "PegFinder claw 3 opened";
+      case robot::PegFinderState::PostClawsOpenDelay:
+        message =
+            "PegFinder all claws open; funnel reverse delay started";
+        break;
+      case robot::PegFinderState::FunnelReverse:
+        message = "PegFinder funnel reverse started";
         break;
       case robot::PegFinderState::Complete:
         message = "PegFinder complete";
@@ -2751,7 +4890,6 @@ void runPegFinder(RuntimeContext& context,
   }
 
   switch (update.state) {
-    case robot::PegFinderState::RotateClockwise:
     case robot::PegFinderState::Reverse:
     case robot::PegFinderState::Forward: {
       context.requested_funnel_command = robot::disabledMotorCommand();
@@ -2766,9 +4904,7 @@ void runPegFinder(RuntimeContext& context,
         return;
       }
       robot::FourWheelCommand wheels{};
-      if (update.should_rotate_clockwise) {
-        wheels = makePegFinderClockwiseCommand(context, now_ms);
-      } else if (update.should_drive_backward) {
+      if (update.should_drive_backward) {
         wheels = makePegFinderBackwardCommand(context, now_ms);
       } else {
         wheels = makePegFinderForwardCommand(context, now_ms);
@@ -2786,6 +4922,20 @@ void runPegFinder(RuntimeContext& context,
       break;
     }
 
+    case robot::PegFinderState::RotateClockwise:
+      context.requested_funnel_command = robot::disabledMotorCommand();
+      if (!sendStoppedFunnelCommand(rear_link, context.rear_config,
+                                    now_ms)) {
+        enterPegFinderFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::PegFinderFaultReason::FunnelCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "PegFinder stopped: funnel stop command failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      break;
+
     case robot::PegFinderState::PostRotationPause:
     case robot::PegFinderState::PostReversePause:
     case robot::PegFinderState::PostFunnelLimitDelay:
@@ -2794,13 +4944,15 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::OpenClaw2:
     case robot::PegFinderState::PostClaw2OpenDelay:
     case robot::PegFinderState::OpenClaw3:
+    case robot::PegFinderState::PostClawsOpenDelay:
       if (!stopPegFinderOutputsOrFault(
               context, front_left, front_right, rear_link, now_ms)) {
         return;
       }
       return;
 
-    case robot::PegFinderState::FunnelForward: {
+    case robot::PegFinderState::FunnelForward:
+    case robot::PegFinderState::FunnelReverse: {
       if (!disableMotionActuators(context, front_left, front_right, rear_link,
                                   now_ms)) {
         enterPegFinderFault(
@@ -2811,9 +4963,13 @@ void runPegFinder(RuntimeContext& context,
             robot::EventSource::Uart);
         return;
       }
-      const float duty =
-          clampFloat(context.peg_finder_config.funnel_forward_duty, 0.0F,
-                     funnelMotionDutyCap());
+      const bool reversing = update.should_run_funnel_reverse;
+      const float duty_magnitude =
+          clampFloat(reversing
+                         ? context.peg_finder_config.funnel_reverse_duty
+                         : context.peg_finder_config.funnel_forward_duty,
+                     0.0F, funnelMotionDutyCap());
+      const float duty = reversing ? -duty_magnitude : duty_magnitude;
       context.requested_funnel_command = makeTimedMotorCommand(
           duty, now_ms, context.rear_config.remoteCommandTimeoutMs);
       if (!sendFunnelMotorCommand(rear_link,
@@ -2856,6 +5012,7 @@ void enterSolarPanelAligned(RuntimeContext& context,
                             robot::IMotorOutput& front_right,
                             RearCommandLink& rear_link,
                             const robot::Milliseconds now_ms) {
+  stopAutonomousImuStrafe(context);
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   enterSolarPanelAutonomyState(
       context, robot::SolarPanelAutonomyState::SolarBeaconAligned, now_ms);
@@ -2869,6 +5026,7 @@ void enterSolarPanelContacted(RuntimeContext& context,
                               robot::IMotorOutput& front_right,
                               RearCommandLink& rear_link,
                               const robot::Milliseconds now_ms) {
+  stopAutonomousImuStrafe(context);
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   enterSolarPanelAutonomyState(
       context, robot::SolarPanelAutonomyState::SolarPanelContacted, now_ms);
@@ -2883,6 +5041,7 @@ void enterSolarRearLineReacquired(RuntimeContext& context,
                                   robot::IMotorOutput& front_right,
                                   RearCommandLink& rear_link,
                                   const robot::Milliseconds now_ms) {
+  stopAutonomousImuStrafe(context);
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   enterSolarPanelAutonomyState(
       context, robot::SolarPanelAutonomyState::RearLineReacquired, now_ms);
@@ -2899,6 +5058,7 @@ void enterSolarPanelSearchFault(
     const robot::SolarPanelFaultReason reason,
     const robot::FaultCode fault_code, const char* message,
     const robot::EventSource source) {
+  stopAutonomousImuStrafe(context);
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   enterSolarPanelAutonomyState(
       context, robot::SolarPanelAutonomyState::SolarSearchFault, now_ms,
@@ -2907,12 +5067,78 @@ void enterSolarPanelSearchFault(
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
 }
 
+void enterSolarImuStrafeFault(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const AutonomousImuMotionResult result,
+    const robot::Milliseconds now_ms) {
+  const bool imu_unavailable =
+      result == AutonomousImuMotionResult::ImuUnavailable;
+  const bool link_failed =
+      result == AutonomousImuMotionResult::RearLinkUnavailable ||
+      result == AutonomousImuMotionResult::CommandFailed;
+  enterSolarPanelSearchFault(
+      context, front_left, front_right, rear_link, now_ms,
+      imu_unavailable
+          ? robot::SolarPanelFaultReason::ImuUnavailable
+          : (link_failed
+                 ? robot::SolarPanelFaultReason::RearLinkStale
+                 : robot::SolarPanelFaultReason::ImuStrafeFailed),
+      imu_unavailable ||
+              result == AutonomousImuMotionResult::MotorUnavailable
+          ? robot::FaultCode::HardwareNotConfigured
+          : (link_failed ? robot::FaultCode::CommunicationStale
+                         : robot::FaultCode::InvalidCommand),
+      imu_unavailable
+          ? "solar strafe stopped: IMU unavailable"
+          : (link_failed
+                 ? "solar strafe stopped: rear command failed"
+                 : "solar strafe stopped: IMU heading hold failed"),
+      link_failed ? robot::EventSource::Uart
+                  : robot::EventSource::System);
+}
+
 void runSolarPanelAutonomy(RuntimeContext& context,
                            DigitalFrontLineSensorReader& sensors,
                            DualPwmMotorOutput& front_left,
                            DualPwmMotorOutput& front_right,
                            RearCommandLink& rear_link,
                            const robot::Milliseconds now_ms) {
+  const bool imu_strafe_phase =
+      context.autonomous_state ==
+          robot::SolarPanelAutonomyState::StrafeRightToSolarPanel ||
+      context.autonomous_state ==
+          robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry ||
+      context.autonomous_state ==
+          robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel ||
+      context.autonomous_state ==
+          robot::SolarPanelAutonomyState::StrafeLeftToRearLine;
+  if (imu_strafe_phase) {
+    const AutonomousImuRecoveryUpdate recovery_update =
+        serviceAutonomousImuRecovery(
+            context, context.imu_strafe_recovery, false, front_left,
+            front_right, rear_link, context.config, now_ms);
+    context.autonomous_state_entered_at_ms +=
+        recovery_update.timer_adjustment_ms;
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::Paused) {
+      return;
+    }
+    if (recovery_update.result ==
+            AutonomousImuRecoveryResult::TimedOut ||
+        recovery_update.result ==
+            AutonomousImuRecoveryResult::StopCommandFailed) {
+      enterSolarImuStrafeFault(
+          context, front_left, front_right, rear_link,
+          recovery_update.result ==
+                  AutonomousImuRecoveryResult::TimedOut
+              ? AutonomousImuMotionResult::ImuUnavailable
+              : AutonomousImuMotionResult::CommandFailed,
+          now_ms);
+      return;
+    }
+  }
+
   const robot::Milliseconds time_in_state_ms =
       elapsedSince(now_ms, context.autonomous_state_entered_at_ms);
 
@@ -3075,7 +5301,9 @@ void runSolarPanelAutonomy(RuntimeContext& context,
     case robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact:
     case robot::SolarPanelAutonomyState::
         WaitBeforeStrafeLeftToRearLine:
-    case robot::SolarPanelAutonomyState::StrafeLeftToRearLine: {
+    case robot::SolarPanelAutonomyState::StrafeLeftToRearLine:
+    case robot::SolarPanelAutonomyState::
+        BackwardLineFollowAfterRearDetection: {
       if (!rear_link.remoteStatusFresh(now_ms,
                                        remoteStatusTimeoutMs(context.config))) {
         enterSolarPanelSearchFault(
@@ -3166,10 +5394,21 @@ void runSolarPanelAutonomy(RuntimeContext& context,
         return;
       }
       if (sequence_update.transitioned) {
+        stopAutonomousImuStrafe(context);
         disableMotionActuators(context, front_left, front_right, rear_link,
                                now_ms);
         enterSolarPanelAutonomyState(context, sequence_update.next_state,
                                      now_ms);
+        if (sequence_update.next_state ==
+            robot::SolarPanelAutonomyState::
+                BackwardLineFollowAfterRearDetection) {
+          robot::startLineFollower(context.follower_state, now_ms);
+          logEvent(context, now_ms, robot::EventSeverity::Info,
+                   robot::EventSource::Line,
+                   "solar rear tape detected; backward line-follow PID started");
+          printTelemetry(context, sensors, rear_link, now_ms);
+          return;
+        }
         const char* message = "solar contact adjustment state changed";
         if (sequence_update.next_state ==
             robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry) {
@@ -3193,6 +5432,10 @@ void runSolarPanelAutonomy(RuntimeContext& context,
                    robot::SolarPanelAutonomyState::
                        WaitBeforeStrafeLeftToRearLine) {
           message = "solar post-forward left-strafe delay started";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::
+                       BackwardLineFollowAfterRearDetection) {
+          message = "solar rear tape detected; backward line following started";
         }
         logEvent(context, now_ms, robot::EventSeverity::Info,
                  robot::EventSource::System, message);
@@ -3215,6 +5458,96 @@ void runSolarPanelAutonomy(RuntimeContext& context,
         }
       }
 
+      const bool imu_strafe_state =
+          context.autonomous_state ==
+              robot::SolarPanelAutonomyState::
+                  StrafeRightToSolarPanel ||
+          context.autonomous_state ==
+              robot::SolarPanelAutonomyState::
+                  StrafeLeftForSolarRetry ||
+          context.autonomous_state ==
+              robot::SolarPanelAutonomyState::
+                  RetryStrafeRightToSolarPanel ||
+          context.autonomous_state ==
+              robot::SolarPanelAutonomyState::StrafeLeftToRearLine;
+      if (imu_strafe_state) {
+        int strafe_direction = 0;
+        float strafe_duty = 0.0F;
+        if (context.autonomous_state ==
+            robot::SolarPanelAutonomyState::StrafeLeftToRearLine) {
+          strafe_direction = -1;
+          strafe_duty =
+              context.solar_contact_config.line_reacquire_strafe_duty;
+        } else if (context.autonomous_state ==
+                   robot::SolarPanelAutonomyState::
+                       StrafeRightToSolarPanel) {
+          strafe_direction = 1;
+          strafe_duty =
+              context.solar_contact_config.initial_strafe_right_duty;
+        } else if (context.autonomous_state ==
+                   robot::SolarPanelAutonomyState::
+                       StrafeLeftForSolarRetry) {
+          strafe_direction = -1;
+          strafe_duty =
+              context.solar_contact_config.retry_strafe_left_duty;
+        } else {
+          strafe_direction = 1;
+          strafe_duty =
+              context.solar_contact_config.retry_strafe_right_duty;
+        }
+        const AutonomousImuMotionResult result =
+            runAutonomousImuStrafe(
+                context, front_left, front_right, rear_link,
+                context.config, strafe_direction, strafe_duty, now_ms);
+        if (result != AutonomousImuMotionResult::Running) {
+          enterSolarImuStrafeFault(
+              context, front_left, front_right, rear_link, result,
+              now_ms);
+          return;
+        }
+        printTelemetry(context, sensors, rear_link, now_ms);
+        return;
+      }
+
+      stopAutonomousImuStrafe(context);
+      if (context.autonomous_state ==
+          robot::SolarPanelAutonomyState::
+              BackwardLineFollowAfterRearDetection) {
+        const robot::LineFollowerConfig reverse_config =
+            reverseRearLineFollowerConfig(context);
+        context.last_rear_update = robot::updateLineFollower(
+            context.follower_state,
+            context.last_rear_line_observation.left_black,
+            context.last_rear_line_observation.right_black,
+            reverse_config, now_ms);
+        if (!context.follower_state.enabled &&
+            !context.last_rear_update.observation.safe_to_drive) {
+          enterSolarPanelSearchFault(
+              context, front_left, front_right, rear_link, now_ms,
+              robot::SolarPanelFaultReason::LineLost,
+              robot::FaultCode::InvalidCommand,
+              "solar backward line follow stopped: rear line lost without history",
+              robot::EventSource::Line);
+          return;
+        }
+        if (!applyWheelCommand(
+                context, front_left, front_right, rear_link,
+                context.last_rear_update.wheel_command, reverse_config,
+                now_ms)) {
+          enterSolarPanelSearchFault(
+              context, front_left, front_right, rear_link, now_ms,
+              robot::SolarPanelFaultReason::RearLinkStale,
+              robot::FaultCode::CommunicationStale,
+              "solar backward line follow stopped: rear command failed",
+              robot::EventSource::Uart);
+          return;
+        }
+        context.last_command_ms = now_ms;
+        context.command_deadman_armed = true;
+        context.mode_expires_at_ms = 0U;
+        printTelemetry(context, sensors, rear_link, now_ms);
+        return;
+      }
       robot::FourWheelCommand wheels{};
       switch (context.autonomous_state) {
         case robot::SolarPanelAutonomyState::SolarPanelContacted:
@@ -3222,21 +5555,11 @@ void runSolarPanelAutonomy(RuntimeContext& context,
             WaitBeforeStrafeLeftToRearLine:
           wheels = robot::disabledFourWheelCommand();
           break;
-        case robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry:
-          wheels = makeSolarStrafeLeftCommand(context, now_ms);
-          break;
-        case robot::SolarPanelAutonomyState::StrafeLeftToRearLine:
-          wheels = makeSolarLineReacquireStrafeLeftCommand(context, now_ms);
-          break;
         case robot::SolarPanelAutonomyState::MoveForwardForSolarRetry:
           wheels = makeSolarForwardCommand(context, now_ms);
           break;
         case robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact:
           wheels = makeSolarPostContactForwardCommand(context, now_ms);
-          break;
-        case robot::SolarPanelAutonomyState::StrafeRightToSolarPanel:
-        case robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel:
-          wheels = makeSolarStrafeRightCommand(context, now_ms);
           break;
         default:
           wheels = robot::disabledFourWheelCommand();
@@ -3275,6 +5598,7 @@ void enterTimeTrialFault(RuntimeContext& context,
                          const robot::FaultCode fault_code,
                          const char* message,
                          const robot::EventSource source) {
+  stopAutonomousImuStrafe(context);
   (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
                                    rear_link, now_ms);
   robot::failTimeTrialAutonomy(context.time_trial, now_ms);
@@ -3322,7 +5646,7 @@ void runTimeTrial(RuntimeContext& context,
       enterTimeTrialFault(
           context, front_left, front_right, rear_link, now_ms,
           robot::FaultCode::HardwareNotConfigured,
-          "Time Trial start rejected: configure all three modes, transition strafe, servos, stepper, sensors, and link",
+          "Time Trial start rejected: configure all three modes, servos, stepper, sensors, and link",
           robot::EventSource::System);
       return;
     }
@@ -3334,6 +5658,38 @@ void runTimeTrial(RuntimeContext& context,
              robot::EventSource::System,
              "Time Trial autonomous solar started");
     return;
+  }
+
+  if (context.time_trial.state ==
+      robot::TimeTrialState::SolarToTowerStrafeRight) {
+    const AutonomousImuRecoveryUpdate recovery_update =
+        serviceAutonomousImuRecovery(
+            context, context.imu_strafe_recovery, false, front_left,
+            front_right, rear_link, context.rear_config, now_ms);
+    context.time_trial.state_entered_at_ms +=
+        recovery_update.timer_adjustment_ms;
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::Paused) {
+      return;
+    }
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::TimedOut) {
+      enterTimeTrialFault(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::FaultCode::HardwareNotConfigured,
+          "Time Trial stopped: IMU I2C recovery timed out during transition strafe",
+          robot::EventSource::System);
+      return;
+    }
+    if (recovery_update.result ==
+        AutonomousImuRecoveryResult::StopCommandFailed) {
+      enterTimeTrialFault(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::FaultCode::CommunicationStale,
+          "Time Trial stopped: failed to hold wheel outputs disabled during IMU recovery",
+          robot::EventSource::Uart);
+      return;
+    }
   }
 
   if (context.time_trial.state == robot::TimeTrialState::AutonomousSolar) {
@@ -3358,15 +5714,25 @@ void runTimeTrial(RuntimeContext& context,
   }
 
   const robot::TimeTrialState previous_state = context.time_trial.state;
-  const robot::TimeTrialInputs inputs{
+  robot::TimeTrialInputs inputs{};
+  inputs.solar_complete =
       context.autonomous_state ==
-          robot::SolarPanelAutonomyState::RearLineReacquired,
+      robot::SolarPanelAutonomyState::RearLineReacquired;
+  inputs.solar_line_follow_ready =
       context.autonomous_state ==
-          robot::SolarPanelAutonomyState::SolarSearchFault,
-      context.tower_pieces.state == robot::TowerPiecesState::Complete,
-      context.tower_pieces.state == robot::TowerPiecesState::Fault,
-      context.peg_finder.state == robot::PegFinderState::Complete,
-      context.peg_finder.state == robot::PegFinderState::Fault};
+      robot::SolarPanelAutonomyState::
+          BackwardLineFollowAfterRearDetection;
+  inputs.solar_fault =
+      context.autonomous_state ==
+      robot::SolarPanelAutonomyState::SolarSearchFault;
+  inputs.tower_pieces_complete =
+      context.tower_pieces.state == robot::TowerPiecesState::Complete;
+  inputs.tower_pieces_fault =
+      context.tower_pieces.state == robot::TowerPiecesState::Fault;
+  inputs.peg_finder_complete =
+      context.peg_finder.state == robot::PegFinderState::Complete;
+  inputs.peg_finder_fault =
+      context.peg_finder.state == robot::PegFinderState::Fault;
   const robot::TimeTrialUpdate update = robot::updateTimeTrialAutonomy(
       context.time_trial, inputs, context.time_trial_config, now_ms);
 
@@ -3382,10 +5748,44 @@ void runTimeTrial(RuntimeContext& context,
   }
 
   if (update.should_start_tower_pieces) {
-    context.tower_pieces_start_requested = true;
-    logEvent(context, now_ms, robot::EventSeverity::Info,
-             robot::EventSource::System,
-             "Time Trial tower pieces started");
+    if (update.should_handoff_solar_line_follow) {
+      if (!towerPiecesStartRequirementsMet(
+              front_left, front_right, rear_link, claws, stepper, now_ms,
+              context)) {
+        enterTimeTrialFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::FaultCode::HardwareNotConfigured,
+            "Time Trial line-follow handoff rejected: Tower Pieces hardware or configuration is unavailable",
+            robot::EventSource::System);
+        return;
+      }
+
+      stepper.stop();
+      robot::startTowerPiecesAutonomy(
+          context.tower_pieces,
+          rear_link.latestRearLineSnapshot().side_electrical_high, now_ms);
+      context.last_tower_pieces_update = {};
+      context.tower_pieces_start_requested = false;
+      // Solar initialized this same follower when it detected the rear tape.
+      // Keep that follower instance under Tower Pieces ownership so there is
+      // no second stop/start between the two line-follow phases.
+      enterSolarPanelAutonomyState(
+          context, robot::SolarPanelAutonomyState::RearLineReacquired,
+          now_ms);
+      context.last_command_ms = now_ms;
+      context.command_deadman_armed = true;
+      context.mode_expires_at_ms = 0U;
+      clearFault(context);
+      logEvent(
+          context, now_ms, robot::EventSeverity::Info,
+          robot::EventSource::Line,
+          "Time Trial solar rear-line PID handed directly to Tower Pieces; Tower reverse line-follow duty is active");
+    } else {
+      context.tower_pieces_start_requested = true;
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::System,
+               "Time Trial tower pieces started");
+    }
   }
   if (update.should_start_peg_finder) {
     const ClawServoCommandResult claws_result =
@@ -3422,23 +5822,38 @@ void runTimeTrial(RuntimeContext& context,
           robot::EventSource::Uart);
       return;
     }
-    const robot::FourWheelCommand wheels =
-        makeTimeTrialStrafeRightCommand(context, now_ms);
-    if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                           wheels, context.rear_config, now_ms)) {
+    const AutonomousImuMotionResult result =
+        runAutonomousImuStrafe(
+            context, front_left, front_right, rear_link,
+            context.rear_config, 1,
+            context.imu_heading_hold_config.maximum_strafe_duty, now_ms);
+    if (result != AutonomousImuMotionResult::Running) {
+      const bool imu_unavailable =
+          result == AutonomousImuMotionResult::ImuUnavailable;
+      const bool link_failed =
+          result == AutonomousImuMotionResult::RearLinkUnavailable ||
+          result == AutonomousImuMotionResult::CommandFailed;
       enterTimeTrialFault(
           context, front_left, front_right, rear_link, now_ms,
-          robot::FaultCode::CommunicationStale,
-          "Time Trial transition strafe stopped: rear command failed",
-          robot::EventSource::Uart);
+          imu_unavailable ||
+                  result ==
+                      AutonomousImuMotionResult::MotorUnavailable
+              ? robot::FaultCode::HardwareNotConfigured
+              : (link_failed ? robot::FaultCode::CommunicationStale
+                             : robot::FaultCode::InvalidCommand),
+          imu_unavailable
+              ? "Time Trial transition strafe stopped: IMU unavailable"
+              : (link_failed
+                     ? "Time Trial transition strafe stopped: rear command failed"
+                     : "Time Trial transition strafe stopped: IMU heading hold failed"),
+          link_failed ? robot::EventSource::Uart
+                      : robot::EventSource::System);
       return;
     }
-    context.last_command_ms = now_ms;
-    context.command_deadman_armed = true;
-    context.mode_expires_at_ms = 0U;
   } else if (previous_state ==
                  robot::TimeTrialState::SolarToTowerStrafeRight &&
              update.state == robot::TimeTrialState::TowerPieces) {
+    stopAutonomousImuStrafe(context);
     if (!stopTimeTrialOutputsOrFault(context, front_left, front_right,
                                      rear_link, now_ms)) {
       return;
@@ -3575,6 +5990,8 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.imu.acquisition_running = imu.acquisition_running;
   snapshot.imu.device_acknowledged =
       imu_state.device_acknowledged;
+  snapshot.imu.runtime_configuration_valid =
+      imu_state.runtime_configuration_valid;
   snapshot.imu.register_reads_use_repeated_start =
       imu_state.register_reads_use_repeated_start;
   snapshot.imu.i2c_address = imu_state.address;
@@ -3586,6 +6003,19 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
            sizeof(snapshot.imu.initialization_error),
            robot::esp2::imuInitializationErrorName(
                imu_state.initialization_error));
+  copyText(snapshot.imu.last_read_failure_reason,
+           sizeof(snapshot.imu.last_read_failure_reason),
+           robot::esp2::imuReadFailureReasonName(
+               imu_state.last_read_failure_reason));
+  copyText(snapshot.imu.disconnect_reason,
+           sizeof(snapshot.imu.disconnect_reason),
+           robot::esp2::imuDisconnectReason(
+               imu, now_us, kImuFreshnessTimeoutUs));
+  copyText(snapshot.imu.last_disconnect_reason,
+           sizeof(snapshot.imu.last_disconnect_reason),
+           context.last_imu_disconnect_reason[0] == '\0'
+               ? "NONE"
+               : context.last_imu_disconnect_reason);
   snapshot.imu.raw_gyro_z = imu_state.raw_gyro_z;
   snapshot.imu.gyro_z_bias_dps = imu_state.gyro_z_bias_dps;
   snapshot.imu.yaw_rate_dps = imu_state.yaw_rate_dps;
@@ -3610,11 +6040,60 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       imu_state.last_successful_read_us;
   snapshot.imu.last_sample_interval_us =
       imu_state.last_sample_interval_us;
+  snapshot.imu.last_read_failure_us =
+      imu_state.last_read_failure_us;
   snapshot.imu.successful_read_count =
-      imu.successful_acquisitions;
-  snapshot.imu.failed_read_count = imu.failed_acquisitions;
+      imu.lifetime_successful_acquisitions;
+  snapshot.imu.failed_read_count =
+      imu.lifetime_failed_acquisitions;
   snapshot.imu.consecutive_failed_reads =
       imu.consecutive_acquisition_failures;
+  snapshot.imu.disconnect_count = context.imu_disconnect_count;
+  snapshot.imu.last_disconnect_at_ms =
+      context.last_imu_disconnect_at_ms;
+  snapshot.imu.acquisition_loop_interval_us =
+      imu.acquisition_loop_interval_us;
+  snapshot.imu.maximum_acquisition_loop_interval_us =
+      imu.maximum_acquisition_loop_interval_us;
+  snapshot.imu.synchronization_duration_us =
+      imu.synchronization_duration_us;
+  snapshot.imu.maximum_synchronization_duration_us =
+      imu.maximum_synchronization_duration_us;
+  snapshot.imu.wire_lock_acquire_duration_us =
+      imu_state.last_wire_lock_acquire_duration_us;
+  snapshot.imu.maximum_wire_lock_acquire_duration_us =
+      imu_state.maximum_wire_lock_acquire_duration_us;
+  snapshot.imu.measurement_read_duration_us =
+      imu_state.last_measurement_read_duration_us;
+  snapshot.imu.maximum_measurement_read_duration_us =
+      imu_state.maximum_measurement_read_duration_us;
+  snapshot.imu.successful_read_to_publication_us =
+      imu.successful_read_to_publication_us;
+  snapshot.imu.maximum_successful_read_to_publication_us =
+      imu.maximum_successful_read_to_publication_us;
+  snapshot.imu.publication_queue_duration_us =
+      imu.publication_queue_duration_us;
+  snapshot.imu.maximum_publication_queue_duration_us =
+      imu.maximum_publication_queue_duration_us;
+  snapshot.imu.successful_sample_publication_gap_us =
+      imu.successful_sample_publication_gap_us;
+  snapshot.imu.maximum_successful_sample_publication_gap_us =
+      imu.maximum_successful_sample_publication_gap_us;
+  snapshot.imu.current_observed_publication_gap_us =
+      imu.last_successful_sample_published_at_us == 0U
+          ? 0U
+          : now_us -
+                imu.last_successful_sample_published_at_us;
+  snapshot.imu.maximum_observed_publication_gap_us =
+      snapshot.imu.current_observed_publication_gap_us >
+              context.maximum_observed_imu_publication_gap_us
+          ? snapshot.imu.current_observed_publication_gap_us
+          : context.maximum_observed_imu_publication_gap_us;
+  snapshot.imu.publication_sequence = imu.publication_sequence;
+  snapshot.imu.successful_sample_sequence =
+      imu.successful_sample_sequence;
+  snapshot.imu.delayed_iteration_count =
+      imu.delayed_iteration_count;
 
   snapshot.imu_turn.configuration_valid =
       imuTurnRuntimeConfigValid(context.imu_turn_config);
@@ -3623,6 +6102,94 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.imu_turn.state = context.imu_turn_state.state;
   snapshot.imu_turn.fault_reason =
       context.imu_turn_state.fault_reason;
+  const ImuTurnAvailabilityFaultCapture& availability_capture =
+      context.imu_turn_availability_fault;
+  snapshot.imu_turn.availability_fault_capture_valid =
+      availability_capture.valid;
+  snapshot.imu_turn.availability_fault_latched =
+      availability_capture.valid &&
+      context.imu_turn_state.state == robot::ImuTurnState::Fault &&
+      context.imu_turn_state.fault_reason ==
+          robot::ImuTurnFaultReason::ImuUnavailable;
+  snapshot.imu_turn.imu_currently_available =
+      std::strcmp(robot::esp2::imuDisconnectReason(
+                      imu, now_us, kImuFreshnessTimeoutUs),
+                  "NONE") == 0;
+  snapshot.imu_turn.captured_configured =
+      availability_capture.configured;
+  snapshot.imu_turn.captured_initialized =
+      availability_capture.initialized;
+  snapshot.imu_turn.captured_calibrated =
+      availability_capture.calibrated;
+  snapshot.imu_turn.captured_healthy = availability_capture.healthy;
+  snapshot.imu_turn.captured_sample_valid =
+      availability_capture.sample_valid;
+  snapshot.imu_turn.captured_data_fresh =
+      availability_capture.data_fresh;
+  snapshot.imu_turn.captured_acquisition_running =
+      availability_capture.acquisition_running;
+  snapshot.imu_turn.captured_shared_snapshot_available =
+      availability_capture.shared_snapshot_available;
+  snapshot.imu_turn.captured_front_left_configured =
+      availability_capture.front_left_configured;
+  snapshot.imu_turn.captured_front_right_configured =
+      availability_capture.front_right_configured;
+  snapshot.imu_turn.captured_rear_link_configured =
+      availability_capture.rear_link_configured;
+  snapshot.imu_turn.captured_rear_status_available =
+      availability_capture.rear_status_available;
+  snapshot.imu_turn.captured_rear_status_fresh =
+      availability_capture.rear_status_fresh;
+  snapshot.imu_turn.captured_newest_snapshot_available =
+      availability_capture.newest_snapshot_available;
+  snapshot.imu_turn.captured_cached_snapshot_matches_newest =
+      availability_capture.cached_snapshot_matches_newest;
+  copyText(snapshot.imu_turn.availability_fault_origin,
+           sizeof(snapshot.imu_turn.availability_fault_origin),
+           availability_capture.origin);
+  copyText(snapshot.imu_turn.captured_availability_reason,
+           sizeof(snapshot.imu_turn.captured_availability_reason),
+           availability_capture.reason);
+  snapshot.imu_turn.availability_evaluated_at_us =
+      availability_capture.evaluated_at_us;
+  snapshot.imu_turn.availability_evaluated_at_ms =
+      availability_capture.evaluated_at_ms;
+  snapshot.imu_turn.captured_published_at_us =
+      availability_capture.published_at_us;
+  snapshot.imu_turn.captured_last_successful_read_us =
+      availability_capture.last_successful_read_us;
+  snapshot.imu_turn.captured_sample_age_us =
+      availability_capture.sample_age_us;
+  snapshot.imu_turn.captured_snapshot_age_us =
+      availability_capture.snapshot_age_us;
+  snapshot.imu_turn.captured_freshness_timeout_us =
+      availability_capture.freshness_timeout_us;
+  snapshot.imu_turn.captured_cached_snapshot_sequence =
+      availability_capture.cached_snapshot_sequence;
+  snapshot.imu_turn.captured_newest_snapshot_sequence =
+      availability_capture.newest_snapshot_sequence;
+  snapshot.imu_turn.captured_cached_successful_sample_sequence =
+      availability_capture.cached_successful_sample_sequence;
+  snapshot.imu_turn.captured_newest_successful_sample_sequence =
+      availability_capture.newest_successful_sample_sequence;
+  snapshot.imu_turn.captured_cached_snapshot_fetched_at_us =
+      availability_capture.cached_snapshot_fetched_at_us;
+  snapshot.imu_turn.captured_cached_snapshot_fetch_to_gate_us =
+      availability_capture.cached_snapshot_fetch_to_gate_us;
+  snapshot.imu_turn.captured_successful_sample_publication_gap_us =
+      availability_capture.successful_sample_publication_gap_us;
+  snapshot.imu_turn
+      .captured_maximum_successful_sample_publication_gap_us =
+      availability_capture
+          .maximum_successful_sample_publication_gap_us;
+  snapshot.imu_turn.captured_current_observed_publication_gap_us =
+      availability_capture.current_observed_publication_gap_us;
+  snapshot.imu_turn.captured_maximum_observed_publication_gap_us =
+      availability_capture.maximum_observed_publication_gap_us;
+  snapshot.imu_turn.captured_rear_last_status_received_at_ms =
+      availability_capture.rear_last_status_received_at_ms;
+  snapshot.imu_turn.captured_rear_status_age_ms =
+      availability_capture.rear_status_age_ms;
   snapshot.imu_turn.maximum_rotation_duty =
       context.imu_turn_config.maximum_rotation_duty;
   snapshot.imu_turn.kp = context.imu_turn_config.kp;
@@ -3657,15 +6224,103 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.imu_turn.settling_elapsed_ms =
       context.last_imu_turn_update.settling_elapsed_ms;
 
+  snapshot.imu_heading_hold.configuration_valid =
+      imuHeadingHoldRuntimeConfigValid(
+          context.imu_heading_hold_config);
+  snapshot.imu_heading_hold.active =
+      robot::imuHeadingHoldActive(context.imu_heading_hold_state);
+  snapshot.imu_heading_hold.state =
+      context.imu_heading_hold_state.state;
+  snapshot.imu_heading_hold.fault_reason =
+      context.imu_heading_hold_state.fault_reason;
+  snapshot.imu_heading_hold.maximum_strafe_duty =
+      context.imu_heading_hold_config.maximum_strafe_duty;
+  snapshot.imu_heading_hold.kp =
+      context.imu_heading_hold_config.kp;
+  snapshot.imu_heading_hold.kd =
+      context.imu_heading_hold_config.kd;
+  snapshot.imu_heading_hold.maximum_yaw_correction_duty =
+      context.imu_heading_hold_config.maximum_yaw_correction_duty;
+  snapshot.imu_heading_hold.yaw_command_polarity =
+      context.imu_heading_hold_config.yaw_command_polarity;
+  snapshot.imu_heading_hold.start_heading_deg =
+      context.imu_heading_hold_state.start_heading_deg;
+  snapshot.imu_heading_hold.current_heading_deg =
+      imu_state.heading_deg;
+  snapshot.imu_heading_hold.target_heading_deg =
+      context.imu_heading_hold_state.target_heading_deg;
+  snapshot.imu_heading_hold.angle_error_deg =
+      context.imu_heading_hold_state.target_heading_deg -
+      imu_state.heading_deg;
+  snapshot.imu_heading_hold.yaw_rate_dps =
+      imu_state.yaw_rate_dps;
+  snapshot.imu_heading_hold.proportional_term =
+      context.last_imu_heading_hold_update.proportional_term;
+  snapshot.imu_heading_hold.damping_term =
+      context.last_imu_heading_hold_update.damping_term;
+  snapshot.imu_heading_hold.yaw_correction_duty =
+      context.last_imu_heading_hold_update.yaw_correction_duty;
+  snapshot.imu_heading_hold.lateral_direction =
+      context.imu_heading_hold_state.lateral_direction;
+  snapshot.imu_heading_hold.elapsed_ms =
+      context.last_imu_heading_hold_update.elapsed_ms;
+
+  snapshot.imu_recovery.turn_paused =
+      context.imu_turn_recovery.active;
+  snapshot.imu_recovery.strafe_paused =
+      context.imu_strafe_recovery.active;
+  snapshot.imu_recovery.turn_saved_heading_deg =
+      context.imu_turn_recovery.saved_heading_deg;
+  snapshot.imu_recovery.strafe_saved_heading_deg =
+      context.imu_strafe_recovery.saved_heading_deg;
+  snapshot.imu_recovery.turn_pause_elapsed_ms =
+      context.imu_turn_recovery.active
+          ? elapsedSince(
+                now_ms,
+                context.imu_turn_recovery.pause_started_at_ms)
+          : context.imu_turn_recovery.last_pause_duration_ms;
+  snapshot.imu_recovery.strafe_pause_elapsed_ms =
+      context.imu_strafe_recovery.active
+          ? elapsedSince(
+                now_ms,
+                context.imu_strafe_recovery.pause_started_at_ms)
+          : context.imu_strafe_recovery.last_pause_duration_ms;
+  snapshot.imu_recovery.maximum_pause_ms =
+      kAutonomousImuRecoveryConfig.maximum_pause_ms;
+  snapshot.imu_recovery.consecutive_fresh_samples_required =
+      kAutonomousImuRecoveryConfig
+          .consecutive_fresh_samples_required;
+  snapshot.imu_recovery.turn_consecutive_fresh_samples =
+      context.imu_turn_recovery.consecutive_fresh_samples;
+  snapshot.imu_recovery.strafe_consecutive_fresh_samples =
+      context.imu_strafe_recovery.consecutive_fresh_samples;
+  snapshot.imu_recovery.turn_pause_count =
+      context.imu_turn_recovery.pause_count;
+  snapshot.imu_recovery.strafe_pause_count =
+      context.imu_strafe_recovery.pause_count;
+  const std::uint64_t total_imu_paused_ms =
+      static_cast<std::uint64_t>(
+          context.imu_turn_recovery.total_paused_ms) +
+      static_cast<std::uint64_t>(
+          context.imu_strafe_recovery.total_paused_ms);
+  snapshot.imu_recovery.total_paused_ms =
+      total_imu_paused_ms >
+              std::numeric_limits<robot::Milliseconds>::max()
+          ? std::numeric_limits<robot::Milliseconds>::max()
+          : static_cast<robot::Milliseconds>(
+                total_imu_paused_ms);
+
   const bool time_trial_tower_active =
       context.modes.currentMode() == robot::RobotTestMode::TimeTrial &&
       context.time_trial.state == robot::TimeTrialState::TowerPieces;
+  const bool tower_line_config_active =
+      context.modes.currentMode() ==
+          robot::RobotTestMode::AutonomousTowerPieces ||
+      time_trial_tower_active;
   const bool rear_line_following =
       (context.modes.currentMode() ==
            robot::RobotTestMode::RearLineFollowTest ||
-       context.modes.currentMode() ==
-           robot::RobotTestMode::AutonomousTowerPieces ||
-       time_trial_tower_active) &&
+       tower_line_config_active) &&
       context.follower_state.enabled;
   const bool front_line_following =
       context.follower_state.enabled && !rear_line_following;
@@ -3711,7 +6366,11 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.rear_logical_right_black = rear_observation.right_black;
 
   const robot::LineFollowerConfig reverse_config =
-      reverseRearLineFollowerConfig(context);
+      tower_line_config_active
+          ? towerPiecesLineFollowerConfig(
+                context,
+                context.tower_pieces_config.reverse_line_duty)
+          : reverseRearLineFollowerConfig(context);
   snapshot.rear_kp = context.rear_config.kp;
   snapshot.rear_ki = context.rear_config.ki;
   snapshot.rear_kd = context.rear_config.kd;
@@ -3805,25 +6464,133 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.solar_contact_timeout_ms =
       context.solar_contact_config.timeout_ms;
   snapshot.solar_contact_strafe_duty =
-      context.solar_contact_config.strafe_duty;
+      context.solar_contact_config.initial_strafe_right_duty;
+  snapshot.solar_retry_left_strafe_duty =
+      context.solar_contact_config.retry_strafe_left_duty;
+  snapshot.solar_retry_right_strafe_duty =
+      context.solar_contact_config.retry_strafe_right_duty;
   snapshot.solar_strafe_start_delay_ms =
       context.solar_contact_config.strafe_start_delay_ms;
   snapshot.solar_retry_strafe_left_duration_ms =
       context.solar_contact_config.retry_strafe_left_duration_ms;
   snapshot.solar_retry_forward_duration_ms =
       context.solar_contact_config.retry_forward_duration_ms;
+  snapshot.solar_retry_forward_duty =
+      context.solar_contact_config.retry_forward_duty;
   snapshot.solar_retry_strafe_timeout_ms =
       context.solar_contact_config.retry_strafe_timeout_ms;
   snapshot.solar_post_contact_forward_duration_ms =
       context.solar_contact_config.post_contact_forward_duration_ms;
   snapshot.solar_line_reacquire_strafe_duty =
       context.solar_contact_config.line_reacquire_strafe_duty;
+  snapshot.solar_rear_line_follow_duration_ms =
+      context.solar_contact_config.rear_line_follow_duration_ms;
   snapshot.solar_post_contact_forward_start_delay_ms =
       context.solar_contact_config.post_contact_forward_start_delay_ms;
   snapshot.solar_line_reacquire_strafe_start_delay_ms =
       context.solar_contact_config.line_reacquire_strafe_start_delay_ms;
   snapshot.solar_post_contact_forward_duty =
       context.solar_contact_config.post_contact_forward_duty;
+
+  const robot::LineFollowerConfig habitat_line_config =
+      habitatPiecesLineFollowerConfig(context);
+  snapshot.habitat_pieces_state = context.habitat_pieces.state;
+  snapshot.habitat_pieces_stop_reason =
+      context.habitat_pieces.stop_reason;
+  snapshot.habitat_pieces_time_in_state_ms =
+      elapsedSince(now_ms, context.habitat_pieces.state_entered_at_ms);
+  snapshot.habitat_pieces_line_follow_duty =
+      context.habitat_pieces_config.line_follow_duty;
+  snapshot.habitat_pieces_lss2_detection_delay_ms =
+      context.habitat_pieces_config.lss2_detection_delay_ms;
+  snapshot.habitat_pieces_lss2_detection_remaining_ms =
+      context.habitat_pieces_config.lss2_detection_delay_ms >
+              context.habitat_pieces.run_elapsed_ms
+          ? context.habitat_pieces_config.lss2_detection_delay_ms -
+                context.habitat_pieces.run_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_run_timeout_ms =
+      context.habitat_pieces_config.run_timeout_ms;
+  snapshot.habitat_pieces_run_elapsed_ms =
+      context.habitat_pieces.run_elapsed_ms;
+  snapshot.habitat_pieces_timeout_remaining_ms =
+      context.habitat_pieces_config.run_timeout_ms >
+              context.habitat_pieces.run_elapsed_ms
+          ? context.habitat_pieces_config.run_timeout_ms -
+                context.habitat_pieces.run_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_reverse_duty =
+      context.habitat_pieces_config.reverse_duty;
+  snapshot.habitat_pieces_reverse_duration_ms =
+      context.habitat_pieces_config.reverse_duration_ms;
+  snapshot.habitat_pieces_reverse_elapsed_ms =
+      context.habitat_pieces.reverse_elapsed_ms;
+  snapshot.habitat_pieces_reverse_remaining_ms =
+      context.habitat_pieces_config.reverse_duration_ms >
+              context.habitat_pieces.reverse_elapsed_ms
+          ? context.habitat_pieces_config.reverse_duration_ms -
+                context.habitat_pieces.reverse_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_configuration_valid =
+      robot::habitatPiecesConfigValid(context.habitat_pieces_config,
+                                      activeMotionDutyCap(context)) &&
+      robot::validateLineFollowerConfig(habitat_line_config,
+                                        hardwareDutyCap())
+          .accepted;
+  snapshot.habitat_pieces_start_ready =
+      habitatPiecesStartRequirementsMet(
+          sensors, front_left, front_right, rear_link, now_ms, context);
+  snapshot.habitat_pieces_lss2_data_fresh =
+      rear_link.rearLineSnapshotFresh(
+          now_ms, context.config.remoteCommandTimeoutMs);
+  snapshot.habitat_pieces_lss2_configured =
+      rear_link.rearLineSnapshotAvailable() &&
+      rear_link.latestRearLineSnapshot().side_2_configured;
+  snapshot.habitat_pieces_lss2_detection_armed =
+      context.habitat_pieces.lss2_detection_armed;
+  snapshot.habitat_pieces_lss2_black =
+      snapshot.habitat_pieces_lss2_data_fresh &&
+      snapshot.habitat_pieces_lss2_configured &&
+      rear_link.latestRearLineSnapshot().side_2_electrical_high;
+  snapshot.habitat_pieces_should_stop =
+      context.last_habitat_pieces_update.should_stop;
+  snapshot.habitat_pieces_target_reached =
+      context.last_habitat_pieces_update.target_reached;
+  snapshot.habitat_pieces_line_following =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::LineFollowing &&
+      context.follower_state.enabled;
+  snapshot.habitat_pieces_reversing =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::Reversing;
+  snapshot.habitat_pieces_timed_out = context.habitat_pieces.timed_out;
+
+  snapshot.habitat_placement_state = context.habitat_placement.state;
+  snapshot.habitat_placement_fault_reason =
+      context.habitat_placement.fault_reason;
+  snapshot.habitat_placement_config =
+      context.habitat_placement_config;
+  snapshot.habitat_placement_time_in_state_ms = elapsedSince(
+      now_ms, context.habitat_placement.state_entered_at_ms);
+  snapshot.habitat_placement_configuration_valid =
+      g_runtime.stepper != nullptr &&
+      robot::habitatPlacementConfigValid(
+          context.habitat_placement_config,
+          rearMotionDutyCap(context),
+          g_runtime.stepper->maximumSpeedStepsPerSecond());
+  snapshot.habitat_placement_start_ready =
+      g_runtime.stepper != nullptr &&
+      habitatPlacementStartRequirementsMet(
+          sensors, front_left, front_right, rear_link, claws,
+          *g_runtime.stepper, now_ms, context);
+  snapshot.habitat_placement_counter_clockwise_heading_captured =
+      context.habitat_placement.counter_clockwise_heading_captured;
+  snapshot.habitat_placement_counter_clockwise_start_heading_deg =
+      context.habitat_placement.counter_clockwise_start_heading_deg;
+  snapshot.habitat_placement_counter_clockwise_target_heading_deg =
+      context.habitat_placement.counter_clockwise_target_heading_deg;
 
   snapshot.tower_pieces_state = context.tower_pieces.state;
   snapshot.tower_pieces_fault_reason =
@@ -3834,6 +6601,10 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.tower_pieces_config.reverse_line_duty;
   snapshot.tower_pieces_side_line_timeout_ms =
       context.tower_pieces_config.side_line_timeout_ms;
+  snapshot.tower_pieces_side_line_cooldown_ms =
+      context.tower_pieces_config.side_line_cooldown_ms;
+  snapshot.tower_pieces_side_line_rearm_ms =
+      context.tower_pieces_config.side_line_rearm_ms;
   snapshot.tower_pieces_post_line_delay_ms =
       context.tower_pieces_config.post_line_delay_ms;
   snapshot.tower_pieces_strafe_right_duty =
@@ -3843,9 +6614,9 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.tower_pieces_post_strafe_pause_ms =
       context.tower_pieces_config.post_strafe_pause_ms;
   snapshot.tower_pieces_clockwise_rotation_duty =
-      context.tower_pieces_config.clockwise_rotation_duty;
-  snapshot.tower_pieces_clockwise_rotation_duration_ms =
-      context.tower_pieces_config.clockwise_rotation_duration_ms;
+      context.imu_turn_config.maximum_rotation_duty;
+  snapshot.tower_pieces_clockwise_rotation_angle_deg =
+      context.tower_pieces_config.clockwise_rotation_angle_deg;
   snapshot.tower_pieces_post_rotation_pause_ms =
       context.tower_pieces_config.post_rotation_pause_ms;
   snapshot.tower_pieces_reverse_duty =
@@ -3870,6 +6641,8 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.tower_pieces_config.post_winch_open_delay_ms;
   snapshot.tower_pieces_post_claws_open_delay_ms =
       context.tower_pieces_config.post_claws_open_delay_ms;
+  snapshot.tower_pieces_pre_stepper_bottom_delay_ms =
+      context.tower_pieces_config.pre_stepper_bottom_delay_ms;
   snapshot.tower_pieces_stepper_down_speed_steps_per_second =
       context.tower_pieces_config.stepper_down_speed_steps_per_second;
   snapshot.tower_pieces_post_stepper_bottom_delay_ms =
@@ -3880,6 +6653,14 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.tower_pieces_config.stepper_up_speed_steps_per_second;
   snapshot.tower_pieces_side_line_count =
       context.tower_pieces.side_line_count;
+  snapshot.tower_pieces_side_line_rejected_count =
+      context.tower_pieces.side_line_rejected_count;
+  snapshot.tower_pieces_side_line_armed =
+      context.tower_pieces.side_line_armed;
+  snapshot.tower_pieces_side_line_detection_accepted =
+      context.last_tower_pieces_update.side_line_detection_accepted;
+  snapshot.tower_pieces_side_line_detection_rejected =
+      context.last_tower_pieces_update.side_line_detection_rejected;
   snapshot.tower_pieces_target_side_line_count =
       robot::kTowerPiecesTargetSideLineCount;
   const bool tower_pieces_mode_active =
@@ -3917,15 +6698,14 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.tower_pieces_stepper_moving_up =
       tower_pieces_mode_active &&
       context.tower_pieces.state == robot::TowerPiecesState::MoveStepperTop;
-
   snapshot.peg_finder_state = context.peg_finder.state;
   snapshot.peg_finder_fault_reason = context.peg_finder.fault_reason;
   snapshot.peg_finder_time_in_state_ms =
       elapsedSince(now_ms, context.peg_finder.state_entered_at_ms);
   snapshot.peg_finder_clockwise_duty =
-      context.peg_finder_config.clockwise_duty;
-  snapshot.peg_finder_clockwise_duration_ms =
-      context.peg_finder_config.clockwise_duration_ms;
+      context.imu_turn_config.maximum_rotation_duty;
+  snapshot.peg_finder_clockwise_angle_deg =
+      context.peg_finder_config.clockwise_angle_deg;
   snapshot.peg_finder_post_rotation_pause_ms =
       context.peg_finder_config.post_rotation_pause_ms;
   snapshot.peg_finder_reverse_duty =
@@ -3946,6 +6726,18 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.peg_finder_config.post_funnel_limit_delay_ms;
   snapshot.peg_finder_claw_open_interval_ms =
       context.peg_finder_config.claw_open_interval_ms;
+  snapshot.peg_finder_claw_open_order_1 =
+      context.peg_finder_config.claw_open_order_1;
+  snapshot.peg_finder_claw_open_order_2 =
+      context.peg_finder_config.claw_open_order_2;
+  snapshot.peg_finder_claw_open_order_3 =
+      context.peg_finder_config.claw_open_order_3;
+  snapshot.peg_finder_post_claws_open_delay_ms =
+      context.peg_finder_config.post_claws_open_delay_ms;
+  snapshot.peg_finder_funnel_reverse_duty =
+      context.peg_finder_config.funnel_reverse_duty;
+  snapshot.peg_finder_funnel_reverse_duration_ms =
+      context.peg_finder_config.funnel_reverse_duration_ms;
   snapshot.peg_finder_funnel_limit_configured =
       funnel_limit.configured();
   snapshot.peg_finder_funnel_limit_high = funnel_limit.active();
@@ -3965,15 +6757,39 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.peg_finder_funnel_forward =
       peg_finder_mode_active &&
       context.peg_finder.state == robot::PegFinderState::FunnelForward;
+  snapshot.peg_finder_funnel_reverse =
+      peg_finder_mode_active &&
+      context.peg_finder.state == robot::PegFinderState::FunnelReverse;
+  const bool opening_first_claw =
+      context.peg_finder.state == robot::PegFinderState::OpenClaw1;
+  const bool opening_second_claw =
+      context.peg_finder.state == robot::PegFinderState::OpenClaw2;
+  const bool opening_third_claw =
+      context.peg_finder.state == robot::PegFinderState::OpenClaw3;
   snapshot.peg_finder_opening_claw_1 =
       peg_finder_mode_active &&
-      context.peg_finder.state == robot::PegFinderState::OpenClaw1;
+      ((opening_first_claw &&
+        context.peg_finder_config.claw_open_order_1 == 1U) ||
+       (opening_second_claw &&
+        context.peg_finder_config.claw_open_order_2 == 1U) ||
+       (opening_third_claw &&
+        context.peg_finder_config.claw_open_order_3 == 1U));
   snapshot.peg_finder_opening_claw_2 =
       peg_finder_mode_active &&
-      context.peg_finder.state == robot::PegFinderState::OpenClaw2;
+      ((opening_first_claw &&
+        context.peg_finder_config.claw_open_order_1 == 2U) ||
+       (opening_second_claw &&
+        context.peg_finder_config.claw_open_order_2 == 2U) ||
+       (opening_third_claw &&
+        context.peg_finder_config.claw_open_order_3 == 2U));
   snapshot.peg_finder_opening_claw_3 =
       peg_finder_mode_active &&
-      context.peg_finder.state == robot::PegFinderState::OpenClaw3;
+      ((opening_first_claw &&
+        context.peg_finder_config.claw_open_order_1 == 3U) ||
+       (opening_second_claw &&
+        context.peg_finder_config.claw_open_order_2 == 3U) ||
+       (opening_third_claw &&
+        context.peg_finder_config.claw_open_order_3 == 3U));
 
   snapshot.time_trial_state = context.time_trial.state;
   snapshot.time_trial_time_in_state_ms =
@@ -3981,7 +6797,7 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.time_trial_post_solar_delay_ms =
       context.time_trial_config.post_solar_delay_ms;
   snapshot.time_trial_strafe_right_duty =
-      context.time_trial_config.solar_to_tower_strafe_right_duty;
+      context.imu_heading_hold_config.maximum_strafe_duty;
   snapshot.time_trial_strafe_right_duration_ms =
       context.time_trial_config.solar_to_tower_strafe_right_duration_ms;
   snapshot.time_trial_post_tower_delay_ms =
@@ -4003,8 +6819,22 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       snapshot.claws.claw_2.commanded_angle_deg;
   snapshot.servo_claw_3_position =
       snapshot.claws.claw_3.commanded_angle_deg;
+  snapshot.servo_pusher_position =
+      snapshot.claws.habitat_pusher.commanded_angle_deg;
   snapshot.servo_winch_position =
       snapshot.claws.winch.commanded_angle_deg;
+  snapshot.solar_hook.open_angle_deg =
+      context.solar_hook_servo_settings.open_angle_deg;
+  snapshot.solar_hook.closed_angle_deg =
+      context.solar_hook_servo_settings.closed_angle_deg;
+  snapshot.solar_hook.open_configured =
+      snapshot.solar_hook.open_angle_deg >= 0 &&
+      snapshot.solar_hook.open_angle_deg <= 180;
+  snapshot.solar_hook.closed_configured =
+      snapshot.solar_hook.closed_angle_deg >= 0 &&
+      snapshot.solar_hook.closed_angle_deg <= 180;
+  snapshot.solar_hook.commanded_open =
+      context.solar_hook_commanded_open;
   snapshot.rear.back_left_desired_command_milli =
       context.last_commanded_wheels.back_left.duty_command_milli;
   snapshot.rear.back_right_desired_command_milli =
@@ -4059,6 +6889,18 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
         esp1.ultrasonic_1_distance_mm;
     snapshot.esp1.ultrasonic_1_echo_duration_us =
         esp1.ultrasonic_1_echo_duration_us;
+    snapshot.esp1.solar_hook_configured =
+        esp1.solar_hook_configured;
+    snapshot.esp1.solar_hook_output_enabled =
+        esp1.solar_hook_output_enabled;
+    snapshot.esp1.solar_hook_commanded_angle_deg =
+        esp1.solar_hook_commanded_angle_deg;
+    snapshot.solar_hook.hardware_configured =
+        esp1.solar_hook_configured;
+    snapshot.solar_hook.output_enabled =
+        esp1.solar_hook_output_enabled;
+    snapshot.solar_hook.commanded_angle_deg =
+        esp1.solar_hook_commanded_angle_deg;
     snapshot.ultrasonic_1.configured =
         esp1.ultrasonic_1_configured;
     snapshot.ultrasonic_1.data_fresh =
@@ -4111,6 +6953,60 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
         esp1.ir_consecutive_detection_count;
     snapshot.ir_adc_sample_rate_hz = esp1.ir_adc_sample_rate_hz;
   }
+  if (rear_link.laserSnapshotAvailable()) {
+    const robot::LaserDistanceSnapshot& laser =
+        rear_link.latestLaserSnapshot();
+    robot::LaserDistanceTelemetry& telemetry =
+        snapshot.laser_distance;
+    telemetry.available = true;
+    telemetry.configured = laser.configured;
+    telemetry.initialized = laser.initialized;
+    telemetry.ranging = laser.ranging;
+    telemetry.data_valid = laser.data_valid;
+    telemetry.profile = laser.profile;
+    telemetry.distance_mm = laser.distance_mm;
+    telemetry.measurement_sequence = laser.measurement_sequence;
+    telemetry.packet_sequence =
+        rear_link.lastLaserPacketSequence();
+    telemetry.sensor_range_status = laser.sensor_range_status;
+    telemetry.driver_status = laser.driver_status;
+    telemetry.sda_gpio = laser.sda_gpio;
+    telemetry.scl_gpio = laser.scl_gpio;
+    telemetry.i2c_address = laser.i2c_address;
+    telemetry.captured_at_ms = laser.captured_at_ms;
+    telemetry.intermeasurement_period_ms =
+        laser.intermeasurement_period_ms;
+    telemetry.successful_measurement_count =
+        laser.successful_measurement_count;
+    telemetry.failed_measurement_count =
+        laser.failed_measurement_count;
+    telemetry.consecutive_failed_measurements =
+        laser.consecutive_failed_measurements;
+    telemetry.acquisition_duration_us =
+        laser.acquisition_duration_us;
+    telemetry.maximum_acquisition_duration_us =
+        laser.maximum_acquisition_duration_us;
+    const robot::Milliseconds measurement_received_at_ms =
+        rear_link.lastLaserMeasurementReceivedAtMs();
+    telemetry.sample_age_ms =
+        measurement_received_at_ms == 0U
+            ? 0U
+            : elapsedSince(now_ms, measurement_received_at_ms);
+    const robot::Milliseconds snapshot_received_at_ms =
+        rear_link.lastLaserSnapshotReceivedAtMs();
+    telemetry.snapshot_age_ms =
+        snapshot_received_at_ms == 0U
+            ? 0U
+            : elapsedSince(now_ms, snapshot_received_at_ms);
+    const robot::Milliseconds telemetry_freshness_ms =
+        static_cast<robot::Milliseconds>(
+            laser.intermeasurement_period_ms) *
+        4U;
+    telemetry.data_fresh =
+        measurement_received_at_ms != 0U &&
+        telemetry_freshness_ms > 0U &&
+        telemetry.sample_age_ms <= telemetry_freshness_ms;
+  }
   if (snapshot.rear_line_data_fresh &&
       rear_link.rearLineSnapshotAvailable()) {
     const robot::RearLineSensorSnapshot& line_sensors =
@@ -4127,6 +7023,18 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       snapshot.lss_raw_level =
           line_sensors.side_electrical_high ? 1 : 0;
       snapshot.lss_black = line_sensors.side_electrical_high;
+    }
+    snapshot.lss2_configured = line_sensors.side_2_configured;
+    if (line_sensors.side_2_configured) {
+      snapshot.lss2_raw_level =
+          line_sensors.side_2_electrical_high ? 1 : 0;
+      snapshot.lss2_black = line_sensors.side_2_electrical_high;
+    }
+    snapshot.lss3_configured = line_sensors.side_3_configured;
+    if (line_sensors.side_3_configured) {
+      snapshot.lss3_raw_level =
+          line_sensors.side_3_electrical_high ? 1 : 0;
+      snapshot.lss3_black = line_sensors.side_3_electrical_high;
     }
   }
 }
@@ -4232,6 +7140,12 @@ void handleInvert();
 void handleSensors();
 void handleLine();
 void handleRearLine();
+void handleHabitatPiecesStart();
+void handleHabitatPiecesStop();
+void handleHabitatPiecesConfig();
+void handleHabitatPlacementStart();
+void handleHabitatPlacementStop();
+void handleHabitatPlacementConfig();
 void handleAutonomousSolarStart();
 void handleAutonomousSolarConfig();
 void handleTowerPiecesStart();
@@ -4245,6 +7159,11 @@ void handleImuTurnStart();
 void handleImuTurnStop();
 void handleImuAngleReset();
 void handleImuTurnSave();
+void handleImuHeadingHoldConfig();
+void handleImuHeadingHoldStart();
+void handleImuHeadingHoldHeartbeat();
+void handleImuHeadingHoldStop();
+void handleImuHeadingHoldSave();
 void handleLineFollowStart();
 void handleLineFollowStop();
 void handleLineFollowConfig();
@@ -4254,8 +7173,12 @@ void handleRearLineFollowStop();
 void handleClaw();
 void handleClawsAll();
 void handleWinch();
+void handleHabitatPusher();
 void handleClawsConfig();
 void handleClawsSave();
+void handleSolarHook();
+void handleSolarHookConfig();
+void handleSolarHookSave();
 void handleFunnel();
 void handleConfig();
 void handleConfigSave();
@@ -4318,12 +7241,106 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Ultrasonic 1</h2>
-    <div class="muted">HC-SR04 on ESP1 · trigger GPIO12 · echo GPIO11</div>
+    <div class="muted">HC-SR04 pins unassigned because GPIO11/GPIO12 now belong to LSS2/LSS3</div>
     <div class="kv">
       <span>Distance</span><span id="ultrasonic1Distance" class="mono"></span>
       <span>Status</span><span id="ultrasonic1Status" class="mono"></span>
       <span>Echo pulse</span><span id="ultrasonic1Echo" class="mono"></span>
       <span>Sample age</span><span id="ultrasonic1Age" class="mono"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Laser distance</h2>
+    <div class="muted">ESP1 VL53L0X V2 · SDA GPIO10 · SCL GPIO9</div>
+    <div class="kv">
+      <span>Distance</span><span id="laserDistance" class="mono"></span>
+      <span>State</span><span id="laserState" class="mono"></span>
+      <span>Profile</span><span id="laserProfile" class="mono"></span>
+      <span>Range / driver status</span><span id="laserStatus" class="mono"></span>
+      <span>Sample / snapshot age</span><span id="laserAge" class="mono"></span>
+      <span>Measurement / packet sequence</span><span id="laserSequence" class="mono"></span>
+      <span>Reads OK / failed / consecutive</span><span id="laserCounts" class="mono"></span>
+      <span>Acquisition current / max</span><span id="laserTiming" class="mono"></span>
+      <span>SDA / SCL / address</span><span id="laserBus" class="mono"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Habitat Pieces</h2>
+    <div class="muted">Follows the line with the front sensors immediately. LSS2 detection is ignored for the configured delay; a black LSS2 reading then starts the configured straight-backward move. The robot latches stop when that reverse duration completes. Missing/stale LSS2 data before detection, lost front line, rear-link failure, or the search timeout also stops the robot.</div>
+    <div class="kv">
+      <span>Configuration</span><span id="habitatConfig" class="mono"></span>
+      <span>Start ready</span><span id="habitatReady" class="mono"></span>
+      <span>State</span><span id="habitatState" class="mono"></span>
+      <span>LSS2 stop gate</span><span id="habitatGate" class="mono"></span>
+      <span>LSS2 input</span><span id="habitatLss2" class="mono"></span>
+      <span>Detection delay</span><span id="habitatDelay" class="mono"></span>
+      <span>Search elapsed / timeout</span><span id="habitatTimeout" class="mono"></span>
+      <span>Reverse elapsed / duration</span><span id="habitatReverse" class="mono"></span>
+      <span>Line following</span><span id="habitatFollowing" class="mono"></span>
+      <span>Last request</span><span id="habitatResult" class="mono muted">none</span>
+    </div>
+    <div class="two">
+      <label>Front line-follow duty <input id="habitatDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>LSS2 detection delay (ms) <input id="habitatDetectionDelay" type="number" min="1" step="100"></label>
+      <label>LSS2 search timeout (ms) <input id="habitatRunTimeout" type="number" min="1" step="100"></label>
+      <label>Reverse duty <input id="habitatReverseDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Reverse duration (ms) <input id="habitatReverseDuration" type="number" min="1" step="100"></label>
+    </div>
+    <div class="row">
+      <button class="run" onclick="habitatStart()">Start</button>
+      <button onclick="habitatApply()">Apply</button>
+      <button onclick="habitatSave()">Save</button>
+      <button class="stop" onclick="habitatStop()">Stop</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Habitat Placement</h2>
+    <div class="muted">Standalone route intended to run after Habitat Pieces pickup: rear-line follow to LSS1, fixed-target CCW IMU turn, lower the slide, open/push/retreat, CW IMU turn, timed reverse, timed left strafe, then strafe right until either front line sensor sees black and close the pusher. Every motion has an adjustable bound.</div>
+    <div class="kv">
+      <span>Configuration</span><span id="placementConfig" class="mono"></span>
+      <span>Start ready</span><span id="placementReady" class="mono"></span>
+      <span>State</span><span id="placementState" class="mono"></span>
+      <span>Fault reason</span><span id="placementFault" class="mono"></span>
+      <span>Time in state</span><span id="placementTime" class="mono"></span>
+      <span>CCW saved start / target</span><span id="placementCcwSaved" class="mono"></span>
+      <span>Last request</span><span id="placementResult" class="mono muted">none</span>
+    </div>
+    <div class="two">
+      <label>Rear line-follow duty <input id="placementRearDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>LSS1 timeout ms <input id="placementLssTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Delay after LSS1 ms <input id="placementLssDelay" type="number" min="1" max="30000" step="100"></label>
+      <label>CCW angle deg <input id="placementCcwAngle" type="number" min="0.1" step="1"></label>
+      <label>CCW timeout ms <input id="placementCcwTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Forward-to-slide duty <input id="placementSlideDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Forward-to-slide ms <input id="placementSlideMs" type="number" min="1" max="30000" step="100"></label>
+      <label>Slide-down speed µsteps/s <input id="placementStepperSpeed" type="number" min="1" step="100"></label>
+      <label>Slide-down timeout ms <input id="placementStepperTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Pusher-open settle ms <input id="placementPusherSettle" type="number" min="1" max="30000" step="100"></label>
+      <label>Push-forward duty <input id="placementPushDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Push-forward ms <input id="placementPushMs" type="number" min="1" max="30000" step="100"></label>
+      <label>Retreat duty <input id="placementRetreatDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Retreat ms <input id="placementRetreatMs" type="number" min="1" max="30000" step="100"></label>
+      <label>CW angle deg <input id="placementCwAngle" type="number" min="0.1" step="1"></label>
+      <label>CW timeout ms <input id="placementCwTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>After-CW reverse duty <input id="placementAfterCwReverseDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>After-CW reverse ms <input id="placementAfterCwReverseMs" type="number" min="1" max="30000" step="100"></label>
+      <label>After-CW strafe-left duty <input id="placementAfterCwStrafeLeftDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>After-CW strafe-left ms <input id="placementAfterCwStrafeLeftMs" type="number" min="1" max="30000" step="100"></label>
+      <label>Delay after CW ms <input id="placementCwDelay" type="number" min="1" max="30000" step="100"></label>
+      <label>Exit-forward duty <input id="placementExitDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Exit-forward ms <input id="placementExitMs" type="number" min="1" max="30000" step="100"></label>
+      <label>Delay after exit ms <input id="placementExitDelay" type="number" min="1" max="30000" step="100"></label>
+      <label>Strafe-right duty <input id="placementStrafeDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Strafe-right timeout ms <input id="placementStrafeTimeout" type="number" min="1" max="30000" step="100"></label>
+    </div>
+    <div class="row">
+      <button class="run" onclick="placementStart()">Start</button>
+      <button onclick="placementApply()">Apply</button>
+      <button onclick="placementSave()">Save</button>
+      <button class="stop" onclick="placementStop()">Stop</button>
     </div>
   </section>
 
@@ -4336,9 +7353,13 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Calibrated</span><span id="imuCalibrated" class="mono"></span>
       <span>Acquisition task</span><span id="imuAcquisitionRunning" class="mono"></span>
       <span>Health</span><span id="imuHealth" class="mono"></span>
+      <span>Disconnect reason</span><span id="imuDisconnectReason" class="mono"></span>
+      <span>Last disconnect</span><span id="imuLastDisconnect" class="mono"></span>
+      <span>Last read failure</span><span id="imuLastReadFailure" class="mono"></span>
       <span>Initialization result</span><span id="imuInitializationError" class="mono"></span>
       <span>SDA / SCL GPIO</span><span id="imuPins" class="mono"></span>
       <span>Device ACK</span><span id="imuDeviceAck" class="mono"></span>
+      <span>Runtime register configuration</span><span id="imuRuntimeConfig" class="mono"></span>
       <span>Register-read mode</span><span id="imuReadMode" class="mono"></span>
       <span>Last Wire status</span><span id="imuWireStatus" class="mono"></span>
       <span>I2C address</span><span id="imuAddress" class="mono"></span>
@@ -4354,8 +7375,23 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Total acquisition attempts</span><span id="imuTotalAttempts" class="mono"></span>
       <span>Last successful-read timestamp</span><span id="imuLastSuccessfulReadUs" class="mono"></span>
       <span>Sample interval</span><span id="imuSampleInterval" class="mono"></span>
-      <span>Reads OK / failed</span><span id="imuReadCounts" class="mono"></span>
+      <span>Reads OK / failed (lifetime)</span><span id="imuReadCounts" class="mono"></span>
       <span>Consecutive failures</span><span id="imuConsecutiveFailures" class="mono"></span>
+      <span>Acquisition loop interval current / max</span><span id="imuLoopTiming" class="mono"></span>
+      <span>Queue sync current / max</span><span id="imuSyncTiming" class="mono"></span>
+      <span>Wire lock acquisition current / max</span><span id="imuLockTiming" class="mono"></span>
+      <span>I2C measurement read current / max</span><span id="imuReadTiming" class="mono"></span>
+      <span>Successful read → publication current / max</span><span id="imuPublishTiming" class="mono"></span>
+      <span>Snapshot queue publication current / max</span><span id="imuPublishQueueTiming" class="mono"></span>
+      <span>Successful sample publication gap current / max</span><span id="imuPublicationGap" class="mono"></span>
+      <span>Currently observed open publication gap / max</span><span id="imuObservedPublicationGap" class="mono"></span>
+      <span>Snapshot / successful sample sequence</span><span id="imuPublicationSequence" class="mono"></span>
+      <span>Delayed acquisition iterations</span><span id="imuDelayedIterations" class="mono"></span>
+      <span>Autonomous recovery</span><span id="imuRecoveryState" class="mono"></span>
+      <span>Saved turn / strafe heading</span><span id="imuRecoveryHeadings" class="mono"></span>
+      <span>Recovery confirmations</span><span id="imuRecoveryConfirmations" class="mono"></span>
+      <span>Last/current pause turn / strafe</span><span id="imuRecoveryTimes" class="mono"></span>
+      <span>Recovery count / total paused</span><span id="imuRecoveryCounts" class="mono"></span>
     </div>
     <div class="row">
       <button onclick="imuSoakResetCounters()">Reset soak counters</button>
@@ -4371,6 +7407,12 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Configuration</span><span id="imuTurnConfigValid" class="mono"></span>
       <span>State</span><span id="imuTurnState" class="mono"></span>
       <span>Fault</span><span id="imuTurnFault" class="mono"></span>
+      <span>Availability fault timing</span><span id="imuTurnFaultTiming" class="mono"></span>
+      <span>Captured availability gate</span><span id="imuTurnAvailabilityGate" class="mono"></span>
+      <span>Captured timestamps</span><span id="imuTurnAvailabilityTimes" class="mono"></span>
+      <span>Captured publication gap</span><span id="imuTurnPublicationGap" class="mono"></span>
+      <span>Cached snapshot vs newest</span><span id="imuTurnSnapshotIdentity" class="mono"></span>
+      <span>Captured motors / link</span><span id="imuTurnAvailabilityLink" class="mono"></span>
       <span>Current angle</span><span id="imuTurnCurrentAngle" class="mono"></span>
       <span>Start / target</span><span id="imuTurnHeadings" class="mono"></span>
       <span>Angle error / yaw rate</span><span id="imuTurnErrorRate" class="mono"></span>
@@ -4407,7 +7449,46 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
   </section>
 
   <section>
+    <h2>IMU Heading-Held Strafe</h2>
+    <div class="muted">Stage 3 manual test only. The target heading is captured once when a held strafe starts. Motion requires valid tuning, a healthy IMU, and a fresh ESP1 rear-wheel link. Start with wheels raised.</div>
+    <div class="kv">
+      <span>Configuration</span><span id="imuStrafeConfigValid" class="mono"></span>
+      <span>State</span><span id="imuStrafeState" class="mono"></span>
+      <span>Fault</span><span id="imuStrafeFault" class="mono"></span>
+      <span>Direction</span><span id="imuStrafeDirection" class="mono"></span>
+      <span>Current / target</span><span id="imuStrafeHeadings" class="mono"></span>
+      <span>Angle error / yaw rate</span><span id="imuStrafeErrorRate" class="mono"></span>
+      <span>P / damping</span><span id="imuStrafeTerms" class="mono"></span>
+      <span>Yaw correction duty</span><span id="imuStrafeOutput" class="mono"></span>
+      <span>Elapsed</span><span id="imuStrafeElapsed" class="mono"></span>
+      <span>Last request</span><span id="imuStrafeResult" class="mono muted">none</span>
+    </div>
+    <div class="two">
+      <label>Maximum strafe duty <input id="imuStrafeMaxDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Kp (duty/degree) <input id="imuStrafeKp" type="number" min="0.00001" step="0.001"></label>
+      <label>Kd (duty/(degree/second)) <input id="imuStrafeKd" type="number" min="0" step="0.001"></label>
+      <label>Maximum yaw correction duty <input id="imuStrafeMaxCorrection" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Yaw command polarity
+        <select id="imuStrafePolarity">
+          <option value="0">unconfigured</option>
+          <option value="1">+1</option>
+          <option value="-1">-1</option>
+        </select>
+      </label>
+    </div>
+    <div class="muted">Maximum strafe duty plus maximum yaw correction duty must not exceed the hardware duty cap. Use the same measured yaw polarity as the Stage 2 turn controller. Apply settings before holding a direction.</div>
+    <div class="row">
+      <button onclick="imuStrafeApply()">Apply</button>
+      <button onclick="imuStrafeSave()">Save</button>
+      <button class="run" onpointerdown="imuStrafeHold(-1,event)" onpointerup="imuStrafeRelease(event)" onpointercancel="imuStrafeRelease(event)" onlostpointercapture="imuStrafeRelease(event)">Hold Left</button>
+      <button class="run" onpointerdown="imuStrafeHold(1,event)" onpointerup="imuStrafeRelease(event)" onpointercancel="imuStrafeRelease(event)" onlostpointercapture="imuStrafeRelease(event)">Hold Right</button>
+      <button class="stop" onclick="imuStrafeStop()">Stop</button>
+    </div>
+  </section>
+
+  <section>
     <h2>Autonomous Solar</h2>
+    <div class="muted">Each strafe has an independent translational duty while sharing the IMU yaw-hold gains above. The final strafe stops when either rear sensor detects tape, then the existing backward line-follow PID runs for the configured duration.</div>
     <div class="kv">
       <span>State</span><span id="autoState" class="mono"></span>
       <span>Fault</span><span id="autoFault" class="mono"></span>
@@ -4430,16 +7511,20 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Slow after ms <input id="solarSlowAfterMs" type="number" min="0" step="500"></label>
       <label>Slow duty <input id="solarSlowDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Contact timeout ms <input id="solarContactTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Initial right strafe duty <input id="solarInitialStrafeDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Retry left strafe duty <input id="solarRetryLeftDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Retry right strafe duty <input id="solarRetryRightDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Strafe delay ms <input id="solarStrafeDelayMs" type="number" min="0" step="50"></label>
-      <label>Strafe duty <input id="solarStrafeDuty" type="number" min="0" max="1" step="0.01"></label>
+      <label>Retry forward duty <input id="solarStrafeDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Retry left strafe ms <input id="solarRetryLeftMs" type="number" min="0" step="50"></label>
       <label>Retry forward ms <input id="solarRetryForwardMs" type="number" min="0" step="50"></label>
       <label>Retry right timeout ms <input id="solarRetryStrafeTimeoutMs" type="number" min="1" step="500"></label>
       <label>Post-contact forward ms <input id="solarPostContactForwardMs" type="number" min="0" step="50"></label>
       <label>Post-contact forward duty <input id="solarPostContactForwardDuty" type="number" min="0" max="1" step="0.01"></label>
-      <label>Rear-line reacquire left duty <input id="solarLineReacquireDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Post-contact forward delay ms <input id="solarPostContactForwardDelayMs" type="number" min="0" step="50"></label>
       <label>Post-forward rear-line delay ms <input id="solarPostForwardStrafeDelayMs" type="number" min="0" step="50"></label>
+      <label>Rear-line strafe duty <input id="solarLineReacquireDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Backward PID duration ms <input id="solarRearLineFollowDurationMs" type="number" min="1" step="100"></label>
     </div>
     <div class="row">
       <button class="run" onclick="autoSolarStart()">Start</button>
@@ -4457,13 +7542,14 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Both hit</span><span id="solarLimitsAll" class="mono"></span>
       <span>Timeout</span><span id="solarLimitTimeout" class="mono"></span>
       <span>Strafe delay</span><span id="solarLimitDelay" class="mono"></span>
-      <span>Strafe duty</span><span id="solarLimitDuty" class="mono"></span>
+      <span>IMU strafe duty (shared)</span><span id="solarLimitDuty" class="mono"></span>
       <span>Retry left</span><span id="solarRetryLeft" class="mono"></span>
       <span>Retry forward</span><span id="solarRetryForward" class="mono"></span>
       <span>Retry right timeout</span><span id="solarRetryTimeout" class="mono"></span>
       <span>Post-contact forward</span><span id="solarPostContactForward" class="mono"></span>
       <span>Post-contact forward duty</span><span id="solarPostContactForwardDutyStatus" class="mono"></span>
-      <span>Rear-line reacquire left duty</span><span id="solarLineReacquireDutyStatus" class="mono"></span>
+      <span>Rear-line reacquire IMU duty (shared)</span><span id="solarLineReacquireDutyStatus" class="mono"></span>
+      <span>Backward PID duration</span><span id="solarRearLineFollowDuration" class="mono"></span>
       <span>Post-contact forward delay</span><span id="solarPostContactForwardDelay" class="mono"></span>
       <span>Post-forward rear-line delay</span><span id="solarPostForwardStrafeDelay" class="mono"></span>
     </div>
@@ -4471,7 +7557,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Tower Pieces</h2>
-    <div class="muted">After the shimmy finds either back line: optional timed reverse, winch open, claws open, stepper to the bottom limit, claws closed, stepper to the top limit, then winch closed. Servo angles come from the shared Servos panel.</div>
+    <div class="muted">The initial timed strafe and timed alternating shimmy have independent duties while sharing IMU yaw-hold gains. The shimmy stops when either rear sensor detects tape.</div>
     <div class="kv">
       <span>State</span><span id="towerState" class="mono"></span>
       <span>Fault</span><span id="towerFault" class="mono"></span>
@@ -4479,6 +7565,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Line following</span><span id="towerFollowing" class="mono"></span>
       <span>Side sensor</span><span id="towerSideSensor" class="mono"></span>
       <span>Side-line count</span><span id="towerSideCount" class="mono"></span>
+      <span>Crossing gate</span><span id="towerCrossingGate" class="mono"></span>
       <span>Back line detected</span><span id="towerBackLineDetected" class="mono"></span>
       <span>Active output</span><span id="towerOutput" class="mono"></span>
       <span>Last command</span><span id="towerCommand" class="mono"></span>
@@ -4486,24 +7573,26 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     <div class="two">
       <label>Reverse line-follow duty cycle <input id="towerDuty" type="number" min="0.01" max="1" step="0.01"></label>
       <label>Second-line timeout ms <input id="towerTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Right-sensor crossing cooldown ms <input id="towerSideCooldownMs" type="number" min="0" step="10"></label>
+      <label>Right-sensor off-line re-arm ms <input id="towerSideRearmMs" type="number" min="0" step="10"></label>
       <label>Delay after second line ms <input id="towerPostLineDelayMs" type="number" min="1" step="100"></label>
-      <label>Right strafe duty cycle <input id="towerStrafeDuty" type="number" min="0.01" max="1" step="0.01"></label>
       <label>Right strafe duration ms <input id="towerStrafeDurationMs" type="number" min="1" step="100"></label>
+      <label>Right strafe duty <input id="towerStrafeDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Pause after strafe ms <input id="towerPostStrafePauseMs" type="number" min="1" step="100"></label>
-      <label>Clockwise rotation duty cycle <input id="towerRotationDuty" type="number" min="0.01" max="1" step="0.01"></label>
-      <label>Clockwise rotation duration ms <input id="towerRotationDurationMs" type="number" min="1" step="100"></label>
+      <label>Clockwise rotation angle (degrees) <input id="towerRotationAngleDeg" type="number" min="0.1" step="1"></label>
       <label>Pause after rotation ms <input id="towerPostRotationPauseMs" type="number" min="1" step="100"></label>
       <label>Timed backward duty cycle <input id="towerReverseDuty" type="number" min="0.01" max="1" step="0.01"></label>
       <label>Timed backward duration ms <input id="towerReverseDurationMs" type="number" min="1" step="100"></label>
-      <label>Shimmy duty cycle <input id="towerShimmyDuty" type="number" min="0.01" max="1" step="0.01"></label>
       <label>Shimmy right duration ms <input id="towerShimmyRightMs" type="number" min="1" step="100"></label>
       <label>Shimmy left duration ms <input id="towerShimmyLeftMs" type="number" min="1" step="100"></label>
       <label>Shimmy search timeout ms <input id="towerShimmyTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Shimmy duty <input id="towerShimmyDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Optional final backward duty cycle <input id="towerFinalReverseDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Optional final backward duration ms (0 skips) <input id="towerFinalReverseDurationMs" type="number" min="0" step="100"></label>
       <label>Delay after final backward ms <input id="towerPostFinalReverseDelayMs" type="number" min="1" step="100"></label>
       <label>Delay after winch opens ms <input id="towerPostWinchOpenDelayMs" type="number" min="1" step="100"></label>
       <label>Delay after claws open ms <input id="towerPostClawsOpenDelayMs" type="number" min="1" step="100"></label>
+      <label>Delay before slide moves down ms <input id="towerPreStepperBottomDelayMs" type="number" min="0" step="100"></label>
       <label>Stepper down speed (microsteps/s) <input id="towerStepperDownSpeed" type="number" min="1" max="200000" step="100"></label>
       <label>Delay at bottom ms <input id="towerPostStepperBottomDelayMs" type="number" min="1" step="100"></label>
       <label>Delay after claws close ms <input id="towerPostClawsClosedDelayMs" type="number" min="1" step="100"></label>
@@ -4519,7 +7608,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>PegFinder</h2>
-    <div class="muted">Timed clockwise, backward, and forward chassis movements, then funnel forward until the active-high GPIO 47 limit is pressed. After a delay, claws 1, 2, and 3 open sequentially using the shared Servos panel angles.</div>
+    <div class="muted">IMU-controlled clockwise turn, then timed backward and forward chassis movements, followed by funnel forward until the active-high GPIO 47 limit is pressed. The turn uses the shared IMU Turn tuning and the angle below. After a delay, the claws open in the selected order using the shared Servos panel angles. Once all three are open, PegFinder waits, then reverses the funnel for the configured duration.</div>
     <div class="kv">
       <span>State</span><span id="pegFinderState" class="mono"></span>
       <span>Fault</span><span id="pegFinderFault" class="mono"></span>
@@ -4529,8 +7618,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Last command</span><span id="pegFinderCommand" class="mono"></span>
     </div>
     <div class="two">
-      <label>Clockwise duty cycle <input id="pegFinderClockwiseDuty" type="number" min="0.01" max="1" step="0.01"></label>
-      <label>Clockwise duration ms <input id="pegFinderClockwiseDurationMs" type="number" min="1" step="100"></label>
+      <label>Clockwise turn angle (degrees) <input id="pegFinderClockwiseAngleDeg" type="number" min="0.1" step="1"></label>
       <label>Pause after clockwise ms <input id="pegFinderPostRotationPauseMs" type="number" min="1" step="100"></label>
       <label>Backward duty cycle <input id="pegFinderReverseDuty" type="number" min="0.01" max="1" step="0.01"></label>
       <label>Backward duration ms <input id="pegFinderReverseDurationMs" type="number" min="1" step="100"></label>
@@ -4541,6 +7629,12 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Funnel limit timeout ms <input id="pegFinderFunnelTimeoutMs" type="number" min="1" step="100"></label>
       <label>Delay after funnel limit ms <input id="pegFinderPostFunnelLimitDelayMs" type="number" min="1" step="100"></label>
       <label>Delay between claw openings ms <input id="pegFinderClawOpenIntervalMs" type="number" min="1" step="100"></label>
+      <label>First claw to open <select id="pegFinderClawOrder1"><option value="1">Claw 1</option><option value="2">Claw 2</option><option value="3">Claw 3</option></select></label>
+      <label>Second claw to open <select id="pegFinderClawOrder2"><option value="1">Claw 1</option><option value="2">Claw 2</option><option value="3">Claw 3</option></select></label>
+      <label>Third claw to open <select id="pegFinderClawOrder3"><option value="1">Claw 1</option><option value="2">Claw 2</option><option value="3">Claw 3</option></select></label>
+      <label>Delay after all claws open ms <input id="pegFinderPostClawsOpenDelayMs" type="number" min="1" step="100"></label>
+      <label>Funnel reverse duty cycle <input id="pegFinderFunnelReverseDuty" type="number" min="0.01" max="1" step="0.01"></label>
+      <label>Funnel reverse duration ms <input id="pegFinderFunnelReverseDurationMs" type="number" min="1" step="100"></label>
     </div>
     <div class="row">
       <button class="run" onclick="pegFinderStart()">Start</button>
@@ -4552,7 +7646,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Time Trial</h2>
-    <div class="muted">Runs Autonomous Solar, Tower Pieces, then PegFinder. It uses the live settings from all three panels above and the shared Servos panel. The solar-to-tower delay runs before the optional right strafe.</div>
+    <div class="muted">Runs Autonomous Solar until the rear tape is detected, then hands the active reverse line follower directly to Tower Pieces before running PegFinder. The combined Solar-to-Tower line-follow speed is the Reverse line-follow duty cycle in the Tower Pieces panel.</div>
     <div class="kv">
       <span>State</span><span id="timeTrialState" class="mono"></span>
       <span>Time</span><span id="timeTrialTime" class="mono"></span>
@@ -4560,9 +7654,8 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Last command</span><span id="timeTrialCommand" class="mono"></span>
     </div>
     <div class="two">
-      <label>Delay after solar ms <input id="timeTrialPostSolarDelayMs" type="number" min="0" step="100"></label>
-      <label>Solar-to-tower right strafe duty <input id="timeTrialStrafeDuty" type="number" min="0" max="1" step="0.01"></label>
-      <label>Solar-to-tower right strafe ms (0 skips) <input id="timeTrialStrafeDurationMs" type="number" min="0" step="100"></label>
+      <label>Legacy delay after solar ms (bypassed) <input id="timeTrialPostSolarDelayMs" type="number" min="0" step="100" disabled></label>
+      <label>Legacy solar-to-tower strafe ms (bypassed) <input id="timeTrialStrafeDurationMs" type="number" min="0" step="100" disabled></label>
       <label>Delay after tower pieces ms <input id="timeTrialPostTowerDelayMs" type="number" min="0" step="100"></label>
     </div>
     <div class="row">
@@ -4591,6 +7684,8 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>LSFL</span><span id="lsfl" class="mono"></span>
       <span>LSFR</span><span id="lsfr" class="mono"></span>
       <span>LSS (side)</span><span id="lss" class="mono"></span>
+      <span>LSS2 (side, ESP1 GPIO11)</span><span id="lss2" class="mono"></span>
+      <span>LSS3 (side, ESP1 GPIO12)</span><span id="lss3" class="mono"></span>
       <span>Error</span><span id="lfError" class="mono"></span>
       <span>PID</span><span id="lfPid" class="mono"></span>
     </div>
@@ -4709,6 +7804,8 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Claw commands</span><span id="clawCommanded" class="mono"></span>
       <span>Winch hardware</span><span id="winchHardware" class="mono"></span>
       <span>Winch command</span><span id="winchCommanded" class="mono"></span>
+      <span>Habitat Pusher hardware</span><span id="pusherHardware" class="mono"></span>
+      <span>Habitat Pusher command</span><span id="pusherCommanded" class="mono"></span>
     </div>
     <div class="two">
       <label>Claw 1 open angle <input id="claw1Open" type="number" min="0" max="180" step="1"></label>
@@ -4717,6 +7814,8 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Claw 2 closed angle <input id="claw2Closed" type="number" min="0" max="180" step="1"></label>
       <label>Claw 3 open angle <input id="claw3Open" type="number" min="0" max="180" step="1"></label>
       <label>Claw 3 closed angle <input id="claw3Closed" type="number" min="0" max="180" step="1"></label>
+      <label>Habitat Pusher open angle <input id="pusherOpen" type="number" min="0" max="180" step="1"></label>
+      <label>Habitat Pusher closed angle <input id="pusherClosed" type="number" min="0" max="180" step="1"></label>
       <label>Winch open angle <input id="winchOpen" type="number" min="0" max="180" step="1"></label>
       <label>Winch closed angle <input id="winchClosed" type="number" min="0" max="180" step="1"></label>
     </div>
@@ -4730,10 +7829,34 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Claw 1</span><button onclick="claw(1,'close')">Close</button><button class="run" onclick="claw(1,'open')">Open</button>
       <span>Claw 2</span><button onclick="claw(2,'close')">Close</button><button class="run" onclick="claw(2,'open')">Open</button>
       <span>Claw 3</span><button onclick="claw(3,'close')">Close</button><button class="run" onclick="claw(3,'open')">Open</button>
+      <span>Habitat Pusher</span><button onclick="habitatPusher('close')">Close</button><button class="run" onclick="habitatPusher('open')">Open</button>
       <span>Winch</span><button onclick="winch('close')">Close</button><button class="run" onclick="winch('open')">Open</button>
     </div>
+    <div class="muted">Habitat Pusher: ESP2 GPIO5 / LEDC 7. Winch: ESP2 GPIO6 / MCPWM unit 0, timer 0, generator A. Both start disabled. Apply both pusher angles before Habitat Placement and calibrate close → open for clockwise arm rotation.</div>
 	    <pre id="claws"></pre>
 	  </section>
+
+  <section>
+    <h2>Solar Hook Servo Control</h2>
+    <div class="muted">ESP1 GPIO3 · LEDC channel 6 · output starts disabled</div>
+    <div class="kv">
+      <span>ESP1 hardware</span><span id="solarHookHardware" class="mono"></span>
+      <span>Output</span><span id="solarHookOutput" class="mono"></span>
+      <span>Command</span><span id="solarHookCommandStatus" class="mono"></span>
+    </div>
+    <div class="two">
+      <label>Open angle <input id="solarHookOpen" type="number" min="0" max="180" step="1"></label>
+      <label>Closed angle <input id="solarHookClosed" type="number" min="0" max="180" step="1"></label>
+    </div>
+    <div class="row">
+      <button onclick="solarHookApply()">Apply</button>
+      <button onclick="solarHookSave()">Save</button>
+      <button class="run" onclick="solarHookCommand('open')">Open</button>
+      <button onclick="solarHookCommand('close')">Close</button>
+      <button class="stop" onclick="solarHookCommand('disable')">Disable</button>
+      <span id="solarHookResult" class="mono muted"></span>
+    </div>
+  </section>
 
 	  <section>
 	    <h2>Funnel Motor</h2>
@@ -4773,11 +7896,21 @@ let holdTimer = null;
 let lfLoaded = false;
 let rlfLoaded = false;
 let clawsLoaded = false;
+let solarHookLoaded = false;
 let solarLoaded = false;
+let habitatLoaded = false;
+let placementLoaded = false;
 let towerLoaded = false;
 let pegFinderLoaded = false;
 let timeTrialLoaded = false;
 let imuTurnLoaded = false;
+let imuStrafeLoaded = false;
+let imuStrafeHeartbeat = null;
+let imuStrafeHeartbeatPending = false;
+let imuStrafePressed = false;
+let imuStrafeGeneration = 0;
+let imuStrafePointerId = null;
+let imuStrafeRequestChain = Promise.resolve();
 function qs(id){ return document.getElementById(id); }
 function api(path){ return fetch(path).then(r => r.json().catch(() => ({})).then(j => ({ok:r.ok, status:r.status, json:j}))); }
 function stepperCommand(command, extra=''){ return api(`/api/stepper/command?command=${command}${extra}`); }
@@ -4830,7 +7963,17 @@ function updateStepper(){ fetch('/api/stepper').then(r=>r.json()).then(s=>{
     stepperSettingsLoaded=true;
   }
 }).catch(()=>{ qs('stepperMotion').textContent='disconnected'; }); }
-function stopAll(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; api('/api/stop'); }
+function stopAll(){
+  if (holdTimer) clearInterval(holdTimer);
+  holdTimer=null;
+  ++imuStrafeGeneration;
+  imuStrafePressed=false;
+  if (imuStrafeHeartbeat) clearInterval(imuStrafeHeartbeat);
+  imuStrafeHeartbeat=null;
+  imuStrafeHeartbeatPending=false;
+  imuStrafePointerId=null;
+  api('/api/stop');
+}
 function drive(vx,vy,wz){
   const duty = Number(qs('driveDuty').value || 0);
   const send = start => api(`/api/drive?vx=${vx}&vy=${vy}&wz=${wz}&duty=${duty}&hold-start=${start ? 1 : 0}`);
@@ -4869,6 +8012,142 @@ function funnelHold(sign){
 }
 function funnelRelease(){ if (holdTimer) clearInterval(holdTimer); holdTimer=null; funnelCommand(0); }
 function setLfValue(id, value){ const el = qs(id); if (el && document.activeElement !== el) el.value = value; }
+function loadHabitatControls(j){
+  if (habitatLoaded || !j.habitat_pieces) return;
+  const h = j.habitat_pieces;
+  setLfValue('habitatDuty', h.line_follow_duty);
+  setLfValue('habitatDetectionDelay', h.lss2_detection_delay_ms || '');
+  setLfValue('habitatRunTimeout', h.run_timeout_ms || '');
+  setLfValue('habitatReverseDuty', h.reverse_duty || '');
+  setLfValue('habitatReverseDuration', h.reverse_duration_ms || '');
+  habitatLoaded = true;
+}
+function habitatParams(){
+  return new URLSearchParams({
+    duty: qs('habitatDuty').value,
+    'lss2-detection-delay-ms': qs('habitatDetectionDelay').value,
+    'run-timeout-ms': qs('habitatRunTimeout').value,
+    'reverse-duty': qs('habitatReverseDuty').value,
+    'reverse-duration-ms': qs('habitatReverseDuration').value
+  });
+}
+function habitatShowResult(result){
+  const message = result.json.message || result.json.error ||
+    `request ${result.status}`;
+  qs('habitatResult').textContent = message;
+  qs('habitatResult').className = result.ok ? 'mono good' : 'mono bad';
+  return result;
+}
+function habitatApply(){
+  return api(`/api/autonomous/habitat-pieces/config?${habitatParams().toString()}`)
+    .then(habitatShowResult);
+}
+async function habitatStart(){
+  const applied = await habitatApply();
+  if (!applied.ok) return applied;
+  return api('/api/autonomous/habitat-pieces/start')
+    .then(habitatShowResult);
+}
+async function habitatSave(){
+  const applied = await habitatApply();
+  if (!applied.ok) return applied;
+  return api('/api/config/save').then(habitatShowResult);
+}
+function habitatStop(){
+  return api('/api/autonomous/habitat-pieces/stop')
+    .then(habitatShowResult);
+}
+function loadPlacementControls(j){
+  if (placementLoaded || !j.habitat_placement) return;
+  const p = j.habitat_placement;
+  const values = {
+    placementRearDuty:p.reverse_line_follow_duty,
+    placementLssTimeout:p.lss1_timeout_ms,
+    placementLssDelay:p.post_lss1_delay_ms,
+    placementCcwAngle:p.counter_clockwise_angle_deg,
+    placementCcwTimeout:p.counter_clockwise_timeout_ms,
+    placementSlideDuty:p.forward_to_slide_duty,
+    placementSlideMs:p.forward_to_slide_duration_ms,
+    placementStepperSpeed:p.stepper_down_speed_steps_per_second,
+    placementStepperTimeout:p.stepper_down_timeout_ms,
+    placementPusherSettle:p.pusher_open_settle_ms,
+    placementPushDuty:p.push_forward_duty,
+    placementPushMs:p.push_forward_duration_ms,
+    placementRetreatDuty:p.reverse_retreat_duty,
+    placementRetreatMs:p.reverse_retreat_duration_ms,
+    placementCwAngle:p.clockwise_angle_deg,
+    placementCwTimeout:p.clockwise_timeout_ms,
+    placementAfterCwReverseDuty:p.post_clockwise_reverse_duty,
+    placementAfterCwReverseMs:p.post_clockwise_reverse_duration_ms,
+    placementAfterCwStrafeLeftDuty:p.post_clockwise_strafe_left_duty,
+    placementAfterCwStrafeLeftMs:p.post_clockwise_strafe_left_duration_ms,
+    placementCwDelay:p.post_clockwise_delay_ms,
+    placementExitDuty:p.exit_forward_duty,
+    placementExitMs:p.exit_forward_duration_ms,
+    placementExitDelay:p.post_forward_delay_ms,
+    placementStrafeDuty:p.strafe_right_duty,
+    placementStrafeTimeout:p.strafe_right_timeout_ms
+  };
+  Object.entries(values).forEach(([id,value]) =>
+    setLfValue(id, value || ''));
+  placementLoaded = true;
+}
+function placementParams(){
+  return new URLSearchParams({
+    'reverse-line-duty':qs('placementRearDuty').value,
+    'lss1-timeout-ms':qs('placementLssTimeout').value,
+    'post-lss1-delay-ms':qs('placementLssDelay').value,
+    'ccw-angle-deg':qs('placementCcwAngle').value,
+    'ccw-timeout-ms':qs('placementCcwTimeout').value,
+    'forward-to-slide-duty':qs('placementSlideDuty').value,
+    'forward-to-slide-ms':qs('placementSlideMs').value,
+    'stepper-down-speed':qs('placementStepperSpeed').value,
+    'stepper-down-timeout-ms':qs('placementStepperTimeout').value,
+    'pusher-open-settle-ms':qs('placementPusherSettle').value,
+    'push-forward-duty':qs('placementPushDuty').value,
+    'push-forward-ms':qs('placementPushMs').value,
+    'reverse-retreat-duty':qs('placementRetreatDuty').value,
+    'reverse-retreat-ms':qs('placementRetreatMs').value,
+    'cw-angle-deg':qs('placementCwAngle').value,
+    'cw-timeout-ms':qs('placementCwTimeout').value,
+    'post-cw-reverse-duty':qs('placementAfterCwReverseDuty').value,
+    'post-cw-reverse-ms':qs('placementAfterCwReverseMs').value,
+    'post-cw-strafe-left-duty':qs('placementAfterCwStrafeLeftDuty').value,
+    'post-cw-strafe-left-ms':qs('placementAfterCwStrafeLeftMs').value,
+    'post-cw-delay-ms':qs('placementCwDelay').value,
+    'exit-forward-duty':qs('placementExitDuty').value,
+    'exit-forward-ms':qs('placementExitMs').value,
+    'post-forward-delay-ms':qs('placementExitDelay').value,
+    'strafe-right-duty':qs('placementStrafeDuty').value,
+    'strafe-right-timeout-ms':qs('placementStrafeTimeout').value
+  });
+}
+function placementShowResult(result){
+  const message = result.json.message || result.json.error ||
+    `request ${result.status}`;
+  qs('placementResult').textContent = message;
+  qs('placementResult').className = result.ok ? 'mono good' : 'mono bad';
+  return result;
+}
+function placementApply(){
+  return api(`/api/autonomous/habitat-placement/config?${placementParams().toString()}`)
+    .then(placementShowResult);
+}
+async function placementStart(){
+  const applied = await placementApply();
+  if (!applied.ok) return applied;
+  return api('/api/autonomous/habitat-placement/start')
+    .then(placementShowResult);
+}
+async function placementSave(){
+  const applied = await placementApply();
+  if (!applied.ok) return applied;
+  return api('/api/config/save').then(placementShowResult);
+}
+function placementStop(){
+  return api('/api/autonomous/habitat-placement/stop')
+    .then(placementShowResult);
+}
 function loadLfControls(j){
   if (lfLoaded || !j.pid) return;
   setLfValue('lfKp', j.pid.kp);
@@ -4944,26 +8223,29 @@ function rearLineSensorMode(){ api('/api/mode?mode=rear-line-sensor'); }
 function autoSolarStart(){ api('/api/autonomous/solar/start'); }
 function loadTowerControls(j){
   if (towerLoaded || !j.tower_pieces) return;
+  const line = j.tower_line_control || {};
   setLfValue('towerDuty', j.tower_pieces.reverse_line_duty);
   setLfValue('towerTimeoutMs', j.tower_pieces.side_line_timeout_ms);
+  setLfValue('towerSideCooldownMs', line.side_line_cooldown_ms);
+  setLfValue('towerSideRearmMs', line.side_line_rearm_ms);
   setLfValue('towerPostLineDelayMs', j.tower_pieces.post_line_delay_ms);
-  setLfValue('towerStrafeDuty', j.tower_pieces.strafe_right_duty);
   setLfValue('towerStrafeDurationMs', j.tower_pieces.strafe_right_duration_ms);
+  setLfValue('towerStrafeDuty', line.initial_strafe_duty);
   setLfValue('towerPostStrafePauseMs', j.tower_pieces.post_strafe_pause_ms);
-  setLfValue('towerRotationDuty', j.tower_pieces.clockwise_rotation_duty);
-  setLfValue('towerRotationDurationMs', j.tower_pieces.clockwise_rotation_duration_ms);
+  setLfValue('towerRotationAngleDeg', j.tower_pieces.clockwise_rotation_angle_deg);
   setLfValue('towerPostRotationPauseMs', j.tower_pieces.post_rotation_pause_ms);
   setLfValue('towerReverseDuty', j.tower_pieces.reverse_duty);
   setLfValue('towerReverseDurationMs', j.tower_pieces.reverse_duration_ms);
-  setLfValue('towerShimmyDuty', j.tower_pieces.shimmy_duty);
   setLfValue('towerShimmyRightMs', j.tower_pieces.shimmy_right_duration_ms);
   setLfValue('towerShimmyLeftMs', j.tower_pieces.shimmy_left_duration_ms);
   setLfValue('towerShimmyTimeoutMs', j.tower_pieces.shimmy_timeout_ms);
+  setLfValue('towerShimmyDuty', line.shimmy_duty);
   setLfValue('towerFinalReverseDuty', j.tower_pieces.final_reverse_duty);
   setLfValue('towerFinalReverseDurationMs', j.tower_pieces.final_reverse_duration_ms);
   setLfValue('towerPostFinalReverseDelayMs', j.tower_pieces.post_final_reverse_delay_ms);
   setLfValue('towerPostWinchOpenDelayMs', j.tower_pieces.post_winch_open_delay_ms);
   setLfValue('towerPostClawsOpenDelayMs', j.tower_pieces.post_claws_open_delay_ms);
+  setLfValue('towerPreStepperBottomDelayMs', line.pre_stepper_bottom_delay_ms);
   setLfValue('towerStepperDownSpeed', j.tower_pieces.stepper_down_speed_steps_per_second);
   setLfValue('towerPostStepperBottomDelayMs', j.tower_pieces.post_stepper_bottom_delay_ms);
   setLfValue('towerPostClawsClosedDelayMs', j.tower_pieces.post_claws_closed_delay_ms);
@@ -4974,24 +8256,26 @@ function towerParams(){
   const p = new URLSearchParams();
   p.set('duty', qs('towerDuty').value);
   p.set('timeout-ms', qs('towerTimeoutMs').value);
+  p.set('side-line-cooldown-ms', qs('towerSideCooldownMs').value);
+  p.set('side-line-rearm-ms', qs('towerSideRearmMs').value);
   p.set('post-line-delay-ms', qs('towerPostLineDelayMs').value);
-  p.set('strafe-duty', qs('towerStrafeDuty').value);
   p.set('strafe-duration-ms', qs('towerStrafeDurationMs').value);
+  p.set('strafe-duty', qs('towerStrafeDuty').value);
   p.set('post-strafe-pause-ms', qs('towerPostStrafePauseMs').value);
-  p.set('rotation-duty', qs('towerRotationDuty').value);
-  p.set('rotation-duration-ms', qs('towerRotationDurationMs').value);
+  p.set('rotation-angle-deg', qs('towerRotationAngleDeg').value);
   p.set('post-rotation-pause-ms', qs('towerPostRotationPauseMs').value);
   p.set('reverse-duty', qs('towerReverseDuty').value);
   p.set('reverse-duration-ms', qs('towerReverseDurationMs').value);
-  p.set('shimmy-duty', qs('towerShimmyDuty').value);
   p.set('shimmy-right-ms', qs('towerShimmyRightMs').value);
   p.set('shimmy-left-ms', qs('towerShimmyLeftMs').value);
   p.set('shimmy-timeout-ms', qs('towerShimmyTimeoutMs').value);
+  p.set('shimmy-duty', qs('towerShimmyDuty').value);
   p.set('final-reverse-duty', qs('towerFinalReverseDuty').value);
   p.set('final-reverse-duration-ms', qs('towerFinalReverseDurationMs').value);
   p.set('post-final-reverse-delay-ms', qs('towerPostFinalReverseDelayMs').value);
   p.set('post-winch-open-delay-ms', qs('towerPostWinchOpenDelayMs').value);
   p.set('post-claws-open-delay-ms', qs('towerPostClawsOpenDelayMs').value);
+  p.set('pre-stepper-bottom-delay-ms', qs('towerPreStepperBottomDelayMs').value);
   p.set('stepper-down-speed-steps-per-second', qs('towerStepperDownSpeed').value);
   p.set('post-stepper-bottom-delay-ms', qs('towerPostStepperBottomDelayMs').value);
   p.set('post-claws-closed-delay-ms', qs('towerPostClawsClosedDelayMs').value);
@@ -5009,8 +8293,7 @@ function towerSave(){ towerApply().then(r => { if (r.ok) api('/api/config/save')
 function loadPegFinderControls(j){
   if (pegFinderLoaded || !j.peg_finder) return;
   const p = j.peg_finder;
-  setLfValue('pegFinderClockwiseDuty', p.clockwise_duty);
-  setLfValue('pegFinderClockwiseDurationMs', p.clockwise_duration_ms);
+  setLfValue('pegFinderClockwiseAngleDeg', p.clockwise_angle_deg);
   setLfValue('pegFinderPostRotationPauseMs', p.post_rotation_pause_ms);
   setLfValue('pegFinderReverseDuty', p.reverse_duty);
   setLfValue('pegFinderReverseDurationMs', p.reverse_duration_ms);
@@ -5021,12 +8304,18 @@ function loadPegFinderControls(j){
   setLfValue('pegFinderFunnelTimeoutMs', p.funnel_forward_timeout_ms);
   setLfValue('pegFinderPostFunnelLimitDelayMs', p.post_funnel_limit_delay_ms);
   setLfValue('pegFinderClawOpenIntervalMs', p.claw_open_interval_ms);
+  const clawOrder = p.claw_open_order || [1, 2, 3];
+  setLfValue('pegFinderClawOrder1', clawOrder[0]);
+  setLfValue('pegFinderClawOrder2', clawOrder[1]);
+  setLfValue('pegFinderClawOrder3', clawOrder[2]);
+  setLfValue('pegFinderPostClawsOpenDelayMs', p.post_claws_open_delay_ms);
+  setLfValue('pegFinderFunnelReverseDuty', p.funnel_reverse_duty);
+  setLfValue('pegFinderFunnelReverseDurationMs', p.funnel_reverse_duration_ms);
   pegFinderLoaded = true;
 }
 function pegFinderParams(){
   const p = new URLSearchParams();
-  p.set('clockwise-duty', qs('pegFinderClockwiseDuty').value);
-  p.set('clockwise-duration-ms', qs('pegFinderClockwiseDurationMs').value);
+  p.set('clockwise-angle-deg', qs('pegFinderClockwiseAngleDeg').value);
   p.set('post-rotation-pause-ms', qs('pegFinderPostRotationPauseMs').value);
   p.set('reverse-duty', qs('pegFinderReverseDuty').value);
   p.set('reverse-duration-ms', qs('pegFinderReverseDurationMs').value);
@@ -5037,6 +8326,12 @@ function pegFinderParams(){
   p.set('funnel-timeout-ms', qs('pegFinderFunnelTimeoutMs').value);
   p.set('post-funnel-limit-delay-ms', qs('pegFinderPostFunnelLimitDelayMs').value);
   p.set('claw-open-interval-ms', qs('pegFinderClawOpenIntervalMs').value);
+  p.set('claw-order-1', qs('pegFinderClawOrder1').value);
+  p.set('claw-order-2', qs('pegFinderClawOrder2').value);
+  p.set('claw-order-3', qs('pegFinderClawOrder3').value);
+  p.set('post-claws-open-delay-ms', qs('pegFinderPostClawsOpenDelayMs').value);
+  p.set('funnel-reverse-duty', qs('pegFinderFunnelReverseDuty').value);
+  p.set('funnel-reverse-duration-ms', qs('pegFinderFunnelReverseDurationMs').value);
   return p;
 }
 function pegFinderResult(r){
@@ -5051,7 +8346,6 @@ function loadTimeTrialControls(j){
   if (timeTrialLoaded || !j.time_trial) return;
   const t = j.time_trial;
   setLfValue('timeTrialPostSolarDelayMs', t.post_solar_delay_ms);
-  setLfValue('timeTrialStrafeDuty', t.strafe_right_duty);
   setLfValue('timeTrialStrafeDurationMs', t.strafe_right_duration_ms);
   setLfValue('timeTrialPostTowerDelayMs', t.post_tower_delay_ms);
   timeTrialLoaded = true;
@@ -5059,7 +8353,6 @@ function loadTimeTrialControls(j){
 function timeTrialParams(){
   const p = new URLSearchParams();
   p.set('post-solar-delay-ms', qs('timeTrialPostSolarDelayMs').value);
-  p.set('strafe-right-duty', qs('timeTrialStrafeDuty').value);
   p.set('strafe-right-duration-ms', qs('timeTrialStrafeDurationMs').value);
   p.set('post-tower-delay-ms', qs('timeTrialPostTowerDelayMs').value);
   return p;
@@ -5163,9 +8456,165 @@ function imuSoakResetCounters(){
     return result;
   });
 }
+function loadImuStrafeControls(j){
+  if (imuStrafeLoaded || !j.imu_heading_hold) return;
+  const h = j.imu_heading_hold;
+  setLfValue('imuStrafeMaxDuty', h.maximum_strafe_duty);
+  setLfValue('imuStrafeKp', h.kp);
+  setLfValue('imuStrafeKd', h.kd);
+  setLfValue('imuStrafeMaxCorrection', h.maximum_yaw_correction_duty);
+  setLfValue('imuStrafePolarity', h.yaw_command_polarity);
+  imuStrafeLoaded = true;
+}
+function imuStrafeParams(){
+  const p = new URLSearchParams();
+  p.set('strafe-duty', qs('imuStrafeMaxDuty').value);
+  p.set('kp', qs('imuStrafeKp').value);
+  p.set('kd', qs('imuStrafeKd').value);
+  p.set('max-correction-duty', qs('imuStrafeMaxCorrection').value);
+  p.set('polarity', qs('imuStrafePolarity').value);
+  return p;
+}
+function imuStrafeShowResult(result){
+  qs('imuStrafeResult').textContent =
+    result.ok ? (result.json.message || 'ok')
+              : (result.json.error || `HTTP ${result.status}`);
+  qs('imuStrafeResult').className =
+    result.ok ? 'mono good' : 'mono bad';
+  return result;
+}
+function imuStrafeRequest(path){
+  const request = imuStrafeRequestChain
+    .catch(() => {})
+    .then(() => api(path));
+  imuStrafeRequestChain = request.catch(() => {});
+  return request;
+}
+function imuStrafeRequestError(){
+  return {
+    ok: false,
+    status: 0,
+    json: {error: 'IMU strafe request failed'}
+  };
+}
+function imuStrafeClearHeartbeat(){
+  if (imuStrafeHeartbeat) clearInterval(imuStrafeHeartbeat);
+  imuStrafeHeartbeat = null;
+}
+function imuStrafeStartHeartbeat(generation){
+  imuStrafeClearHeartbeat();
+  imuStrafeHeartbeatPending = false;
+  imuStrafeHeartbeat = setInterval(() => {
+    if (!imuStrafePressed ||
+        generation !== imuStrafeGeneration ||
+        imuStrafeHeartbeatPending) {
+      return;
+    }
+    imuStrafeHeartbeatPending = true;
+    imuStrafeRequest('/api/imu-strafe/heartbeat')
+      .then(heartbeat => {
+        if (!imuStrafePressed ||
+            generation !== imuStrafeGeneration) {
+          return;
+        }
+        if (!heartbeat.ok) {
+          imuStrafeShowResult(heartbeat);
+          imuStrafeRelease();
+        }
+      })
+      .catch(() => {
+        if (!imuStrafePressed ||
+            generation !== imuStrafeGeneration) {
+          return;
+        }
+        imuStrafeShowResult(imuStrafeRequestError());
+        imuStrafeRelease();
+      })
+      .finally(() => {
+        if (generation === imuStrafeGeneration) {
+          imuStrafeHeartbeatPending = false;
+        }
+      });
+  }, 200);
+}
+function imuStrafeApply(){
+  return imuStrafeRequest(
+      `/api/imu-strafe/config?${imuStrafeParams().toString()}`)
+    .then(imuStrafeShowResult);
+}
+async function imuStrafeSave(){
+  const applied = await imuStrafeApply();
+  if (!applied.ok) return applied;
+  return imuStrafeRequest('/api/imu-strafe/save')
+    .then(imuStrafeShowResult);
+}
+function imuStrafeHold(direction,event){
+  if (event && event.currentTarget &&
+      event.currentTarget.setPointerCapture) {
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch (_) {}
+  }
+  const generation = ++imuStrafeGeneration;
+  imuStrafePressed = true;
+  imuStrafePointerId = event ? event.pointerId : null;
+  imuStrafeClearHeartbeat();
+  imuStrafeHeartbeatPending = false;
+  imuStrafeRequest(`/api/imu-strafe/start?direction=${direction}`)
+    .then(result => {
+      if (generation !== imuStrafeGeneration) {
+        return;
+      }
+      imuStrafeShowResult(result);
+      if (!result.ok) {
+        imuStrafePressed = false;
+        imuStrafePointerId = null;
+        return;
+      }
+      if (!imuStrafePressed) return;
+      imuStrafeStartHeartbeat(generation);
+    })
+    .catch(() => {
+      if (generation !== imuStrafeGeneration) {
+        return;
+      }
+      imuStrafePressed = false;
+      imuStrafePointerId = null;
+      imuStrafeShowResult(imuStrafeRequestError());
+    });
+}
+function imuStrafeRelease(event=null,sendStop=true){
+  if (event && imuStrafePointerId !== null &&
+      event.pointerId !== imuStrafePointerId) {
+    return;
+  }
+  const wasActive = imuStrafePressed || imuStrafeHeartbeat !== null;
+  if (!wasActive) return;
+  ++imuStrafeGeneration;
+  imuStrafePressed = false;
+  imuStrafePointerId = null;
+  imuStrafeClearHeartbeat();
+  imuStrafeHeartbeatPending = false;
+  if (sendStop && wasActive) {
+    return imuStrafeRequest('/api/imu-strafe/stop')
+      .then(imuStrafeShowResult)
+      .catch(() => imuStrafeShowResult(imuStrafeRequestError()));
+  }
+}
+function imuStrafeStop(){
+  ++imuStrafeGeneration;
+  imuStrafePressed = false;
+  imuStrafePointerId = null;
+  imuStrafeClearHeartbeat();
+  imuStrafeHeartbeatPending = false;
+  return imuStrafeRequest('/api/imu-strafe/stop')
+    .then(imuStrafeShowResult)
+    .catch(() => imuStrafeShowResult(imuStrafeRequestError()));
+}
 function loadSolarControls(j){
   if (solarLoaded || !j.autonomous) return;
   const a = j.autonomous;
+  const speeds = j.solar_strafe_speeds || {};
   setLfValue('solarDetect1', a.ir_detection_threshold_1khz);
   setLfValue('solarRelease1', a.ir_release_threshold_1khz);
   setLfValue('solarDetect10', a.ir_detection_threshold_10khz);
@@ -5178,16 +8627,20 @@ function loadSolarControls(j){
   setLfValue('solarSlowAfterMs', a.slow_after_ms);
   setLfValue('solarSlowDuty', a.slow_base_duty);
   setLfValue('solarContactTimeoutMs', a.contact_timeout_ms);
+  setLfValue('solarInitialStrafeDuty', speeds.initial_right_duty);
+  setLfValue('solarRetryLeftDuty', speeds.retry_left_duty);
+  setLfValue('solarRetryRightDuty', speeds.retry_right_duty);
   setLfValue('solarStrafeDelayMs', a.strafe_start_delay_ms);
-  setLfValue('solarStrafeDuty', a.strafe_duty);
+  setLfValue('solarStrafeDuty', a.retry_forward_duty);
   setLfValue('solarRetryLeftMs', a.retry_strafe_left_duration_ms);
   setLfValue('solarRetryForwardMs', a.retry_forward_duration_ms);
   setLfValue('solarRetryStrafeTimeoutMs', a.retry_strafe_timeout_ms);
   setLfValue('solarPostContactForwardMs', a.post_contact_forward_duration_ms);
   setLfValue('solarPostContactForwardDuty', a.post_contact_forward_duty);
-  setLfValue('solarLineReacquireDuty', a.line_reacquire_strafe_duty);
   setLfValue('solarPostContactForwardDelayMs', a.post_contact_forward_start_delay_ms);
   setLfValue('solarPostForwardStrafeDelayMs', a.line_reacquire_strafe_start_delay_ms);
+  setLfValue('solarLineReacquireDuty', speeds.rear_line_strafe_duty);
+  setLfValue('solarRearLineFollowDurationMs', speeds.backward_pid_duration_ms);
   solarLoaded = true;
 }
 function solarParams(){
@@ -5205,16 +8658,20 @@ function solarParams(){
   add('slow-after-ms', 'solarSlowAfterMs');
   add('slow-duty', 'solarSlowDuty');
   add('contact-timeout-ms', 'solarContactTimeoutMs');
+  add('initial-strafe-duty', 'solarInitialStrafeDuty');
+  add('retry-left-strafe-duty', 'solarRetryLeftDuty');
+  add('retry-right-strafe-duty', 'solarRetryRightDuty');
   add('strafe-delay-ms', 'solarStrafeDelayMs');
-  add('strafe-duty', 'solarStrafeDuty');
+  add('retry-forward-duty', 'solarStrafeDuty');
   add('retry-left-ms', 'solarRetryLeftMs');
   add('retry-forward-ms', 'solarRetryForwardMs');
   add('retry-strafe-timeout-ms', 'solarRetryStrafeTimeoutMs');
   add('post-contact-forward-ms', 'solarPostContactForwardMs');
   add('post-contact-forward-duty', 'solarPostContactForwardDuty');
-  add('line-reacquire-duty', 'solarLineReacquireDuty');
   add('post-contact-forward-delay-ms', 'solarPostContactForwardDelayMs');
   add('post-forward-strafe-delay-ms', 'solarPostForwardStrafeDelayMs');
+  add('line-reacquire-strafe-duty', 'solarLineReacquireDuty');
+  add('rear-line-follow-duration-ms', 'solarRearLineFollowDurationMs');
   return p;
 }
 function autoSolarApply(){ return api(`/api/autonomous/solar/config?${solarParams().toString()}`); }
@@ -5233,6 +8690,9 @@ function loadClawControls(j){
     setClawAngle(`claw${n}Closed`, claw.closedAngleDeg);
   });
   const winchServo = j.claws.winch || {};
+  const pusherServo = j.claws.habitat_pusher || {};
+  setClawAngle('pusherOpen', pusherServo.openAngleDeg ?? -1);
+  setClawAngle('pusherClosed', pusherServo.closedAngleDeg ?? -1);
   setClawAngle('winchOpen', winchServo.openAngleDeg ?? -1);
   setClawAngle('winchClosed', winchServo.closedAngleDeg ?? -1);
   clawsLoaded = true;
@@ -5247,6 +8707,10 @@ function clawParams(){
   }
   const winchOpen = qs('winchOpen').value;
   const winchClosed = qs('winchClosed').value;
+  const pusherOpen = qs('pusherOpen').value;
+  const pusherClosed = qs('pusherClosed').value;
+  if (pusherOpen !== '') p.set('pusher-open', pusherOpen);
+  if (pusherClosed !== '') p.set('pusher-closed', pusherClosed);
   if (winchOpen !== '') p.set('winch-open', winchOpen);
   if (winchClosed !== '') p.set('winch-closed', winchClosed);
   return p;
@@ -5256,12 +8720,64 @@ function clawsSave(){ clawsApply().then(r => { if (r.ok) api('/api/claws/save');
 function claw(id,state){ clawsApply().then(r => { if (r.ok) api(`/api/claw?id=${id}&state=${state}`); }); }
 function clawAll(state){ clawsApply().then(r => { if (r.ok) api(`/api/claws?state=${state}`); }); }
 function winch(state){ clawsApply().then(r => { if (r.ok) api(`/api/winch?state=${state}`); }); }
+function habitatPusher(state){ clawsApply().then(r => { if (r.ok) api(`/api/habitat-pusher?state=${state}`); }); }
 function clawSummary(c){
   if (!c) return 'n/a';
   const open = c.openConfigured ? c.openAngleDeg : 'unset';
   const closed = c.closedConfigured ? c.closedAngleDeg : 'unset';
   const target = c.outputEnabled ? c.commandedAngleDeg : 'off';
   return `open=${open} closed=${closed} target=${target}`;
+}
+function servoHardwareSummary(c){
+  if (!c) return 'n/a';
+  const configured = yn(c.hardwareConfigured);
+  if (c.pwmBackend === 'MCPWM') {
+    const generator = c.mcpwmGenerator === 0 ? 'A' : 'B';
+    return `${configured} · GPIO${c.gpio} · MCPWM ${c.mcpwmUnit}/${c.mcpwmTimer}/${generator}`;
+  }
+  if (c.pwmBackend === 'LEDC') {
+    return `${configured} · GPIO${c.gpio} · LEDC ${c.ledcChannel}`;
+  }
+  return `${configured} · unconfigured`;
+}
+function loadSolarHookControls(j){
+  if (solarHookLoaded || !j.solar_hook) return;
+  setClawAngle('solarHookOpen', j.solar_hook.openAngleDeg ?? -1);
+  setClawAngle('solarHookClosed', j.solar_hook.closedAngleDeg ?? -1);
+  solarHookLoaded = true;
+}
+function solarHookParams(){
+  const p = new URLSearchParams();
+  const open = qs('solarHookOpen').value;
+  const closed = qs('solarHookClosed').value;
+  if (open !== '') p.set('open-angle', open);
+  if (closed !== '') p.set('closed-angle', closed);
+  return p;
+}
+function solarHookShowResult(result){
+  const message = result.json.message || result.json.error ||
+    `request ${result.status}`;
+  qs('solarHookResult').textContent = message;
+  qs('solarHookResult').className =
+    result.ok ? 'mono good' : 'mono bad';
+  return result;
+}
+function solarHookApply(){
+  return api(`/api/solar-hook/config?${solarHookParams().toString()}`)
+    .then(solarHookShowResult);
+}
+async function solarHookSave(){
+  const applied = await solarHookApply();
+  if (!applied.ok) return applied;
+  return api('/api/solar-hook/save').then(solarHookShowResult);
+}
+async function solarHookCommand(state){
+  if (state !== 'disable') {
+    const applied = await solarHookApply();
+    if (!applied.ok) return applied;
+  }
+  return api(`/api/solar-hook?state=${state}`)
+    .then(solarHookShowResult);
 }
 function yn(v){ return v ? 'yes' : 'no'; }
 function level(v){ return v ? 'HIGH' : 'LOW'; }
@@ -5298,6 +8814,87 @@ function update(){
       ultrasonic1Fresh ? `${ultrasonic1.echo_duration_us ?? 0} µs` : '—';
     qs('ultrasonic1Age').textContent =
       ultrasonic1Fresh ? `${ultrasonic1.sample_age_ms ?? 0} ms` : '—';
+    const laser = j.laser_distance || {};
+    const laserUsable = laser.available === true &&
+      laser.configured === true && laser.initialized === true &&
+      laser.ranging === true && laser.data_fresh === true &&
+      laser.data_valid === true && laser.sensor_range_status === 0;
+    qs('laserDistance').textContent = laserUsable
+      ? `${laser.distance_mm ?? 0} mm (${((laser.distance_mm ?? 0) / 10).toFixed(1)} cm)`
+      : '—';
+    qs('laserDistance').className =
+      laserUsable ? 'mono good' : 'mono muted';
+    qs('laserState').textContent =
+      `available=${yn(laser.available)} configured=${yn(laser.configured)} initialized=${yn(laser.initialized)} ranging=${yn(laser.ranging)} fresh=${yn(laser.data_fresh)} valid=${yn(laser.data_valid)}`;
+    qs('laserState').className =
+      laserUsable ? 'mono good' : 'mono bad';
+    qs('laserProfile').textContent = laser.profile || 'DEFAULT';
+    qs('laserProfile').className =
+      laser.profile === 'HIGH_ACCURACY' ? 'mono good' : 'mono muted';
+    qs('laserStatus').textContent =
+      `${laser.sensor_range_status ?? 255} / ${laser.driver_status ?? 0}`;
+    qs('laserAge').textContent =
+      `${laser.sample_age_ms ?? 0} / ${laser.snapshot_age_ms ?? 0} ms`;
+    qs('laserSequence').textContent =
+      `${laser.measurement_sequence ?? 0} / ${laser.packet_sequence ?? 0}`;
+    qs('laserCounts').textContent =
+      `${laser.successful_measurement_count ?? 0} / ${laser.failed_measurement_count ?? 0} / ${laser.consecutive_failed_measurements ?? 0}`;
+    qs('laserTiming').textContent =
+      `${laser.acquisition_duration_us ?? 0} / ${laser.maximum_acquisition_duration_us ?? 0} µs`;
+    qs('laserBus').textContent =
+      `${laser.sda_gpio ?? -1} / ${laser.scl_gpio ?? -1} / 0x${Number(laser.i2c_address ?? 0).toString(16).toUpperCase().padStart(2, '0')}`;
+    const habitat = j.habitat_pieces || {};
+    loadHabitatControls(j);
+    qs('habitatConfig').textContent = habitat.configuration_valid
+      ? 'valid' : 'incomplete / locked';
+    qs('habitatConfig').className =
+      habitat.configuration_valid ? 'mono good' : 'mono bad';
+    qs('habitatReady').textContent = yn(habitat.start_ready);
+    qs('habitatReady').className =
+      habitat.start_ready ? 'mono good' : 'mono bad';
+    qs('habitatState').textContent = habitat.state || 'WAIT_FOR_START';
+    const habitatReason = habitat.stop_reason || 'CONFIGURATION_INCOMPLETE';
+    qs('habitatGate').textContent =
+      `${habitatReason} · armed=${yn(habitat.lss2_detection_armed)} · stop=${yn(habitat.should_stop)} · target=${yn(habitat.target_reached)}`;
+    qs('habitatGate').className =
+      (!habitat.timed_out &&
+      (habitatReason === 'NONE' || habitatReason === 'LSS2_BLACK_DETECTED')
+        ? 'mono good' : 'mono bad');
+    const habitatLss2Level =
+      habitat.lss2_configured && habitat.lss2_data_fresh
+        ? (habitat.lss2_black ? 'BLACK' : 'WHITE') : 'UNKNOWN';
+    qs('habitatLss2').textContent =
+      `${habitatLss2Level} · configured=${yn(habitat.lss2_configured)} · fresh=${yn(habitat.lss2_data_fresh)}`;
+    qs('habitatLss2').className =
+      habitat.lss2_configured && habitat.lss2_data_fresh ? 'mono good' : 'mono bad';
+    qs('habitatDelay').textContent =
+      `${habitat.run_elapsed_ms ?? 0} / ${habitat.lss2_detection_delay_ms ?? 0} ms (${habitat.lss2_detection_remaining_ms ?? 0} ms remaining)`;
+    qs('habitatTimeout').textContent =
+      `${habitat.run_elapsed_ms ?? 0} / ${habitat.run_timeout_ms ?? 0} ms (${habitat.timeout_remaining_ms ?? 0} ms remaining)`;
+    qs('habitatReverse').textContent =
+      `${habitat.reverse_elapsed_ms ?? 0} / ${habitat.reverse_duration_ms ?? 0} ms at duty ${Number(habitat.reverse_duty ?? 0).toFixed(3)} · active=${yn(habitat.reversing)}`;
+    qs('habitatFollowing').textContent = yn(habitat.line_following);
+    qs('habitatFollowing').className =
+      habitat.line_following ? 'mono good' : 'mono muted';
+    const placement = j.habitat_placement || {};
+    loadPlacementControls(j);
+    qs('placementConfig').textContent = placement.configuration_valid
+      ? 'valid' : 'incomplete / locked';
+    qs('placementConfig').className =
+      placement.configuration_valid ? 'mono good' : 'mono bad';
+    qs('placementReady').textContent = yn(placement.start_ready);
+    qs('placementReady').className =
+      placement.start_ready ? 'mono good' : 'mono bad';
+    qs('placementState').textContent = placement.state || 'WAIT_FOR_START';
+    qs('placementFault').textContent = placement.fault_reason || 'NONE';
+    qs('placementFault').className =
+      placement.fault_reason === 'NONE' ? 'mono good' : 'mono bad';
+    qs('placementTime').textContent =
+      `${placement.time_in_state_ms ?? 0} ms`;
+    qs('placementCcwSaved').textContent =
+      placement.counter_clockwise_heading_captured
+        ? `${Number(placement.counter_clockwise_start_heading_deg ?? 0).toFixed(2)}\u00b0 / ${Number(placement.counter_clockwise_target_heading_deg ?? 0).toFixed(2)}\u00b0`
+        : 'not captured';
     const imu = j.imu || {};
     const hexByte = value =>
       `0x${Number(value ?? 0).toString(16).toUpperCase().padStart(2, '0')}`;
@@ -5311,6 +8908,20 @@ function update(){
       `${imu.healthy ? 'healthy' : 'unhealthy'} / ${imu.data_fresh ? 'fresh' : 'stale'}`;
     qs('imuHealth').className =
       imu.healthy && imu.data_fresh ? 'mono good' : 'mono bad';
+    const disconnectReason = imu.disconnect_reason || 'UNKNOWN';
+    qs('imuDisconnectReason').textContent = disconnectReason;
+    qs('imuDisconnectReason').className =
+      disconnectReason === 'NONE' ? 'mono good' : 'mono bad';
+    const lastDisconnectReason = imu.last_disconnect_reason || 'NONE';
+    qs('imuLastDisconnect').textContent =
+      `${lastDisconnectReason} · count ${imu.disconnect_count ?? 0} · at ${imu.last_disconnect_at_ms ?? 0} ms`;
+    qs('imuLastDisconnect').className =
+      lastDisconnectReason === 'NONE' ? 'mono muted' : 'mono bad';
+    const lastReadFailure = imu.last_read_failure_reason || 'NONE';
+    qs('imuLastReadFailure').textContent =
+      `${lastReadFailure} · at ${imu.last_read_failure_us ?? 0} µs`;
+    qs('imuLastReadFailure').className =
+      lastReadFailure === 'NONE' ? 'mono good' : 'mono bad';
     qs('imuInitializationError').textContent =
       imu.initialization_error || 'UNKNOWN';
     qs('imuInitializationError').className =
@@ -5320,6 +8931,10 @@ function update(){
     qs('imuDeviceAck').textContent = yn(imu.device_acknowledged);
     qs('imuDeviceAck').className =
       imu.device_acknowledged ? 'mono good' : 'mono bad';
+    qs('imuRuntimeConfig').textContent =
+      imu.runtime_configuration_valid ? 'verified' : 'not verified / lost';
+    qs('imuRuntimeConfig').className =
+      imu.runtime_configuration_valid ? 'mono good' : 'mono bad';
     qs('imuReadMode').textContent =
       imu.register_reads_use_repeated_start ? 'repeated start' : 'stop / start';
     const wireStatus = imu.last_wire_status ?? -1;
@@ -5351,6 +8966,43 @@ function update(){
       `${imu.successful_read_count ?? 0} / ${imu.failed_read_count ?? 0}`;
     qs('imuConsecutiveFailures').textContent =
       imu.consecutive_failed_reads ?? 0;
+    const imuTiming = imu.acquisition_timing || {};
+    qs('imuLoopTiming').textContent =
+      `${imuTiming.loop_interval_us ?? 0} / ${imuTiming.maximum_loop_interval_us ?? 0} µs`;
+    qs('imuSyncTiming').textContent =
+      `${imuTiming.synchronization_duration_us ?? 0} / ${imuTiming.maximum_synchronization_duration_us ?? 0} µs`;
+    qs('imuLockTiming').textContent =
+      `${imuTiming.wire_lock_acquire_duration_us ?? 0} / ${imuTiming.maximum_wire_lock_acquire_duration_us ?? 0} µs`;
+    qs('imuReadTiming').textContent =
+      `${imuTiming.measurement_read_duration_us ?? 0} / ${imuTiming.maximum_measurement_read_duration_us ?? 0} µs`;
+    qs('imuPublishTiming').textContent =
+      `${imuTiming.successful_read_to_publication_us ?? 0} / ${imuTiming.maximum_successful_read_to_publication_us ?? 0} µs`;
+    qs('imuPublishQueueTiming').textContent =
+      `${imuTiming.publication_queue_duration_us ?? 0} / ${imuTiming.maximum_publication_queue_duration_us ?? 0} µs`;
+    qs('imuPublicationGap').textContent =
+      `${imuTiming.successful_sample_publication_gap_us ?? 0} / ${imuTiming.maximum_successful_sample_publication_gap_us ?? 0} µs`;
+    qs('imuObservedPublicationGap').textContent =
+      `${imuTiming.current_observed_publication_gap_us ?? 0} / ${imuTiming.maximum_observed_publication_gap_us ?? 0} µs`;
+    qs('imuPublicationSequence').textContent =
+      `${imuTiming.publication_sequence ?? 0} / ${imuTiming.successful_sample_sequence ?? 0}`;
+    qs('imuDelayedIterations').textContent =
+      imuTiming.delayed_iteration_count ?? 0;
+    const imuRecovery = j.imu_recovery || {};
+    const turnRecoveryPaused = imuRecovery.turn_paused === true;
+    const strafeRecoveryPaused = imuRecovery.strafe_paused === true;
+    qs('imuRecoveryState').textContent =
+      turnRecoveryPaused ? 'TURN PAUSED — wheels disabled' :
+      (strafeRecoveryPaused ? 'STRAFE PAUSED — wheels disabled' : 'ready');
+    qs('imuRecoveryState').className =
+      turnRecoveryPaused || strafeRecoveryPaused ? 'mono bad' : 'mono good';
+    qs('imuRecoveryHeadings').textContent =
+      `${Number(imuRecovery.turn_saved_heading_deg ?? 0).toFixed(2)}° / ${Number(imuRecovery.strafe_saved_heading_deg ?? 0).toFixed(2)}°`;
+    qs('imuRecoveryConfirmations').textContent =
+      `${imuRecovery.turn_consecutive_fresh_samples ?? 0} / ${imuRecovery.strafe_consecutive_fresh_samples ?? 0} of ${imuRecovery.consecutive_fresh_samples_required ?? 0}`;
+    qs('imuRecoveryTimes').textContent =
+      `${imuRecovery.turn_pause_elapsed_ms ?? 0} ms / ${imuRecovery.strafe_pause_elapsed_ms ?? 0} ms (limit ${imuRecovery.maximum_pause_ms ?? 0} ms)`;
+    qs('imuRecoveryCounts').textContent =
+      `${imuRecovery.turn_pause_count ?? 0} turn / ${imuRecovery.strafe_pause_count ?? 0} strafe; ${imuRecovery.total_paused_ms ?? 0} ms`;
     const imuTurn = j.imu_turn || {};
     loadImuTurnControls(j);
     qs('imuTurnConfigValid').textContent =
@@ -5363,6 +9015,30 @@ function update(){
       imuTurn.fault_reason || 'NONE';
     qs('imuTurnFault').className =
       (imuTurn.fault_reason || 'NONE') === 'NONE' ? 'mono good' : 'mono bad';
+    const turnAvailability = imuTurn.availability_fault || {};
+    const availabilityCaptured = turnAvailability.capture_valid === true;
+    const availabilityLatched = turnAvailability.latched === true;
+    const imuAvailableNow = turnAvailability.imu_currently_available === true;
+    qs('imuTurnFaultTiming').textContent =
+      !availabilityCaptured ? 'no IMU availability fault captured' :
+      `${availabilityLatched ? 'LATCHED' : 'historical'} at ${turnAvailability.evaluated_at_ms ?? 0} ms · IMU currently ${imuAvailableNow ? 'AVAILABLE' : 'UNAVAILABLE'} · ${turnAvailability.origin || 'UNKNOWN'} / ${turnAvailability.reason || 'UNKNOWN'}`;
+    qs('imuTurnFaultTiming').className =
+      availabilityLatched ? 'mono bad' : 'mono muted';
+    qs('imuTurnAvailabilityGate').textContent =
+      !availabilityCaptured ? '—' :
+      `configured=${yn(turnAvailability.configured)} initialized=${yn(turnAvailability.initialized)} calibrated=${yn(turnAvailability.calibrated)} healthy=${yn(turnAvailability.healthy)} sample_valid=${yn(turnAvailability.sample_valid)} fresh=${yn(turnAvailability.data_fresh)} acquisition_running=${yn(turnAvailability.acquisition_running)} shared_snapshot=${yn(turnAvailability.shared_snapshot_available)}`;
+    qs('imuTurnAvailabilityTimes').textContent =
+      !availabilityCaptured ? '—' :
+      `evaluated_us=${turnAvailability.evaluated_at_us ?? 0} published_us=${turnAvailability.published_at_us ?? 0} last_success_us=${turnAvailability.last_successful_read_us ?? 0} sample_age_us=${turnAvailability.sample_age_us ?? 0} snapshot_age_us=${turnAvailability.snapshot_age_us ?? 0} timeout_us=${turnAvailability.freshness_timeout_us ?? 0}`;
+    qs('imuTurnPublicationGap').textContent =
+      !availabilityCaptured ? '—' :
+      `completed=${turnAvailability.successful_sample_publication_gap_us ?? 0} max_completed=${turnAvailability.maximum_successful_sample_publication_gap_us ?? 0} open_at_fault=${turnAvailability.current_observed_publication_gap_us ?? 0} max_observed=${turnAvailability.maximum_observed_publication_gap_us ?? 0} µs`;
+    qs('imuTurnSnapshotIdentity').textContent =
+      !availabilityCaptured ? '—' :
+      `cached_seq=${turnAvailability.cached_snapshot_sequence ?? 0}/${turnAvailability.cached_successful_sample_sequence ?? 0} newest_available=${yn(turnAvailability.newest_snapshot_available)} newest_seq=${turnAvailability.newest_snapshot_sequence ?? 0}/${turnAvailability.newest_successful_sample_sequence ?? 0} match=${yn(turnAvailability.cached_snapshot_matches_newest)} fetched_at_us=${turnAvailability.cached_snapshot_fetched_at_us ?? 0} fetch_to_gate_us=${turnAvailability.cached_snapshot_fetch_to_gate_us ?? 0}`;
+    qs('imuTurnAvailabilityLink').textContent =
+      !availabilityCaptured ? '—' :
+      `front_left=${yn(turnAvailability.front_left_configured)} front_right=${yn(turnAvailability.front_right_configured)} rear_link=${yn(turnAvailability.rear_link_configured)} rear_status_available=${yn(turnAvailability.rear_status_available)} rear_status_fresh=${yn(turnAvailability.rear_status_fresh)} rear_last_ms=${turnAvailability.rear_last_status_received_at_ms ?? 0} rear_age_ms=${turnAvailability.rear_status_age_ms ?? 0}`;
     qs('imuTurnCurrentAngle').textContent =
       `${Number(imuTurn.current_heading_deg ?? 0).toFixed(2)}°`;
     qs('imuTurnHeadings').textContent =
@@ -5375,6 +9051,33 @@ function update(){
       Number(imuTurn.rotation_command ?? 0).toFixed(4);
     qs('imuTurnTime').textContent =
       `${imuTurn.elapsed_ms ?? 0} ms / ${imuTurn.settling_elapsed_ms ?? 0} ms`;
+    const imuStrafe = j.imu_heading_hold || {};
+    loadImuStrafeControls(j);
+    qs('imuStrafeConfigValid').textContent =
+      imuStrafe.configuration_valid ? 'valid' : 'incomplete / locked';
+    qs('imuStrafeConfigValid').className =
+      imuStrafe.configuration_valid ? 'mono good' : 'mono bad';
+    qs('imuStrafeState').textContent =
+      `${imuStrafe.state || 'IDLE'} active=${yn(imuStrafe.active)}`;
+    qs('imuStrafeFault').textContent =
+      imuStrafe.fault_reason || 'NONE';
+    qs('imuStrafeFault').className =
+      (imuStrafe.fault_reason || 'NONE') === 'NONE'
+        ? 'mono good' : 'mono bad';
+    const imuStrafeDirection = Number(imuStrafe.lateral_direction ?? 0);
+    qs('imuStrafeDirection').textContent =
+      imuStrafeDirection < 0 ? 'left' :
+      (imuStrafeDirection > 0 ? 'right' : 'none');
+    qs('imuStrafeHeadings').textContent =
+      `${Number(imuStrafe.current_heading_deg ?? 0).toFixed(2)}° / ${Number(imuStrafe.target_heading_deg ?? 0).toFixed(2)}°`;
+    qs('imuStrafeErrorRate').textContent =
+      `${Number(imuStrafe.angle_error_deg ?? 0).toFixed(2)}° / ${Number(imuStrafe.yaw_rate_dps ?? 0).toFixed(2)} °/s`;
+    qs('imuStrafeTerms').textContent =
+      `${Number(imuStrafe.proportional_term ?? 0).toFixed(4)} / ${Number(imuStrafe.damping_term ?? 0).toFixed(4)}`;
+    qs('imuStrafeOutput').textContent =
+      Number(imuStrafe.yaw_correction_duty ?? 0).toFixed(4);
+    qs('imuStrafeElapsed').textContent =
+      `${imuStrafe.elapsed_ms ?? 0} ms`;
     const a = j.autonomous || {};
     qs('autoState').textContent = a.state || j.autonomous_state || 'WAIT_FOR_START';
     qs('autoFault').textContent = a.fault_reason || 'NONE';
@@ -5399,9 +9102,11 @@ function update(){
     qs('solarPostContactForward').textContent = `${a.post_contact_forward_duration_ms ?? 0} ms`;
     qs('solarPostContactForwardDutyStatus').textContent = a.post_contact_forward_duty ?? 0;
     qs('solarLineReacquireDutyStatus').textContent = a.line_reacquire_strafe_duty ?? 0;
+    qs('solarRearLineFollowDuration').textContent = `${a.rear_line_follow_duration_ms ?? 0} ms`;
     qs('solarPostContactForwardDelay').textContent = `${a.post_contact_forward_start_delay_ms ?? 0} ms`;
     qs('solarPostForwardStrafeDelay').textContent = `${a.line_reacquire_strafe_start_delay_ms ?? 0} ms`;
     const tower = j.tower_pieces || {};
+    const towerLine = j.tower_line_control || {};
     qs('towerState').textContent = tower.state || 'WAIT_FOR_START';
     qs('towerFault').textContent = tower.fault_reason || 'NONE';
     qs('towerFault').className = tower.fault_reason && tower.fault_reason !== 'NONE' ? 'mono bad' : 'mono good';
@@ -5411,6 +9116,8 @@ function update(){
     qs('towerSideSensor').className = tower.side_line_sensor_configured ? 'mono good' : 'mono bad';
     qs('towerSideCount').textContent = `${tower.side_line_count ?? 0} / ${tower.target_side_line_count ?? 2}`;
     qs('towerSideCount').className = (tower.side_line_count ?? 0) >= (tower.target_side_line_count ?? 2) ? 'mono good' : 'mono';
+    qs('towerCrossingGate').textContent =
+      `armed=${yn(towerLine.side_line_armed)} accepted=${yn(towerLine.detection_accepted)} rejected=${yn(towerLine.detection_rejected)} count=${towerLine.crossing_count ?? 0} rejectedTotal=${towerLine.rejected_detection_count ?? 0}`;
     qs('towerBackLineDetected').textContent = yn(tower.back_line_detected);
     qs('towerBackLineDetected').className = tower.back_line_detected ? 'mono good' : 'mono';
     qs('towerOutput').textContent = tower.final_reverse_active ? 'final backward' : (tower.stepper_moving_down ? 'stepper down' : (tower.stepper_moving_up ? 'stepper up' : (tower.line_following ? 'line following' : (tower.strafing_right ? 'strafe right' : (tower.rotating_clockwise ? 'clockwise' : (tower.driving_backward ? 'backward' : (tower.shimmying_left ? 'shimmy left' : (tower.shimmying_right ? 'shimmy right' : 'stopped'))))))));
@@ -5421,7 +9128,7 @@ function update(){
     qs('pegFinderTime').textContent = `${pegFinder.time_in_state_ms ?? 0} ms`;
     qs('pegFinderFunnelLimit').textContent = `${level(pegFinder.funnel_limit_high)} ${pegFinder.funnel_limit_high ? 'PRESSED' : 'released'} configured=${yn(pegFinder.funnel_limit_configured)}`;
     qs('pegFinderFunnelLimit').className = pegFinder.funnel_limit_configured ? (pegFinder.funnel_limit_high ? 'mono good' : 'mono') : 'mono bad';
-    qs('pegFinderOutput').textContent = pegFinder.rotating_clockwise ? 'clockwise' : (pegFinder.driving_backward ? 'backward' : (pegFinder.driving_forward ? 'forward' : (pegFinder.funnel_forward ? 'funnel forward' : (pegFinder.opening_claw_1 ? 'opening claw 1' : (pegFinder.opening_claw_2 ? 'opening claw 2' : (pegFinder.opening_claw_3 ? 'opening claw 3' : 'stopped'))))));
+    qs('pegFinderOutput').textContent = pegFinder.rotating_clockwise ? 'clockwise' : (pegFinder.driving_backward ? 'backward' : (pegFinder.driving_forward ? 'forward' : (pegFinder.funnel_forward ? 'funnel forward' : (pegFinder.funnel_reverse ? 'funnel reverse' : (pegFinder.opening_claw_1 ? 'opening claw 1' : (pegFinder.opening_claw_2 ? 'opening claw 2' : (pegFinder.opening_claw_3 ? 'opening claw 3' : 'stopped')))))));
     const timeTrial = j.time_trial || {};
     qs('timeTrialState').textContent = timeTrial.state || 'WAIT_FOR_START';
     qs('timeTrialTime').textContent = `${timeTrial.time_in_state_ms ?? 0} ms`;
@@ -5433,10 +9140,13 @@ function update(){
     loadLfControls(j);
     loadRlfControls(j);
     loadClawControls(j);
+    loadSolarHookControls(j);
     qs('lfEnabled').textContent = yn(j.line.line_follower_enabled);
     qs('lsfl').textContent = `${j.line.lsfl_level} black=${yn(j.line.lsfl_black)}`;
     qs('lsfr').textContent = `${j.line.lsfr_level} black=${yn(j.line.lsfr_black)}`;
     qs('lss').textContent = `${j.line.lss_level} black=${yn(j.line.lss_black)} configured=${yn(j.line.lss_configured)}`;
+    qs('lss2').textContent = `${j.line.lss2_level} black=${yn(j.line.lss2_black)} configured=${yn(j.line.lss2_configured)}`;
+    qs('lss3').textContent = `${j.line.lss3_level} black=${yn(j.line.lss3_black)} configured=${yn(j.line.lss3_configured)}`;
     qs('lfError').textContent = `${j.line.line_error}, side=${j.line.last_known_line_side}, visible=${yn(j.line.line_visible)}, hist=${yn(j.line.has_history)}`;
     const rearLine = j.rear_line || {};
     qs('rlfEnabled').textContent = yn(rearLine.line_follower_enabled);
@@ -5465,10 +9175,26 @@ function update(){
     const clawList = [claws.claw_1, claws.claw_2, claws.claw_3];
     qs('clawHardware').textContent = clawList.map(c => yn(c && c.hardwareConfigured)).join(' / ');
     qs('clawCommanded').textContent = clawList.map(clawSummary).join(' | ');
-    qs('winchHardware').textContent = yn(claws.winch && claws.winch.hardwareConfigured);
+    qs('winchHardware').textContent = servoHardwareSummary(claws.winch);
     qs('winchHardware').className = claws.winch && claws.winch.hardwareConfigured ? 'mono good' : 'mono bad';
     qs('winchCommanded').textContent = clawSummary(claws.winch);
+    qs('pusherHardware').textContent = servoHardwareSummary(claws.habitat_pusher);
+    qs('pusherHardware').className = claws.habitat_pusher && claws.habitat_pusher.hardwareConfigured ? 'mono good' : 'mono bad';
+    qs('pusherCommanded').textContent = clawSummary(claws.habitat_pusher);
     qs('claws').textContent = JSON.stringify(claws, null, 2);
+    const solarHook = j.solar_hook || {};
+    qs('solarHookHardware').textContent =
+      yn(solarHook.hardwareConfigured);
+    qs('solarHookHardware').className =
+      solarHook.hardwareConfigured ? 'mono good' : 'mono bad';
+    qs('solarHookOutput').textContent =
+      solarHook.outputEnabled
+        ? `enabled at ${solarHook.commandedAngleDeg ?? 'unknown'}°`
+        : 'disabled';
+    qs('solarHookOutput').className =
+      solarHook.outputEnabled ? 'mono good' : 'mono muted';
+    qs('solarHookCommandStatus').textContent =
+      `open=${solarHook.openConfigured ? solarHook.openAngleDeg : 'unset'}° closed=${solarHook.closedConfigured ? solarHook.closedAngleDeg : 'unset'}° last=${solarHook.commandedOpen ? 'open' : 'closed/off'}`;
   }).catch(() => { qs('fault').textContent = 'telemetry disconnected'; qs('fault').className = 'mono bad'; });
   fetch('/api/events').then(r => r.json()).then(j => { qs('events').textContent = JSON.stringify(j.events, null, 2); });
 }
@@ -5622,10 +9348,13 @@ void handleMode() {
                    *g_runtime.front_right, *g_runtime.rear_link, now_ms);
   g_runtime.context->modes.setMode(mode, now_ms);
   resetSolarPanelAutonomy(*g_runtime.context, now_ms);
+  resetHabitatPieces(*g_runtime.context, now_ms);
+  resetHabitatPlacement(*g_runtime.context, now_ms);
   resetTowerPieces(*g_runtime.context, now_ms);
   resetPegFinder(*g_runtime.context, now_ms);
   resetTimeTrial(*g_runtime.context, now_ms);
   resetImuTurn(*g_runtime.context);
+  resetImuHeadingHold(*g_runtime.context);
   clearFault(*g_runtime.context);
   logEvent(*g_runtime.context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Web, "mode changed");
@@ -5852,11 +9581,15 @@ void handleSensors() {
   const robot::TelemetrySnapshot snapshot = currentSnapshot();
   std::snprintf(g_json_buffer, sizeof(g_json_buffer),
                 "{\"lsfl_raw_level\":%d,\"lsfr_raw_level\":%d,"
-                "\"lss_raw_level\":%d,"
+                "\"lss_raw_level\":%d,\"lss2_raw_level\":%d,"
+                "\"lss3_raw_level\":%d,"
                 "\"lsfl_level\":\"%s\",\"lsfr_level\":\"%s\","
-                "\"lss_level\":\"%s\","
+                "\"lss_level\":\"%s\",\"lss2_level\":\"%s\","
+                "\"lss3_level\":\"%s\","
                 "\"lsfl_black\":%s,\"lsfr_black\":%s,"
                 "\"lss_black\":%s,\"lss_configured\":%s,"
+                "\"lss2_black\":%s,\"lss2_configured\":%s,"
+                "\"lss3_black\":%s,\"lss3_configured\":%s,"
                 "\"limit_switch_stepper_bottom\":%s,"
                 "\"limit_switch_stepper_middle\":%s,"
                 "\"limit_switch_stepper_top\":%s,"
@@ -5869,14 +9602,21 @@ void handleSensors() {
                 "\"solar_limit_front_right_hit\":%s,"
                 "\"solar_limit_all_hit\":%s}",
                 snapshot.lsfl_raw_level, snapshot.lsfr_raw_level,
-                snapshot.lss_raw_level,
+                snapshot.lss_raw_level, snapshot.lss2_raw_level,
+                snapshot.lss3_raw_level,
                 digitalLevelName(snapshot.lsfl_raw_level),
                 digitalLevelName(snapshot.lsfr_raw_level),
                 digitalLevelName(snapshot.lss_raw_level),
+                digitalLevelName(snapshot.lss2_raw_level),
+                digitalLevelName(snapshot.lss3_raw_level),
                 snapshot.lsfl_black ? "true" : "false",
                 snapshot.lsfr_black ? "true" : "false",
                 snapshot.lss_black ? "true" : "false",
                 snapshot.lss_configured ? "true" : "false",
+                snapshot.lss2_black ? "true" : "false",
+                snapshot.lss2_configured ? "true" : "false",
+                snapshot.lss3_black ? "true" : "false",
+                snapshot.lss3_configured ? "true" : "false",
                 snapshot.limit_switch_stepper_bottom ? "true" : "false",
                 snapshot.limit_switch_stepper_middle ? "true" : "false",
                 snapshot.limit_switch_stepper_top ? "true" : "false",
@@ -5895,22 +9635,33 @@ void handleSensors() {
 void handleLine() {
   const robot::TelemetrySnapshot snapshot = currentSnapshot();
   std::snprintf(g_json_buffer, sizeof(g_json_buffer),
-                "{\"LSFL\":%d,\"LSFR\":%d,\"LSS\":%d,"
+                "{\"LSFL\":%d,\"LSFR\":%d,\"LSS\":%d,\"LSS2\":%d,"
+                "\"LSS3\":%d,"
                 "\"LSFLLevel\":\"%s\",\"LSFRLevel\":\"%s\","
-                "\"LSSLevel\":\"%s\",\"leftBlack\":%s,"
+                "\"LSSLevel\":\"%s\",\"LSS2Level\":\"%s\","
+                "\"LSS3Level\":\"%s\",\"leftBlack\":%s,"
                 "\"rightBlack\":%s,\"sideBlack\":%s,"
-                "\"sideConfigured\":%s,\"error\":%d,"
+                "\"sideConfigured\":%s,\"side2Black\":%s,"
+                "\"side2Configured\":%s,\"side3Black\":%s,"
+                "\"side3Configured\":%s,\"error\":%d,"
                 "\"lastKnownSide\":%d,"
                 "\"lineVisible\":%s,\"hasHistory\":%s}",
                 snapshot.lsfl_raw_level, snapshot.lsfr_raw_level,
-                snapshot.lss_raw_level,
+                snapshot.lss_raw_level, snapshot.lss2_raw_level,
+                snapshot.lss3_raw_level,
                 digitalLevelName(snapshot.lsfl_raw_level),
                 digitalLevelName(snapshot.lsfr_raw_level),
                 digitalLevelName(snapshot.lss_raw_level),
+                digitalLevelName(snapshot.lss2_raw_level),
+                digitalLevelName(snapshot.lss3_raw_level),
                 snapshot.lsfl_black ? "true" : "false",
                 snapshot.lsfr_black ? "true" : "false",
                 snapshot.lss_black ? "true" : "false",
                 snapshot.lss_configured ? "true" : "false",
+                snapshot.lss2_black ? "true" : "false",
+                snapshot.lss2_configured ? "true" : "false",
+                snapshot.lss3_black ? "true" : "false",
+                snapshot.lss3_configured ? "true" : "false",
                 static_cast<int>(snapshot.line_error),
                 static_cast<int>(snapshot.last_known_line_side),
                 snapshot.line_visible ? "true" : "false",
@@ -5948,6 +9699,285 @@ void handleRearLine() {
       snapshot.rear_logical_left_black ? "true" : "false",
       snapshot.rear_logical_right_black ? "true" : "false");
   g_server.send(200, "application/json", g_json_buffer);
+}
+
+void handleHabitatPiecesStart() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  requestHabitatPiecesStart(*g_runtime.context, *g_runtime.front_left,
+                            *g_runtime.front_right, *g_runtime.rear_link,
+                            now_ms, robot::EventSource::Web);
+  sendOkJson("Habitat Pieces start requested");
+}
+
+void handleHabitatPiecesStop() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  disableActuators(*g_runtime.context, *g_runtime.front_left,
+                   *g_runtime.front_right, *g_runtime.rear_link, now_ms);
+  resetHabitatPieces(*g_runtime.context, now_ms);
+  resetHabitatPlacement(*g_runtime.context, now_ms);
+  clearFault(*g_runtime.context);
+  logEvent(*g_runtime.context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web, "Habitat Pieces stopped");
+  sendOkJson("Habitat Pieces stopped");
+}
+
+void handleHabitatPiecesConfig() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  if (context.habitat_pieces.state ==
+          robot::HabitatPiecesState::LineFollowing ||
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::Reversing) {
+    sendErrorJson(409, "stop Habitat Pieces before changing its config");
+    return;
+  }
+
+  robot::HabitatPiecesConfig next = context.habitat_pieces_config;
+  float duty = next.line_follow_duty;
+  float reverse_duty = next.reverse_duty;
+  robot::Milliseconds value = 0U;
+  if (g_server.hasArg("duty") &&
+      !argFloat("duty", duty, next.line_follow_duty, true)) {
+    sendErrorJson(400, "malformed duty");
+    return;
+  }
+  next.line_follow_duty = duty;
+  if (g_server.hasArg("lss2-detection-delay-ms")) {
+    if (!argUnsigned("lss2-detection-delay-ms", value,
+                     next.lss2_detection_delay_ms, true)) {
+      sendErrorJson(400, "malformed lss2-detection-delay-ms");
+      return;
+    }
+    next.lss2_detection_delay_ms = value;
+  }
+  if (g_server.hasArg("run-timeout-ms")) {
+    if (!argUnsigned("run-timeout-ms", value, next.run_timeout_ms,
+                     true)) {
+      sendErrorJson(400, "malformed run-timeout-ms");
+      return;
+    }
+    next.run_timeout_ms = value;
+  }
+  if (g_server.hasArg("reverse-duty") &&
+      !argFloat("reverse-duty", reverse_duty, next.reverse_duty, true)) {
+    sendErrorJson(400, "malformed reverse-duty");
+    return;
+  }
+  next.reverse_duty = reverse_duty;
+  if (g_server.hasArg("reverse-duration-ms")) {
+    if (!argUnsigned("reverse-duration-ms", value,
+                     next.reverse_duration_ms, true)) {
+      sendErrorJson(400, "malformed reverse-duration-ms");
+      return;
+    }
+    next.reverse_duration_ms = value;
+  }
+
+  robot::LineFollowerConfig line_config = context.config;
+  line_config.baseDuty = next.line_follow_duty;
+  if (!robot::habitatPiecesConfigValid(next,
+                                       activeMotionDutyCap(context)) ||
+      !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
+           .accepted) {
+    sendErrorJson(
+        409,
+        "Habitat Pieces requires line-follow and reverse duties within the active cap, a nonzero LSS2 detection delay, a search timeout longer than that delay, and a nonzero reverse duration");
+    return;
+  }
+
+  context.habitat_pieces_config = next;
+  resetHabitatPieces(context,
+                     static_cast<robot::Milliseconds>(millis()));
+  clearFault(context);
+  logEvent(context, static_cast<robot::Milliseconds>(millis()),
+           robot::EventSeverity::Info, robot::EventSource::Web,
+           "Habitat Pieces config updated");
+  sendOkJson("Habitat Pieces config updated");
+}
+
+void handleHabitatPlacementStart() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  requestHabitatPlacementStart(
+      *g_runtime.context, *g_runtime.front_left, *g_runtime.front_right,
+      *g_runtime.rear_link, now_ms, robot::EventSource::Web);
+  sendOkJson("Habitat Placement start requested");
+}
+
+void handleHabitatPlacementStop() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  disableActuators(*g_runtime.context, *g_runtime.front_left,
+                   *g_runtime.front_right, *g_runtime.rear_link, now_ms);
+  g_runtime.stepper->stop();
+  resetHabitatPlacement(*g_runtime.context, now_ms);
+  clearFault(*g_runtime.context);
+  logEvent(*g_runtime.context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web, "Habitat Placement stopped");
+  sendOkJson("Habitat Placement stopped");
+}
+
+void handleHabitatPlacementConfig() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  const robot::HabitatPlacementState state =
+      context.habitat_placement.state;
+  if (state != robot::HabitatPlacementState::WaitForStart &&
+      state != robot::HabitatPlacementState::Complete &&
+      state != robot::HabitatPlacementState::Fault) {
+    sendErrorJson(409,
+                  "stop Habitat Placement before changing its config");
+    return;
+  }
+
+  robot::HabitatPlacementConfig next =
+      context.habitat_placement_config;
+  const auto readFloat = [](const char* name, float& field) {
+    if (!g_server.hasArg(name)) {
+      return true;
+    }
+    float value = field;
+    if (!argFloat(name, value, field, true)) {
+      return false;
+    }
+    field = value;
+    return true;
+  };
+  const auto readMilliseconds = [](const char* name,
+                                   robot::Milliseconds& field) {
+    if (!g_server.hasArg(name)) {
+      return true;
+    }
+    robot::Milliseconds value = field;
+    if (!argUnsigned(name, value, field, true)) {
+      return false;
+    }
+    field = value;
+    return true;
+  };
+  const auto readSpeed = [](const char* name, std::uint32_t& field) {
+    if (!g_server.hasArg(name)) {
+      return true;
+    }
+    robot::Milliseconds value = field;
+    if (!argUnsigned(name, value, field, true)) {
+      return false;
+    }
+    field = value;
+    return true;
+  };
+
+  if (!readFloat("reverse-line-duty", next.reverse_line_follow_duty) ||
+      !readMilliseconds("lss1-timeout-ms", next.lss1_timeout_ms) ||
+      !readMilliseconds("post-lss1-delay-ms",
+                        next.post_lss1_delay_ms) ||
+      !readFloat("ccw-angle-deg", next.counter_clockwise_angle_deg) ||
+      !readMilliseconds("ccw-timeout-ms",
+                        next.counter_clockwise_timeout_ms) ||
+      !readFloat("forward-to-slide-duty",
+                 next.forward_to_slide_duty) ||
+      !readMilliseconds("forward-to-slide-ms",
+                        next.forward_to_slide_duration_ms) ||
+      !readSpeed("stepper-down-speed",
+                 next.stepper_down_speed_steps_per_second) ||
+      !readMilliseconds("stepper-down-timeout-ms",
+                        next.stepper_down_timeout_ms) ||
+      !readMilliseconds("pusher-open-settle-ms",
+                        next.pusher_open_settle_ms) ||
+      !readFloat("push-forward-duty", next.push_forward_duty) ||
+      !readMilliseconds("push-forward-ms",
+                        next.push_forward_duration_ms) ||
+      !readFloat("reverse-retreat-duty",
+                 next.reverse_retreat_duty) ||
+      !readMilliseconds("reverse-retreat-ms",
+                        next.reverse_retreat_duration_ms) ||
+      !readFloat("cw-angle-deg", next.clockwise_angle_deg) ||
+      !readMilliseconds("cw-timeout-ms", next.clockwise_timeout_ms) ||
+      !readFloat("post-cw-reverse-duty",
+                 next.post_clockwise_reverse_duty) ||
+      !readMilliseconds("post-cw-reverse-ms",
+                        next.post_clockwise_reverse_duration_ms) ||
+      !readFloat("post-cw-strafe-left-duty",
+                 next.post_clockwise_strafe_left_duty) ||
+      !readMilliseconds(
+          "post-cw-strafe-left-ms",
+          next.post_clockwise_strafe_left_duration_ms) ||
+      !readMilliseconds("post-cw-delay-ms",
+                        next.post_clockwise_delay_ms) ||
+      !readFloat("exit-forward-duty", next.exit_forward_duty) ||
+      !readMilliseconds("exit-forward-ms",
+                        next.exit_forward_duration_ms) ||
+      !readMilliseconds("post-forward-delay-ms",
+                        next.post_forward_delay_ms) ||
+      !readFloat("strafe-right-duty", next.strafe_right_duty) ||
+      !readMilliseconds("strafe-right-timeout-ms",
+                        next.strafe_right_timeout_ms)) {
+    sendErrorJson(400, "malformed Habitat Placement config value");
+    return;
+  }
+
+  const bool timings_bounded =
+      next.lss1_timeout_ms <= kMaxTimedTestDurationMs &&
+      next.post_lss1_delay_ms <= kMaxTimedTestDurationMs &&
+      next.counter_clockwise_timeout_ms <= kMaxTimedTestDurationMs &&
+      next.forward_to_slide_duration_ms <= kMaxTimedTestDurationMs &&
+      next.stepper_down_timeout_ms <= kMaxTimedTestDurationMs &&
+      next.pusher_open_settle_ms <= kMaxTimedTestDurationMs &&
+      next.push_forward_duration_ms <= kMaxTimedTestDurationMs &&
+      next.reverse_retreat_duration_ms <= kMaxTimedTestDurationMs &&
+      next.clockwise_timeout_ms <= kMaxTimedTestDurationMs &&
+      next.post_clockwise_reverse_duration_ms <=
+          kMaxTimedTestDurationMs &&
+      next.post_clockwise_strafe_left_duration_ms <=
+          kMaxTimedTestDurationMs &&
+      next.post_clockwise_delay_ms <= kMaxTimedTestDurationMs &&
+      next.exit_forward_duration_ms <= kMaxTimedTestDurationMs &&
+      next.post_forward_delay_ms <= kMaxTimedTestDurationMs &&
+      next.strafe_right_timeout_ms <= kMaxTimedTestDurationMs;
+  robot::LineFollowerConfig line_config = context.rear_config;
+  line_config.baseDuty = next.reverse_line_follow_duty;
+  line_config = robot::makeReverseTravelLineFollowerConfig(line_config);
+  if (!timings_bounded ||
+      !robot::habitatPlacementConfigValid(
+          next, rearMotionDutyCap(context),
+          g_runtime.stepper->maximumSpeedStepsPerSecond()) ||
+      !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
+           .accepted) {
+    sendErrorJson(
+        409,
+        "Habitat Placement needs nonzero duties and durations (including after-CW reverse/left strafe), search/turn timeouts, positive turn angles, a valid slide speed, and every timing at or below 30000 ms");
+    return;
+  }
+
+  context.habitat_placement_config = next;
+  resetHabitatPlacement(
+      context, static_cast<robot::Milliseconds>(millis()));
+  clearFault(context);
+  sendOkJson("Habitat Placement config updated");
 }
 
 void handleAutonomousSolarStart() {
@@ -6083,6 +10113,42 @@ void handleAutonomousSolarConfig() {
     }
     next_contact.timeout_ms = milliseconds_value;
   }
+  if (g_server.hasArg("initial-strafe-duty") &&
+      !argFloat("initial-strafe-duty",
+                next_contact.initial_strafe_right_duty,
+                next_contact.initial_strafe_right_duty, true)) {
+    sendErrorJson(400, "malformed initial-strafe-duty");
+    return;
+  }
+  if (g_server.hasArg("retry-left-strafe-duty") &&
+      !argFloat("retry-left-strafe-duty",
+                next_contact.retry_strafe_left_duty,
+                next_contact.retry_strafe_left_duty, true)) {
+    sendErrorJson(400, "malformed retry-left-strafe-duty");
+    return;
+  }
+  if (g_server.hasArg("retry-right-strafe-duty") &&
+      !argFloat("retry-right-strafe-duty",
+                next_contact.retry_strafe_right_duty,
+                next_contact.retry_strafe_right_duty, true)) {
+    sendErrorJson(400, "malformed retry-right-strafe-duty");
+    return;
+  }
+  if (g_server.hasArg("line-reacquire-strafe-duty") &&
+      !argFloat("line-reacquire-strafe-duty",
+                next_contact.line_reacquire_strafe_duty,
+                next_contact.line_reacquire_strafe_duty, true)) {
+    sendErrorJson(400, "malformed line-reacquire-strafe-duty");
+    return;
+  }
+  if (g_server.hasArg("rear-line-follow-duration-ms")) {
+    if (!argUnsigned("rear-line-follow-duration-ms", milliseconds_value,
+                     next_contact.rear_line_follow_duration_ms, true)) {
+      sendErrorJson(400, "malformed rear-line-follow-duration-ms");
+      return;
+    }
+    next_contact.rear_line_follow_duration_ms = milliseconds_value;
+  }
   if (g_server.hasArg("strafe-delay-ms")) {
     if (!argUnsigned("strafe-delay-ms", milliseconds_value,
                      next_contact.strafe_start_delay_ms, true)) {
@@ -6091,13 +10157,17 @@ void handleAutonomousSolarConfig() {
     }
     next_contact.strafe_start_delay_ms = milliseconds_value;
   }
-  if (g_server.hasArg("strafe-duty")) {
-    if (!argFloat("strafe-duty", float_value, next_contact.strafe_duty,
-                  true)) {
-      sendErrorJson(400, "malformed strafe-duty");
+  const char* retry_forward_duty_arg =
+      g_server.hasArg("retry-forward-duty")
+          ? "retry-forward-duty"
+          : (g_server.hasArg("strafe-duty") ? "strafe-duty" : nullptr);
+  if (retry_forward_duty_arg != nullptr) {
+    if (!argFloat(retry_forward_duty_arg, float_value,
+                  next_contact.retry_forward_duty, true)) {
+      sendErrorJson(400, "malformed retry-forward-duty");
       return;
     }
-    next_contact.strafe_duty = float_value;
+    next_contact.retry_forward_duty = float_value;
   }
   if (g_server.hasArg("retry-left-ms")) {
     if (!argUnsigned("retry-left-ms", milliseconds_value,
@@ -6139,14 +10209,6 @@ void handleAutonomousSolarConfig() {
     }
     next_contact.post_contact_forward_duty = float_value;
   }
-  if (g_server.hasArg("line-reacquire-duty")) {
-    if (!argFloat("line-reacquire-duty", float_value,
-                  next_contact.line_reacquire_strafe_duty, true)) {
-      sendErrorJson(400, "malformed line-reacquire-duty");
-      return;
-    }
-    next_contact.line_reacquire_strafe_duty = float_value;
-  }
   if (g_server.hasArg("post-contact-forward-delay-ms")) {
     if (!argUnsigned(
             "post-contact-forward-delay-ms", milliseconds_value,
@@ -6176,7 +10238,15 @@ void handleAutonomousSolarConfig() {
       !robot::solarPanelAutonomyConfigValid(validate_1khz) ||
       !robot::solarPanelAutonomyConfigValid(validate_10khz) ||
       !solarSpeedConfigValid(next_speed) ||
-      !robot::solarPanelContactConfigValid(next_contact)) {
+      !robot::solarPanelContactConfigValid(next_contact) ||
+      !autonomousStrafeDutyValid(
+          context, next_contact.initial_strafe_right_duty) ||
+      !autonomousStrafeDutyValid(
+          context, next_contact.retry_strafe_left_duty) ||
+      !autonomousStrafeDutyValid(
+          context, next_contact.retry_strafe_right_duty) ||
+      !autonomousStrafeDutyValid(
+          context, next_contact.line_reacquire_strafe_duty)) {
     sendErrorJson(409,
                   "solar config requires release <= detect, alpha [0,1), contact timeouts > 0, duties [0,1]");
     return;
@@ -6215,23 +10285,30 @@ void handleTowerPiecesConfig() {
   }
 
   RuntimeContext& context = *g_runtime.context;
+  if (context.tower_pieces.state ==
+          robot::TowerPiecesState::RotateClockwise &&
+      robot::imuTurnActive(context.imu_turn_state)) {
+    sendErrorJson(
+        409, "stop the active Tower Pieces IMU turn before changing its angle");
+    return;
+  }
   robot::TowerPiecesConfig next = context.tower_pieces_config;
   float duty = next.reverse_line_duty;
   robot::Milliseconds timeout_ms = next.side_line_timeout_ms;
+  robot::Milliseconds side_line_cooldown_ms =
+      next.side_line_cooldown_ms;
+  robot::Milliseconds side_line_rearm_ms = next.side_line_rearm_ms;
   robot::Milliseconds post_line_delay_ms = next.post_line_delay_ms;
-  float strafe_duty = next.strafe_right_duty;
   robot::Milliseconds strafe_duration_ms =
       next.strafe_right_duration_ms;
   robot::Milliseconds post_strafe_pause_ms =
       next.post_strafe_pause_ms;
-  float rotation_duty = next.clockwise_rotation_duty;
-  robot::Milliseconds rotation_duration_ms =
-      next.clockwise_rotation_duration_ms;
+  float rotation_angle_deg =
+      next.clockwise_rotation_angle_deg;
   robot::Milliseconds post_rotation_pause_ms =
       next.post_rotation_pause_ms;
   float reverse_duty = next.reverse_duty;
   robot::Milliseconds reverse_duration_ms = next.reverse_duration_ms;
-  float shimmy_duty = next.shimmy_duty;
   robot::Milliseconds shimmy_right_ms = next.shimmy_right_duration_ms;
   robot::Milliseconds shimmy_left_ms = next.shimmy_left_duration_ms;
   robot::Milliseconds shimmy_timeout_ms = next.shimmy_timeout_ms;
@@ -6246,16 +10323,22 @@ void handleTowerPiecesConfig() {
     sendErrorJson(400, "malformed timeout-ms");
     return;
   }
+  if (g_server.hasArg("side-line-cooldown-ms") &&
+      !argUnsigned("side-line-cooldown-ms", side_line_cooldown_ms,
+                   next.side_line_cooldown_ms, true)) {
+    sendErrorJson(400, "malformed side-line-cooldown-ms");
+    return;
+  }
+  if (g_server.hasArg("side-line-rearm-ms") &&
+      !argUnsigned("side-line-rearm-ms", side_line_rearm_ms,
+                   next.side_line_rearm_ms, true)) {
+    sendErrorJson(400, "malformed side-line-rearm-ms");
+    return;
+  }
   if (g_server.hasArg("post-line-delay-ms") &&
       !argUnsigned("post-line-delay-ms", post_line_delay_ms,
                    next.post_line_delay_ms, true)) {
     sendErrorJson(400, "malformed post-line-delay-ms");
-    return;
-  }
-  if (g_server.hasArg("strafe-duty") &&
-      !argFloat("strafe-duty", strafe_duty,
-                next.strafe_right_duty, true)) {
-    sendErrorJson(400, "malformed strafe-duty");
     return;
   }
   if (g_server.hasArg("strafe-duration-ms") &&
@@ -6264,22 +10347,22 @@ void handleTowerPiecesConfig() {
     sendErrorJson(400, "malformed strafe-duration-ms");
     return;
   }
+  if (g_server.hasArg("strafe-duty") &&
+      !argFloat("strafe-duty", next.strafe_right_duty,
+                next.strafe_right_duty, true)) {
+    sendErrorJson(400, "malformed strafe-duty");
+    return;
+  }
   if (g_server.hasArg("post-strafe-pause-ms") &&
       !argUnsigned("post-strafe-pause-ms", post_strafe_pause_ms,
                    next.post_strafe_pause_ms, true)) {
     sendErrorJson(400, "malformed post-strafe-pause-ms");
     return;
   }
-  if (g_server.hasArg("rotation-duty") &&
-      !argFloat("rotation-duty", rotation_duty,
-                next.clockwise_rotation_duty, true)) {
-    sendErrorJson(400, "malformed rotation-duty");
-    return;
-  }
-  if (g_server.hasArg("rotation-duration-ms") &&
-      !argUnsigned("rotation-duration-ms", rotation_duration_ms,
-                   next.clockwise_rotation_duration_ms, true)) {
-    sendErrorJson(400, "malformed rotation-duration-ms");
+  if (g_server.hasArg("rotation-angle-deg") &&
+      !argFloat("rotation-angle-deg", rotation_angle_deg,
+                next.clockwise_rotation_angle_deg, true)) {
+    sendErrorJson(400, "malformed rotation-angle-deg");
     return;
   }
   if (g_server.hasArg("post-rotation-pause-ms") &&
@@ -6297,11 +10380,6 @@ void handleTowerPiecesConfig() {
       !argUnsigned("reverse-duration-ms", reverse_duration_ms,
                    next.reverse_duration_ms, true)) {
     sendErrorJson(400, "malformed reverse-duration-ms");
-    return;
-  }
-  if (g_server.hasArg("shimmy-duty") &&
-      !argFloat("shimmy-duty", shimmy_duty, next.shimmy_duty, true)) {
-    sendErrorJson(400, "malformed shimmy-duty");
     return;
   }
   if (g_server.hasArg("shimmy-direction-ms")) {
@@ -6332,6 +10410,11 @@ void handleTowerPiecesConfig() {
     sendErrorJson(400, "malformed shimmy-timeout-ms");
     return;
   }
+  if (g_server.hasArg("shimmy-duty") &&
+      !argFloat("shimmy-duty", next.shimmy_duty, next.shimmy_duty, true)) {
+    sendErrorJson(400, "malformed shimmy-duty");
+    return;
+  }
   if (g_server.hasArg("final-reverse-duty") &&
       !argFloat("final-reverse-duty", next.final_reverse_duty,
                 context.tower_pieces_config.final_reverse_duty, true)) {
@@ -6357,6 +10440,14 @@ void handleTowerPiecesConfig() {
           "post-winch-open-delay-ms", next.post_winch_open_delay_ms,
           context.tower_pieces_config.post_winch_open_delay_ms, true)) {
     sendErrorJson(400, "malformed post-winch-open-delay-ms");
+    return;
+  }
+  if (g_server.hasArg("pre-stepper-bottom-delay-ms") &&
+      !argUnsigned(
+          "pre-stepper-bottom-delay-ms",
+          next.pre_stepper_bottom_delay_ms,
+          context.tower_pieces_config.pre_stepper_bottom_delay_ms, true)) {
+    sendErrorJson(400, "malformed pre-stepper-bottom-delay-ms");
     return;
   }
   if (g_server.hasArg("post-claws-open-delay-ms") &&
@@ -6402,25 +10493,26 @@ void handleTowerPiecesConfig() {
   }
   next.reverse_line_duty = duty;
   next.side_line_timeout_ms = timeout_ms;
+  next.side_line_cooldown_ms = side_line_cooldown_ms;
+  next.side_line_rearm_ms = side_line_rearm_ms;
   next.post_line_delay_ms = post_line_delay_ms;
-  next.strafe_right_duty = strafe_duty;
   next.strafe_right_duration_ms = strafe_duration_ms;
   next.post_strafe_pause_ms = post_strafe_pause_ms;
-  next.clockwise_rotation_duty = rotation_duty;
-  next.clockwise_rotation_duration_ms = rotation_duration_ms;
+  next.clockwise_rotation_angle_deg = rotation_angle_deg;
   next.post_rotation_pause_ms = post_rotation_pause_ms;
   next.reverse_duty = reverse_duty;
   next.reverse_duration_ms = reverse_duration_ms;
-  next.shimmy_duty = shimmy_duty;
   next.shimmy_right_duration_ms = shimmy_right_ms;
   next.shimmy_left_duration_ms = shimmy_left_ms;
   next.shimmy_timeout_ms = shimmy_timeout_ms;
   if (!robot::towerPiecesConfigValid(
           next, rearMotionDutyCap(context),
-          g_runtime.stepper->maximumSpeedStepsPerSecond())) {
+          g_runtime.stepper->maximumSpeedStepsPerSecond()) ||
+      !autonomousStrafeDutyValid(context, next.strafe_right_duty) ||
+      !autonomousStrafeDutyValid(context, next.shimmy_duty)) {
     sendErrorJson(
         409,
-        "tower pieces config requires safe nonzero main duties/timings, positive delays/speeds, and a valid optional final reverse");
+        "tower pieces config requires a positive clockwise angle, safe nonzero drive duties/timings, positive delays/speeds, and a valid optional final reverse");
     return;
   }
 
@@ -6452,17 +10544,18 @@ void handlePegFinderConfig() {
   }
 
   RuntimeContext& context = *g_runtime.context;
-  robot::PegFinderConfig next = context.peg_finder_config;
-  if (g_server.hasArg("clockwise-duty") &&
-      !argFloat("clockwise-duty", next.clockwise_duty,
-                context.peg_finder_config.clockwise_duty, true)) {
-    sendErrorJson(400, "malformed clockwise-duty");
+  if (context.peg_finder.state ==
+          robot::PegFinderState::RotateClockwise &&
+      robot::imuTurnActive(context.imu_turn_state)) {
+    sendErrorJson(
+        409, "stop the active PegFinder IMU turn before changing config");
     return;
   }
-  if (g_server.hasArg("clockwise-duration-ms") &&
-      !argUnsigned("clockwise-duration-ms", next.clockwise_duration_ms,
-                   context.peg_finder_config.clockwise_duration_ms, true)) {
-    sendErrorJson(400, "malformed clockwise-duration-ms");
+  robot::PegFinderConfig next = context.peg_finder_config;
+  if (g_server.hasArg("clockwise-angle-deg") &&
+      !argFloat("clockwise-angle-deg", next.clockwise_angle_deg,
+                context.peg_finder_config.clockwise_angle_deg, true)) {
+    sendErrorJson(400, "malformed clockwise-angle-deg");
     return;
   }
   if (g_server.hasArg("post-rotation-pause-ms") &&
@@ -6537,11 +10630,58 @@ void handlePegFinderConfig() {
     sendErrorJson(400, "malformed claw-open-interval-ms");
     return;
   }
+  robot::Milliseconds claw_order_1 = next.claw_open_order_1;
+  robot::Milliseconds claw_order_2 = next.claw_open_order_2;
+  robot::Milliseconds claw_order_3 = next.claw_open_order_3;
+  if (g_server.hasArg("claw-order-1") &&
+      (!argUnsigned("claw-order-1", claw_order_1,
+                    context.peg_finder_config.claw_open_order_1, true) ||
+       claw_order_1 < 1U || claw_order_1 > 3U)) {
+    sendErrorJson(400, "claw-order-1 must be 1, 2, or 3");
+    return;
+  }
+  if (g_server.hasArg("claw-order-2") &&
+      (!argUnsigned("claw-order-2", claw_order_2,
+                    context.peg_finder_config.claw_open_order_2, true) ||
+       claw_order_2 < 1U || claw_order_2 > 3U)) {
+    sendErrorJson(400, "claw-order-2 must be 1, 2, or 3");
+    return;
+  }
+  if (g_server.hasArg("claw-order-3") &&
+      (!argUnsigned("claw-order-3", claw_order_3,
+                    context.peg_finder_config.claw_open_order_3, true) ||
+       claw_order_3 < 1U || claw_order_3 > 3U)) {
+    sendErrorJson(400, "claw-order-3 must be 1, 2, or 3");
+    return;
+  }
+  next.claw_open_order_1 = static_cast<std::uint8_t>(claw_order_1);
+  next.claw_open_order_2 = static_cast<std::uint8_t>(claw_order_2);
+  next.claw_open_order_3 = static_cast<std::uint8_t>(claw_order_3);
+  if (g_server.hasArg("post-claws-open-delay-ms") &&
+      !argUnsigned(
+          "post-claws-open-delay-ms", next.post_claws_open_delay_ms,
+          context.peg_finder_config.post_claws_open_delay_ms, true)) {
+    sendErrorJson(400, "malformed post-claws-open-delay-ms");
+    return;
+  }
+  if (g_server.hasArg("funnel-reverse-duty") &&
+      !argFloat("funnel-reverse-duty", next.funnel_reverse_duty,
+                context.peg_finder_config.funnel_reverse_duty, true)) {
+    sendErrorJson(400, "malformed funnel-reverse-duty");
+    return;
+  }
+  if (g_server.hasArg("funnel-reverse-duration-ms") &&
+      !argUnsigned(
+          "funnel-reverse-duration-ms", next.funnel_reverse_duration_ms,
+          context.peg_finder_config.funnel_reverse_duration_ms, true)) {
+    sendErrorJson(400, "malformed funnel-reverse-duration-ms");
+    return;
+  }
   if (!robot::pegFinderConfigValid(next, rearMotionDutyCap(context),
                                     funnelMotionDutyCap())) {
     sendErrorJson(
         409,
-        "PegFinder config requires safe nonzero duties, motion timings, funnel timeout, post-limit delay, and claw interval");
+        "PegFinder config requires a positive clockwise angle, safe nonzero duties, motion timings, a unique claw order containing 1, 2, and 3, and both funnel phases");
     return;
   }
 
@@ -6580,15 +10720,6 @@ void handleTimeTrialConfig() {
     sendErrorJson(400, "malformed post-solar-delay-ms");
     return;
   }
-  if (g_server.hasArg("strafe-right-duty") &&
-      !argFloat(
-          "strafe-right-duty",
-          next.solar_to_tower_strafe_right_duty,
-          context.time_trial_config.solar_to_tower_strafe_right_duty,
-          true)) {
-    sendErrorJson(400, "malformed strafe-right-duty");
-    return;
-  }
   if (g_server.hasArg("strafe-right-duration-ms") &&
       !argUnsigned(
           "strafe-right-duration-ms",
@@ -6608,7 +10739,7 @@ void handleTimeTrialConfig() {
   if (!robot::timeTrialConfigValid(next, rearMotionDutyCap(context))) {
     sendErrorJson(
         409,
-        "Time Trial strafe duty must be within the rear motion limit and nonzero when duration is nonzero");
+        "Time Trial transition configuration is invalid");
     return;
   }
 
@@ -6717,6 +10848,8 @@ void handleImuTurnStart() {
                    *g_runtime.rear_link, now_ms);
   context.modes.setMode(robot::RobotTestMode::ImuTurnTest, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
@@ -6739,10 +10872,17 @@ void handleImuTurnStart() {
     sendErrorJson(409, "IMU angle reset is still being applied");
     return;
   }
-  if (!imu_state.configured || !imu_state.initialized ||
-      !imu_state.calibrated || !imu_state.healthy ||
-      !robot::esp2::imuSnapshotFresh(
-          imu_snapshot, micros(), kImuFreshnessTimeoutUs)) {
+  const std::uint32_t imu_availability_now_us = micros();
+  const char* const imu_availability_reason =
+      robot::esp2::imuDisconnectReason(
+          imu_snapshot, imu_availability_now_us,
+          kImuFreshnessTimeoutUs);
+  if (std::strcmp(imu_availability_reason, "NONE") != 0) {
+    captureImuTurnAvailabilityFault(
+        context, imu_snapshot, *g_runtime.front_left,
+        *g_runtime.front_right, *g_runtime.rear_link, now_ms,
+        imu_availability_now_us, "TURN_START_GATE",
+        imu_availability_reason);
     robot::faultImuTurn(context.imu_turn_state,
                         robot::ImuTurnFaultReason::ImuUnavailable);
     setFault(context, robot::FaultCode::HardwareNotConfigured,
@@ -6852,6 +10992,11 @@ void handleImuAngleReset() {
     sendErrorJson(409, "stop the active IMU turn before resetting angle");
     return;
   }
+  if (robot::imuHeadingHoldActive(context.imu_heading_hold_state)) {
+    sendErrorJson(
+        409, "stop the active IMU strafe before resetting angle");
+    return;
+  }
 
   std::uint32_t reset_sequence = 0U;
   if (!g_runtime.imu_acquisition->requestHeadingReset(
@@ -6861,8 +11006,11 @@ void handleImuAngleReset() {
   }
   context.imu_heading_reset_pending_sequence = reset_sequence;
   resetImuTurn(context);
+  resetImuHeadingHold(context);
   if (context.modes.currentMode() ==
-      robot::RobotTestMode::ImuTurnTest) {
+          robot::RobotTestMode::ImuTurnTest ||
+      context.modes.currentMode() ==
+          robot::RobotTestMode::ImuStrafeTest) {
     clearFault(context);
   }
   logEvent(context, static_cast<robot::Milliseconds>(millis()),
@@ -6897,6 +11045,245 @@ void handleImuTurnSave() {
   sendOkJson("IMU turn tuning saved");
 }
 
+void handleImuHeadingHoldConfig() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  if (robot::imuHeadingHoldActive(context.imu_heading_hold_state)) {
+    sendErrorJson(
+        409, "stop the active IMU strafe before changing tuning");
+    return;
+  }
+
+  robot::ImuHeadingHoldConfig next =
+      context.imu_heading_hold_config;
+  if (g_server.hasArg("strafe-duty") &&
+      !argFloat("strafe-duty", next.maximum_strafe_duty,
+                next.maximum_strafe_duty, true)) {
+    sendErrorJson(400, "malformed strafe-duty");
+    return;
+  }
+  if (g_server.hasArg("kp") &&
+      !argFloat("kp", next.kp, next.kp, true)) {
+    sendErrorJson(400, "malformed kp");
+    return;
+  }
+  if (g_server.hasArg("kd") &&
+      !argFloat("kd", next.kd, next.kd, true)) {
+    sendErrorJson(400, "malformed kd");
+    return;
+  }
+  if (g_server.hasArg("max-correction-duty") &&
+      !argFloat("max-correction-duty",
+                next.maximum_yaw_correction_duty,
+                next.maximum_yaw_correction_duty, true)) {
+    sendErrorJson(400, "malformed max-correction-duty");
+    return;
+  }
+  if (g_server.hasArg("polarity") &&
+      !argPolarity("polarity", next.yaw_command_polarity,
+                   next.yaw_command_polarity, true)) {
+    sendErrorJson(400, "polarity must be +1 or -1");
+    return;
+  }
+
+  if (!imuHeadingHoldRuntimeConfigValid(next)) {
+    sendErrorJson(
+        409,
+        "IMU strafe tuning incomplete: strafe duty, Kp, and correction duty must be positive, Kd nonnegative, polarity +1 or -1, and strafe plus correction duty must not exceed the hardware cap");
+    return;
+  }
+
+  context.imu_heading_hold_config = next;
+  clearFault(context);
+  logEvent(context, static_cast<robot::Milliseconds>(millis()),
+           robot::EventSeverity::Info, robot::EventSource::Web,
+           "IMU strafe tuning updated");
+  sendOkJson("IMU strafe tuning updated");
+}
+
+void handleImuHeadingHoldStart() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  int lateral_direction = 0;
+  if (!argSigned("direction", lateral_direction, 0, true) ||
+      (lateral_direction != -1 && lateral_direction != 1)) {
+    sendErrorJson(400, "direction must be -1 (left) or +1 (right)");
+    return;
+  }
+
+  // A rejected request must not allow a previous motion mode to resume.
+  disableActuators(context, *g_runtime.front_left,
+                   *g_runtime.front_right, *g_runtime.rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::ImuStrafeTest, now_ms);
+  resetSolarPanelAutonomy(context, now_ms);
+  resetTowerPieces(context, now_ms);
+  resetPegFinder(context, now_ms);
+  resetTimeTrial(context, now_ms);
+  resetImuTurn(context);
+  resetImuHeadingHold(context);
+
+  if (!imuHeadingHoldRuntimeConfigValid(
+          context.imu_heading_hold_config)) {
+    robot::faultImuHeadingHold(
+        context.imu_heading_hold_state,
+        robot::ImuHeadingHoldFaultReason::InvalidConfiguration);
+    setFault(context, robot::FaultCode::InvalidCommand,
+             "IMU strafe tuning is incomplete");
+    sendErrorJson(409, "IMU strafe tuning is incomplete");
+    return;
+  }
+
+  const robot::esp2::ImuAcquisitionSnapshot& imu_snapshot =
+      context.latest_imu_snapshot;
+  const robot::esp2::ImuState& imu_state = imu_snapshot.state;
+  if (context.imu_heading_reset_pending_sequence != 0U) {
+    sendErrorJson(409, "IMU angle reset is still being applied");
+    return;
+  }
+  if (std::strcmp(robot::esp2::imuDisconnectReason(
+                      imu_snapshot, micros(), kImuFreshnessTimeoutUs),
+                  "NONE") != 0) {
+    robot::faultImuHeadingHold(
+        context.imu_heading_hold_state,
+        robot::ImuHeadingHoldFaultReason::ImuUnavailable);
+    setFault(context, robot::FaultCode::HardwareNotConfigured,
+             "IMU strafe unavailable: IMU unhealthy");
+    sendErrorJson(409, "IMU strafe unavailable: IMU unhealthy or stale");
+    return;
+  }
+  if (!g_runtime.front_left->configured() ||
+      !g_runtime.front_right->configured()) {
+    robot::faultImuHeadingHold(
+        context.imu_heading_hold_state,
+        robot::ImuHeadingHoldFaultReason::CommandFailed);
+    setFault(context, robot::FaultCode::HardwareNotConfigured,
+             "IMU strafe unavailable: front motors invalid");
+    sendErrorJson(409, "IMU strafe unavailable: front motors invalid");
+    return;
+  }
+  if (!g_runtime.rear_link->configured() ||
+      !g_runtime.rear_link->remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config))) {
+    robot::faultImuHeadingHold(
+        context.imu_heading_hold_state,
+        robot::ImuHeadingHoldFaultReason::RearLinkUnavailable);
+    setFault(context, robot::FaultCode::CommunicationStale,
+             "IMU strafe unavailable: rear link unhealthy");
+    sendErrorJson(409, "IMU strafe unavailable: rear link unhealthy");
+    return;
+  }
+
+  if (!robot::startImuHeadingHold(
+          context.imu_heading_hold_state, imu_state.heading_deg,
+          lateral_direction, context.imu_heading_hold_config,
+          hardwareDutyCap(), now_ms)) {
+    setFault(context, robot::FaultCode::InvalidCommand,
+             "IMU strafe controller rejected start");
+    sendErrorJson(409, "IMU strafe controller rejected start");
+    return;
+  }
+
+  context.last_imu_heading_hold_update = {};
+  context.last_imu_heading_hold_update.state =
+      context.imu_heading_hold_state.state;
+  context.last_imu_heading_hold_update.current_heading_deg =
+      imu_state.heading_deg;
+  context.last_imu_heading_hold_update.target_heading_deg =
+      context.imu_heading_hold_state.target_heading_deg;
+  context.last_imu_heading_hold_update.yaw_rate_dps =
+      imu_state.yaw_rate_dps;
+  context.last_imu_heading_hold_update.lateral_direction =
+      lateral_direction;
+  context.last_imu_heading_hold_update.should_strafe = true;
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = true;
+  context.mode_expires_at_ms = now_ms + kCommandTimeoutMs;
+  resetMotionDiagnosticCapture(context, now_ms);
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web,
+           lateral_direction < 0
+               ? "IMU heading-held left strafe started"
+               : "IMU heading-held right strafe started");
+  sendOkJson(lateral_direction < 0
+                 ? "IMU heading-held left strafe started"
+                 : "IMU heading-held right strafe started");
+}
+
+void handleImuHeadingHoldHeartbeat() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  if (context.modes.currentMode() !=
+          robot::RobotTestMode::ImuStrafeTest ||
+      !robot::imuHeadingHoldActive(context.imu_heading_hold_state)) {
+    sendErrorJson(409, "no active IMU strafe");
+    return;
+  }
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  context.last_command_ms = now_ms;
+  context.command_deadman_armed = true;
+  context.mode_expires_at_ms = now_ms + kCommandTimeoutMs;
+  sendOkJson("IMU strafe heartbeat accepted");
+}
+
+void handleImuHeadingHoldStop() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  disableMotionActuators(context, *g_runtime.front_left,
+                         *g_runtime.front_right,
+                         *g_runtime.rear_link, now_ms);
+  context.modes.setMode(robot::RobotTestMode::ImuStrafeTest, now_ms);
+  robot::stopImuHeadingHold(context.imu_heading_hold_state);
+  context.last_imu_heading_hold_update = {};
+  context.last_imu_heading_hold_update.state =
+      context.imu_heading_hold_state.state;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Warn,
+           robot::EventSource::Web, "IMU strafe stopped");
+  sendOkJson("IMU strafe stopped");
+}
+
+void handleImuHeadingHoldSave() {
+  if (!runtimeReady() || g_runtime.preferences == nullptr) {
+    sendErrorJson(503, "preferences unavailable");
+    return;
+  }
+  const robot::ImuHeadingHoldConfig& config =
+      g_runtime.context->imu_heading_hold_config;
+  if (!imuHeadingHoldRuntimeConfigValid(config)) {
+    sendErrorJson(409, "apply valid IMU strafe tuning before saving");
+    return;
+  }
+  g_runtime.preferences->putFloat(
+      "ihmax", config.maximum_strafe_duty);
+  g_runtime.preferences->putFloat("ihkp", config.kp);
+  g_runtime.preferences->putFloat("ihkd", config.kd);
+  g_runtime.preferences->putFloat(
+      "ihcorr", config.maximum_yaw_correction_duty);
+  g_runtime.preferences->putInt(
+      "ihpol", config.yaw_command_polarity);
+  sendOkJson("IMU strafe tuning saved");
+}
+
 bool parseClawId(std::size_t& claw_index) {
   int claw_id = 0;
   if (!argSigned("id", claw_id, 0, true) || claw_id < 1 ||
@@ -6924,7 +11311,8 @@ bool parseClawRequest(ClawServoPositionRequest& request) {
 }
 
 robot::FaultCode clawFaultCode(const ClawServoCommandResult result) {
-  return result == ClawServoCommandResult::HardwareUnconfigured
+  return result == ClawServoCommandResult::HardwareUnconfigured ||
+                 result == ClawServoCommandResult::PwmWriteFailed
              ? robot::FaultCode::HardwareNotConfigured
              : robot::FaultCode::InvalidCommand;
 }
@@ -7026,6 +11414,18 @@ bool parseClawSettings(ClawServoSettings& settings) {
   }
 
   int value = settings.open_angle_deg[kWinchServoIndex];
+  if (!readOptionalClawInt("pusher-open", "pusherOpen",
+                           settings.open_angle_deg[kHabitatPusherServoIndex],
+                           "malformed Habitat Pusher open angle")) {
+    return false;
+  }
+  if (!readOptionalClawInt("pusher-closed", "pusherClosed",
+                           settings.closed_angle_deg[kHabitatPusherServoIndex],
+                           "malformed Habitat Pusher closed angle")) {
+    return false;
+  }
+
+  value = settings.open_angle_deg[kWinchServoIndex];
   if (!readOptionalClawInt("winch-open", "winchOpen", value,
                            "malformed winch open angle")) {
     return false;
@@ -7046,12 +11446,152 @@ void enterMechanismTestIfNeeded(RuntimeContext& context,
   if (context.modes.currentMode() == robot::RobotTestMode::MechanismTest) {
     return;
   }
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
   disableActuators(context, *g_runtime.front_left, *g_runtime.front_right,
                    *g_runtime.rear_link, now_ms);
   context.modes.setMode(robot::RobotTestMode::MechanismTest, now_ms);
+}
+
+bool solarHookAngleSettingValid(const int angle_deg) {
+  return angle_deg == kClawServoUnsetAngleDeg ||
+         (angle_deg >= 0 && angle_deg <= 180);
+}
+
+bool parseSolarHookSettings(SolarHookServoSettings& settings) {
+  int open_angle_deg = settings.open_angle_deg;
+  int closed_angle_deg = settings.closed_angle_deg;
+  if (!argSigned("open-angle", open_angle_deg, open_angle_deg, false) ||
+      !argSigned("closed-angle", closed_angle_deg, closed_angle_deg,
+                 false)) {
+    sendErrorJson(400, "malformed solar hook angle");
+    return false;
+  }
+  if (!solarHookAngleSettingValid(open_angle_deg) ||
+      !solarHookAngleSettingValid(closed_angle_deg)) {
+    sendErrorJson(409, "solar hook angles must be 0..180 degrees");
+    return false;
+  }
+  settings.open_angle_deg = open_angle_deg;
+  settings.closed_angle_deg = closed_angle_deg;
+  return true;
+}
+
+void handleSolarHookConfig() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  SolarHookServoSettings next =
+      g_runtime.context->solar_hook_servo_settings;
+  if (!parseSolarHookSettings(next)) {
+    return;
+  }
+  g_runtime.context->solar_hook_servo_settings = next;
+  clearFault(*g_runtime.context);
+  logEvent(*g_runtime.context,
+           static_cast<robot::Milliseconds>(millis()),
+           robot::EventSeverity::Info, robot::EventSource::Web,
+           "solar hook settings updated");
+  sendOkJson("solar hook settings updated");
+}
+
+void handleSolarHook() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  if (!g_server.hasArg("state")) {
+    sendErrorJson(400, "missing solar hook state");
+    return;
+  }
+
+  const String state = g_server.arg("state");
+  const bool disable_requested =
+      state == "disable" || state == "off" || state == "stop";
+  const bool open_requested = state == "open";
+  const bool closed_requested =
+      state == "close" || state == "closed";
+  if (!disable_requested && !open_requested && !closed_requested) {
+    sendErrorJson(400, "solar hook state must be open, close, or disable");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  if (!g_runtime.rear_link->configured()) {
+    setFault(context, robot::FaultCode::CommunicationStale,
+             "solar hook UART to ESP1 is not configured");
+    sendErrorJson(409, "solar hook UART to ESP1 is not configured");
+    return;
+  }
+
+  robot::SolarHookCommand command{};
+  if (!disable_requested) {
+    if (!g_runtime.rear_link->remoteStatusFresh(
+            now_ms, remoteStatusTimeoutMs(context.config))) {
+      setFault(context, robot::FaultCode::CommunicationStale,
+               "solar hook ESP1 status is stale");
+      sendErrorJson(409, "solar hook ESP1 status is stale");
+      return;
+    }
+    if (!g_runtime.rear_link->latestStatus().solar_hook_configured) {
+      setFault(context, robot::FaultCode::HardwareNotConfigured,
+               "solar hook servo PWM hardware is not configured on ESP1");
+      sendErrorJson(
+          409, "solar hook servo PWM hardware is not configured on ESP1");
+      return;
+    }
+    const int target_angle_deg =
+        open_requested
+            ? context.solar_hook_servo_settings.open_angle_deg
+            : context.solar_hook_servo_settings.closed_angle_deg;
+    if (target_angle_deg < 0 || target_angle_deg > 180) {
+      setFault(context, robot::FaultCode::InvalidCommand,
+               open_requested ? "solar hook open angle is not set"
+                              : "solar hook closed angle is not set");
+      sendErrorJson(409, open_requested
+                             ? "solar hook open angle is not set"
+                             : "solar hook closed angle is not set");
+      return;
+    }
+    enterMechanismTestIfNeeded(context, now_ms);
+    command.enabled = true;
+    command.angle_deg = static_cast<std::uint8_t>(target_angle_deg);
+  }
+
+  if (!g_runtime.rear_link->send(command)) {
+    setFault(context, robot::FaultCode::CommunicationStale,
+             "solar hook command failed to send");
+    sendErrorJson(503, "solar hook command failed to send");
+    return;
+  }
+
+  context.solar_hook_commanded_open =
+      command.enabled && open_requested;
+  context.last_command_ms = now_ms;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web,
+           command.enabled ? "solar hook command accepted"
+                           : "solar hook output disabled");
+  sendOkJson(command.enabled ? "solar hook command accepted"
+                             : "solar hook output disabled");
+}
+
+void handleSolarHookSave() {
+  if (!runtimeReady() || g_runtime.preferences == nullptr) {
+    sendErrorJson(503, "preferences unavailable");
+    return;
+  }
+  const SolarHookServoSettings& settings =
+      g_runtime.context->solar_hook_servo_settings;
+  g_runtime.preferences->putInt("shopen", settings.open_angle_deg);
+  g_runtime.preferences->putInt("shclosed", settings.closed_angle_deg);
+  sendOkJson("solar hook settings saved");
 }
 
 void handleClawsConfig() {
@@ -7181,6 +11721,42 @@ void handleWinch() {
   sendOkJson("winch command accepted");
 }
 
+void handleHabitatPusher() {
+  if (!runtimeReady()) {
+    sendErrorJson(503, "runtime not ready");
+    return;
+  }
+  ClawServoPositionRequest request{};
+  if (!parseClawRequest(request)) {
+    sendErrorJson(400, "malformed Habitat Pusher command");
+    return;
+  }
+
+  RuntimeContext& context = *g_runtime.context;
+  const robot::Milliseconds now_ms =
+      static_cast<robot::Milliseconds>(millis());
+  enterMechanismTestIfNeeded(context, now_ms);
+  const ClawServoCommandResult result = g_runtime.claws->command(
+      kHabitatPusherServoIndex, request);
+  if (result != ClawServoCommandResult::Accepted) {
+    const char* reason = clawServoResultReason(result);
+    setFault(context, clawFaultCode(result), reason);
+    logEvent(context, now_ms, robot::EventSeverity::Warn,
+             robot::EventSource::Web, reason);
+    sendErrorJson(409, reason);
+    return;
+  }
+
+  context.last_command_ms = now_ms;
+  clearFault(context);
+  logEvent(context, now_ms, robot::EventSeverity::Info,
+           robot::EventSource::Web,
+           request == ClawServoPositionRequest::Open
+               ? "Habitat Pusher opened"
+               : "Habitat Pusher closed");
+  sendOkJson("Habitat Pusher command accepted");
+}
+
 void handleFunnel() {
   if (!runtimeReady()) {
     sendErrorJson(503, "runtime not ready");
@@ -7269,6 +11845,10 @@ void handleClawsSave() {
       "wopen", settings.open_angle_deg[kWinchServoIndex]);
   g_runtime.preferences->putInt(
       "wclosed", settings.closed_angle_deg[kWinchServoIndex]);
+  g_runtime.preferences->putInt(
+      "pushopen", settings.open_angle_deg[kHabitatPusherServoIndex]);
+  g_runtime.preferences->putInt(
+      "pushclose", settings.closed_angle_deg[kHabitatPusherServoIndex]);
   sendOkJson("servo settings saved");
 }
 
@@ -7647,6 +12227,10 @@ void handleConfigSave() {
     return;
   }
   const RuntimeContext& context = *g_runtime.context;
+  g_runtime.preferences->putInt(
+      "shopen", context.solar_hook_servo_settings.open_angle_deg);
+  g_runtime.preferences->putInt(
+      "shclosed", context.solar_hook_servo_settings.closed_angle_deg);
   g_runtime.preferences->putFloat("kp", context.config.kp);
   g_runtime.preferences->putFloat("ki", context.config.ki);
   g_runtime.preferences->putFloat("kd", context.config.kd);
@@ -7662,6 +12246,50 @@ void handleConfigSave() {
                                  context.config.remoteCommandTimeoutMs);
   g_runtime.preferences->putBool("lftele", context.config.telemetryEnabled);
   g_runtime.preferences->putInt("pol", context.config.steeringPolarity);
+  g_runtime.preferences->putFloat(
+      "hpduty", context.habitat_pieces_config.line_follow_duty);
+  g_runtime.preferences->putUInt(
+      "hpdetect",
+      context.habitat_pieces_config.lss2_detection_delay_ms);
+  g_runtime.preferences->putUInt(
+      "hptimeout", context.habitat_pieces_config.run_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "hprevduty", context.habitat_pieces_config.reverse_duty);
+  g_runtime.preferences->putUInt(
+      "hprevms", context.habitat_pieces_config.reverse_duration_ms);
+  const robot::HabitatPlacementConfig& placement =
+      context.habitat_placement_config;
+  g_runtime.preferences->putFloat("hprlduty", placement.reverse_line_follow_duty);
+  g_runtime.preferences->putUInt("hplsstmo", placement.lss1_timeout_ms);
+  g_runtime.preferences->putUInt("hplssdel", placement.post_lss1_delay_ms);
+  g_runtime.preferences->putFloat("hpccwdeg", placement.counter_clockwise_angle_deg);
+  g_runtime.preferences->putUInt("hpccwtmo", placement.counter_clockwise_timeout_ms);
+  g_runtime.preferences->putFloat("hpfwd1d", placement.forward_to_slide_duty);
+  g_runtime.preferences->putUInt("hpfwd1ms", placement.forward_to_slide_duration_ms);
+  g_runtime.preferences->putUInt("hpstpspd", placement.stepper_down_speed_steps_per_second);
+  g_runtime.preferences->putUInt("hpstptmo", placement.stepper_down_timeout_ms);
+  g_runtime.preferences->putUInt("hpopenset", placement.pusher_open_settle_ms);
+  g_runtime.preferences->putFloat("hppushd", placement.push_forward_duty);
+  g_runtime.preferences->putUInt("hppushms", placement.push_forward_duration_ms);
+  g_runtime.preferences->putFloat("hpretd", placement.reverse_retreat_duty);
+  g_runtime.preferences->putUInt("hpretms", placement.reverse_retreat_duration_ms);
+  g_runtime.preferences->putFloat("hpcwdeg", placement.clockwise_angle_deg);
+  g_runtime.preferences->putUInt("hpcwtmo", placement.clockwise_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "hpcwrevd", placement.post_clockwise_reverse_duty);
+  g_runtime.preferences->putUInt(
+      "hpcwrevms", placement.post_clockwise_reverse_duration_ms);
+  g_runtime.preferences->putFloat(
+      "hpcwstrld", placement.post_clockwise_strafe_left_duty);
+  g_runtime.preferences->putUInt(
+      "hpcwstrlms",
+      placement.post_clockwise_strafe_left_duration_ms);
+  g_runtime.preferences->putUInt("hpcwdel", placement.post_clockwise_delay_ms);
+  g_runtime.preferences->putFloat("hpexitd", placement.exit_forward_duty);
+  g_runtime.preferences->putUInt("hpexitms", placement.exit_forward_duration_ms);
+  g_runtime.preferences->putUInt("hpexitdel", placement.post_forward_delay_ms);
+  g_runtime.preferences->putFloat("hpstrd", placement.strafe_right_duty);
+  g_runtime.preferences->putUInt("hpstrtmo", placement.strafe_right_timeout_ms);
   g_runtime.preferences->putFloat("rkp", context.rear_config.kp);
   g_runtime.preferences->putFloat("rki", context.rear_config.ki);
   g_runtime.preferences->putFloat("rkd", context.rear_config.kd);
@@ -7689,31 +12317,33 @@ void handleConfigSave() {
   g_runtime.preferences->putUInt(
       "tptmo", context.tower_pieces_config.side_line_timeout_ms);
   g_runtime.preferences->putUInt(
+      "tpcool", context.tower_pieces_config.side_line_cooldown_ms);
+  g_runtime.preferences->putUInt(
+      "tprearm", context.tower_pieces_config.side_line_rearm_ms);
+  g_runtime.preferences->putUInt(
       "tpdelay", context.tower_pieces_config.post_line_delay_ms);
+  g_runtime.preferences->putUInt(
+      "tpsdur", context.tower_pieces_config.strafe_right_duration_ms);
   g_runtime.preferences->putFloat(
       "tpsduty", context.tower_pieces_config.strafe_right_duty);
   g_runtime.preferences->putUInt(
-      "tpsdur", context.tower_pieces_config.strafe_right_duration_ms);
-  g_runtime.preferences->putUInt(
       "tppause", context.tower_pieces_config.post_strafe_pause_ms);
   g_runtime.preferences->putFloat(
-      "tprduty", context.tower_pieces_config.clockwise_rotation_duty);
-  g_runtime.preferences->putUInt(
-      "tprdur", context.tower_pieces_config.clockwise_rotation_duration_ms);
+      "tprdeg", context.tower_pieces_config.clockwise_rotation_angle_deg);
   g_runtime.preferences->putUInt(
       "tprpause", context.tower_pieces_config.post_rotation_pause_ms);
   g_runtime.preferences->putFloat(
       "tpbkduty", context.tower_pieces_config.reverse_duty);
   g_runtime.preferences->putUInt(
       "tpbkdur", context.tower_pieces_config.reverse_duration_ms);
-  g_runtime.preferences->putFloat(
-      "tpshduty", context.tower_pieces_config.shimmy_duty);
   g_runtime.preferences->putUInt(
       "tpshrdur", context.tower_pieces_config.shimmy_right_duration_ms);
   g_runtime.preferences->putUInt(
       "tpshldur", context.tower_pieces_config.shimmy_left_duration_ms);
   g_runtime.preferences->putUInt(
       "tpshtmo", context.tower_pieces_config.shimmy_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "tpshduty", context.tower_pieces_config.shimmy_duty);
   g_runtime.preferences->putFloat(
       "tp_end_d", context.tower_pieces_config.final_reverse_duty);
   g_runtime.preferences->putUInt(
@@ -7725,6 +12355,9 @@ void handleConfigSave() {
   g_runtime.preferences->putUInt(
       "tp_co_p", context.tower_pieces_config.post_claws_open_delay_ms);
   g_runtime.preferences->putUInt(
+      "tp_pre_dn",
+      context.tower_pieces_config.pre_stepper_bottom_delay_ms);
+  g_runtime.preferences->putUInt(
       "tp_dn_spd",
       context.tower_pieces_config.stepper_down_speed_steps_per_second);
   g_runtime.preferences->putUInt(
@@ -7735,9 +12368,7 @@ void handleConfigSave() {
       "tp_up_spd",
       context.tower_pieces_config.stepper_up_speed_steps_per_second);
   g_runtime.preferences->putFloat(
-      "pf_cw_d", context.peg_finder_config.clockwise_duty);
-  g_runtime.preferences->putUInt(
-      "pf_cw_ms", context.peg_finder_config.clockwise_duration_ms);
+      "pf_cw_deg", context.peg_finder_config.clockwise_angle_deg);
   g_runtime.preferences->putUInt(
       "pf_cw_p", context.peg_finder_config.post_rotation_pause_ms);
   g_runtime.preferences->putFloat(
@@ -7758,11 +12389,20 @@ void handleConfigSave() {
       "pf_fun_p", context.peg_finder_config.post_funnel_limit_delay_ms);
   g_runtime.preferences->putUInt(
       "pf_claw_p", context.peg_finder_config.claw_open_interval_ms);
+  g_runtime.preferences->putUChar(
+      "pf_claw_1", context.peg_finder_config.claw_open_order_1);
+  g_runtime.preferences->putUChar(
+      "pf_claw_2", context.peg_finder_config.claw_open_order_2);
+  g_runtime.preferences->putUChar(
+      "pf_claw_3", context.peg_finder_config.claw_open_order_3);
+  g_runtime.preferences->putUInt(
+      "pf_claw_d", context.peg_finder_config.post_claws_open_delay_ms);
+  g_runtime.preferences->putFloat(
+      "pf_revfun_d", context.peg_finder_config.funnel_reverse_duty);
+  g_runtime.preferences->putUInt(
+      "pf_revfun_ms", context.peg_finder_config.funnel_reverse_duration_ms);
   g_runtime.preferences->putUInt(
       "tt_sdly", context.time_trial_config.post_solar_delay_ms);
-  g_runtime.preferences->putFloat(
-      "tt_sduty",
-      context.time_trial_config.solar_to_tower_strafe_right_duty);
   g_runtime.preferences->putUInt(
       "tt_sms",
       context.time_trial_config.solar_to_tower_strafe_right_duration_ms);
@@ -7791,11 +12431,20 @@ void handleConfigSave() {
                                   context.solar_speed_config.slow_base_duty);
   g_runtime.preferences->putUInt("sctmo",
                                  context.solar_contact_config.timeout_ms);
+  g_runtime.preferences->putFloat(
+      "si_str_d",
+      context.solar_contact_config.initial_strafe_right_duty);
+  g_runtime.preferences->putFloat(
+      "sl_str_d",
+      context.solar_contact_config.retry_strafe_left_duty);
+  g_runtime.preferences->putFloat(
+      "sr_str_d",
+      context.solar_contact_config.retry_strafe_right_duty);
   g_runtime.preferences->putUInt(
       "sdelay",
       context.solar_contact_config.strafe_start_delay_ms);
-  g_runtime.preferences->putFloat("sstrfd",
-                                  context.solar_contact_config.strafe_duty);
+  g_runtime.preferences->putFloat(
+      "sstrfd", context.solar_contact_config.retry_forward_duty);
   g_runtime.preferences->putUInt(
       "srleft",
       context.solar_contact_config.retry_strafe_left_duration_ms);
@@ -7808,14 +12457,16 @@ void handleConfigSave() {
       context.solar_contact_config.post_contact_forward_duration_ms);
   g_runtime.preferences->putFloat(
       "spcfduty", context.solar_contact_config.post_contact_forward_duty);
-  g_runtime.preferences->putFloat(
-      "slrduty", context.solar_contact_config.line_reacquire_strafe_duty);
   g_runtime.preferences->putUInt(
       "sfdly",
       context.solar_contact_config.post_contact_forward_start_delay_ms);
   g_runtime.preferences->putUInt(
       "slfdly",
       context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
+  g_runtime.preferences->putFloat(
+      "slstrd", context.solar_contact_config.line_reacquire_strafe_duty);
+  g_runtime.preferences->putUInt(
+      "slpidms", context.solar_contact_config.rear_line_follow_duration_ms);
   sendOkJson("config saved");
 }
 
@@ -7856,6 +12507,8 @@ void handleStepperCommand() {
   const String command = g_server.arg("command");
   if ((g_runtime.context->modes.currentMode() ==
            robot::RobotTestMode::AutonomousTowerPieces ||
+       g_runtime.context->modes.currentMode() ==
+           robot::RobotTestMode::HabitatPlacement ||
        g_runtime.context->modes.currentMode() ==
            robot::RobotTestMode::TimeTrial) &&
       command != "stop") {
@@ -7912,6 +12565,18 @@ void setupWebHandlers() {
   g_server.on("/api/sensors", HTTP_GET, handleSensors);
   g_server.on("/api/line", HTTP_GET, handleLine);
   g_server.on("/api/rear-line", HTTP_GET, handleRearLine);
+  g_server.on("/api/autonomous/habitat-pieces/start", HTTP_ANY,
+              handleHabitatPiecesStart);
+  g_server.on("/api/autonomous/habitat-pieces/stop", HTTP_ANY,
+              handleHabitatPiecesStop);
+  g_server.on("/api/autonomous/habitat-pieces/config", HTTP_ANY,
+              handleHabitatPiecesConfig);
+  g_server.on("/api/autonomous/habitat-placement/start", HTTP_ANY,
+              handleHabitatPlacementStart);
+  g_server.on("/api/autonomous/habitat-placement/stop", HTTP_ANY,
+              handleHabitatPlacementStop);
+  g_server.on("/api/autonomous/habitat-placement/config", HTTP_ANY,
+              handleHabitatPlacementConfig);
   g_server.on("/api/autonomous/solar/start", HTTP_ANY,
               handleAutonomousSolarStart);
   g_server.on("/api/autonomous/solar/config", HTTP_ANY,
@@ -7934,6 +12599,16 @@ void setupWebHandlers() {
   g_server.on("/api/imu-turn/reset-angle", HTTP_ANY,
               handleImuAngleReset);
   g_server.on("/api/imu-turn/save", HTTP_ANY, handleImuTurnSave);
+  g_server.on("/api/imu-strafe/config", HTTP_ANY,
+              handleImuHeadingHoldConfig);
+  g_server.on("/api/imu-strafe/start", HTTP_ANY,
+              handleImuHeadingHoldStart);
+  g_server.on("/api/imu-strafe/heartbeat", HTTP_ANY,
+              handleImuHeadingHoldHeartbeat);
+  g_server.on("/api/imu-strafe/stop", HTTP_ANY,
+              handleImuHeadingHoldStop);
+  g_server.on("/api/imu-strafe/save", HTTP_ANY,
+              handleImuHeadingHoldSave);
   g_server.on("/api/line-follow/start", HTTP_ANY, handleLineFollowStart);
   g_server.on("/api/line-follow/stop", HTTP_ANY, handleLineFollowStop);
   g_server.on("/api/line-follow/config", HTTP_ANY, handleLineFollowConfig);
@@ -7946,8 +12621,15 @@ void setupWebHandlers() {
   g_server.on("/api/claw", HTTP_ANY, handleClaw);
   g_server.on("/api/claws", HTTP_ANY, handleClawsAll);
   g_server.on("/api/winch", HTTP_ANY, handleWinch);
+  g_server.on("/api/habitat-pusher", HTTP_ANY,
+              handleHabitatPusher);
   g_server.on("/api/claws/config", HTTP_ANY, handleClawsConfig);
   g_server.on("/api/claws/save", HTTP_ANY, handleClawsSave);
+  g_server.on("/api/solar-hook", HTTP_ANY, handleSolarHook);
+  g_server.on("/api/solar-hook/config", HTTP_ANY,
+              handleSolarHookConfig);
+  g_server.on("/api/solar-hook/save", HTTP_ANY,
+              handleSolarHookSave);
   g_server.on("/api/funnel", HTTP_ANY, handleFunnel);
   g_server.on("/api/config", HTTP_GET, handleConfig);
   g_server.on("/api/config/save", HTTP_ANY, handleConfigSave);
@@ -8028,8 +12710,10 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
   Serial.print(context.solar_contact_config.timeout_ms);
   Serial.print(", solar-strafe-delay-ms=");
   Serial.print(context.solar_contact_config.strafe_start_delay_ms);
-  Serial.print(", solar-strafe-duty=");
-  Serial.print(context.solar_contact_config.strafe_duty, 4);
+  Serial.print(", solar-imu-strafe-duty=");
+  Serial.print(context.imu_heading_hold_config.maximum_strafe_duty, 4);
+  Serial.print(", solar-retry-forward-duty=");
+  Serial.print(context.solar_contact_config.retry_forward_duty, 4);
   Serial.print(", solar-retry-left-ms=");
   Serial.print(
       context.solar_contact_config.retry_strafe_left_duration_ms);
@@ -8042,8 +12726,6 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
       context.solar_contact_config.post_contact_forward_duration_ms);
   Serial.print(", solar-post-contact-forward-duty=");
   Serial.print(context.solar_contact_config.post_contact_forward_duty, 4);
-  Serial.print(", solar-line-reacquire-duty=");
-  Serial.print(context.solar_contact_config.line_reacquire_strafe_duty, 4);
   Serial.print(", solar-post-contact-forward-delay-ms=");
   Serial.print(
       context.solar_contact_config.post_contact_forward_start_delay_ms);
@@ -8094,6 +12776,9 @@ void printCommands() {
   Serial.println("  motor invert FL|FR|BL|BR");
   Serial.println("  mode ..., sensor status, line status");
   Serial.println("  rear-line status");
+  Serial.println("  habitat start|stop|status");
+  Serial.println(
+      "  habitat config <duty> <distance-mm> <max-age-ms> <timeout-ms>");
   Serial.println("  auto solar|status");
   Serial.println("  lf start|stop|status|reset");
   Serial.println("  lf kp|ki|kd|base|max-duty|max-correction <value>");
@@ -8120,6 +12805,8 @@ bool serialSetMode(RuntimeContext& context, const char* mode_text,
   disableActuators(context, front_left, front_right, rear_link, now_ms);
   context.modes.setMode(mode, now_ms);
   resetSolarPanelAutonomy(context, now_ms);
+  resetHabitatPieces(context, now_ms);
+  resetHabitatPlacement(context, now_ms);
   resetTowerPieces(context, now_ms);
   resetPegFinder(context, now_ms);
   resetTimeTrial(context, now_ms);
@@ -8477,6 +13164,75 @@ void processCommand(RuntimeContext& context, char* line,
   if (std::strcmp(token, "mode") == 0) {
     serialSetMode(context, strtok(nullptr, " \t\r\n"), sensors, front_left,
                   front_right, rear_link, now_ms);
+    return;
+  }
+  if (std::strcmp(token, "habitat") == 0 ||
+      std::strcmp(token, "habitat-pieces") == 0) {
+    char* command = strtok(nullptr, " \t\r\n");
+    if (command != nullptr && std::strcmp(command, "start") == 0) {
+      requestHabitatPiecesStart(context, front_left, front_right, rear_link,
+                                now_ms, robot::EventSource::Serial);
+      printOk("Habitat Pieces start requested");
+      return;
+    }
+    if (command != nullptr && std::strcmp(command, "stop") == 0) {
+      disableActuators(context, front_left, front_right, rear_link, now_ms);
+      resetHabitatPieces(context, now_ms);
+      clearFault(context);
+      printOk("Habitat Pieces stopped");
+      return;
+    }
+    if (command != nullptr && std::strcmp(command, "status") == 0) {
+      printStatus(context, rear_link, sensors, front_left, front_right,
+                  now_ms);
+      return;
+    }
+    if (command != nullptr && std::strcmp(command, "config") == 0) {
+      float duty = 0.0F;
+      robot::Milliseconds lss2_detection_delay_ms = 0U;
+      robot::Milliseconds run_timeout_ms = 0U;
+      float reverse_duty = 0.0F;
+      robot::Milliseconds reverse_duration_ms = 0U;
+      if (!parseFloat(strtok(nullptr, " \t\r\n"), duty) ||
+          !parseUnsigned(strtok(nullptr, " \t\r\n"),
+                         lss2_detection_delay_ms) ||
+          !parseUnsigned(strtok(nullptr, " \t\r\n"), run_timeout_ms) ||
+          !parseFloat(strtok(nullptr, " \t\r\n"), reverse_duty) ||
+          !parseUnsigned(strtok(nullptr, " \t\r\n"),
+                         reverse_duration_ms)) {
+        printRejected(
+            "habitat config <duty> <lss2-delay-ms> <search-timeout-ms> <reverse-duty> <reverse-duration-ms>");
+        return;
+      }
+      robot::HabitatPiecesConfig next{};
+      next.line_follow_duty = duty;
+      next.lss2_detection_delay_ms = lss2_detection_delay_ms;
+      next.run_timeout_ms = run_timeout_ms;
+      next.reverse_duty = reverse_duty;
+      next.reverse_duration_ms = reverse_duration_ms;
+      robot::LineFollowerConfig line_config = context.config;
+      line_config.baseDuty = duty;
+      if (!robot::habitatPiecesConfigValid(
+              next, activeMotionDutyCap(context)) ||
+          !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
+               .accepted) {
+        printRejected("Habitat Pieces config is outside safe limits");
+        return;
+      }
+      if (context.habitat_pieces.state ==
+              robot::HabitatPiecesState::LineFollowing ||
+          context.habitat_pieces.state ==
+              robot::HabitatPiecesState::Reversing) {
+        printRejected("stop Habitat Pieces before changing config");
+        return;
+      }
+      context.habitat_pieces_config = next;
+      resetHabitatPieces(context, now_ms);
+      clearFault(context);
+      printOk("Habitat Pieces config updated");
+      return;
+    }
+    printRejected("habitat start|stop|status|config");
     return;
   }
   if (std::strcmp(token, "auto") == 0 ||
@@ -9015,6 +13771,77 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       preferences.getBool("lftele", context.config.telemetryEnabled);
   context.config.steeringPolarity =
       preferences.getInt("pol", context.config.steeringPolarity) < 0 ? -1 : 1;
+  context.habitat_pieces_config.line_follow_duty = preferences.getFloat(
+      "hpduty", context.habitat_pieces_config.line_follow_duty);
+  context.habitat_pieces_config.lss2_detection_delay_ms =
+      preferences.getUInt(
+          "hpdetect",
+          context.habitat_pieces_config.lss2_detection_delay_ms);
+  context.habitat_pieces_config.run_timeout_ms = preferences.getUInt(
+      "hptimeout", context.habitat_pieces_config.run_timeout_ms);
+  context.habitat_pieces_config.reverse_duty = preferences.getFloat(
+      "hprevduty", context.habitat_pieces_config.reverse_duty);
+  context.habitat_pieces_config.reverse_duration_ms = preferences.getUInt(
+      "hprevms", context.habitat_pieces_config.reverse_duration_ms);
+  robot::HabitatPlacementConfig& placement =
+      context.habitat_placement_config;
+  placement.reverse_line_follow_duty = preferences.getFloat(
+      "hprlduty", placement.reverse_line_follow_duty);
+  placement.lss1_timeout_ms = preferences.getUInt(
+      "hplsstmo", placement.lss1_timeout_ms);
+  placement.post_lss1_delay_ms = preferences.getUInt(
+      "hplssdel", placement.post_lss1_delay_ms);
+  placement.counter_clockwise_angle_deg = preferences.getFloat(
+      "hpccwdeg", placement.counter_clockwise_angle_deg);
+  placement.counter_clockwise_timeout_ms = preferences.getUInt(
+      "hpccwtmo", placement.counter_clockwise_timeout_ms);
+  placement.forward_to_slide_duty = preferences.getFloat(
+      "hpfwd1d", placement.forward_to_slide_duty);
+  placement.forward_to_slide_duration_ms = preferences.getUInt(
+      "hpfwd1ms", placement.forward_to_slide_duration_ms);
+  placement.stepper_down_speed_steps_per_second = preferences.getUInt(
+      "hpstpspd", placement.stepper_down_speed_steps_per_second);
+  placement.stepper_down_timeout_ms = preferences.getUInt(
+      "hpstptmo", placement.stepper_down_timeout_ms);
+  placement.pusher_open_settle_ms = preferences.getUInt(
+      "hpopenset", placement.pusher_open_settle_ms);
+  placement.push_forward_duty = preferences.getFloat(
+      "hppushd", placement.push_forward_duty);
+  placement.push_forward_duration_ms = preferences.getUInt(
+      "hppushms", placement.push_forward_duration_ms);
+  placement.reverse_retreat_duty = preferences.getFloat(
+      "hpretd", placement.reverse_retreat_duty);
+  placement.reverse_retreat_duration_ms = preferences.getUInt(
+      "hpretms", placement.reverse_retreat_duration_ms);
+  placement.clockwise_angle_deg = preferences.getFloat(
+      "hpcwdeg", placement.clockwise_angle_deg);
+  placement.clockwise_timeout_ms = preferences.getUInt(
+      "hpcwtmo", placement.clockwise_timeout_ms);
+  placement.post_clockwise_reverse_duty = preferences.getFloat(
+      "hpcwrevd", placement.post_clockwise_reverse_duty);
+  placement.post_clockwise_reverse_duration_ms =
+      preferences.getUInt(
+          "hpcwrevms",
+          placement.post_clockwise_reverse_duration_ms);
+  placement.post_clockwise_strafe_left_duty =
+      preferences.getFloat(
+          "hpcwstrld", placement.post_clockwise_strafe_left_duty);
+  placement.post_clockwise_strafe_left_duration_ms =
+      preferences.getUInt(
+          "hpcwstrlms",
+          placement.post_clockwise_strafe_left_duration_ms);
+  placement.post_clockwise_delay_ms = preferences.getUInt(
+      "hpcwdel", placement.post_clockwise_delay_ms);
+  placement.exit_forward_duty = preferences.getFloat(
+      "hpexitd", placement.exit_forward_duty);
+  placement.exit_forward_duration_ms = preferences.getUInt(
+      "hpexitms", placement.exit_forward_duration_ms);
+  placement.post_forward_delay_ms = preferences.getUInt(
+      "hpexitdel", placement.post_forward_delay_ms);
+  placement.strafe_right_duty = preferences.getFloat(
+      "hpstrd", placement.strafe_right_duty);
+  placement.strafe_right_timeout_ms = preferences.getUInt(
+      "hpstrtmo", placement.strafe_right_timeout_ms);
   context.imu_turn_config.maximum_rotation_duty =
       preferences.getFloat(
           "itmax", context.imu_turn_config.maximum_rotation_duty);
@@ -9038,6 +13865,25 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
   context.imu_turn_config.yaw_command_polarity =
       preferences.getInt(
           "itpol", context.imu_turn_config.yaw_command_polarity);
+  context.imu_heading_hold_config.maximum_strafe_duty =
+      preferences.getFloat(
+          "ihmax",
+          context.imu_heading_hold_config.maximum_strafe_duty);
+  context.imu_heading_hold_config.kp =
+      preferences.getFloat(
+          "ihkp", context.imu_heading_hold_config.kp);
+  context.imu_heading_hold_config.kd =
+      preferences.getFloat(
+          "ihkd", context.imu_heading_hold_config.kd);
+  context.imu_heading_hold_config.maximum_yaw_correction_duty =
+      preferences.getFloat(
+          "ihcorr",
+          context.imu_heading_hold_config
+              .maximum_yaw_correction_duty);
+  context.imu_heading_hold_config.yaw_command_polarity =
+      preferences.getInt(
+          "ihpol",
+          context.imu_heading_hold_config.yaw_command_polarity);
   // First-time rear settings inherit the current front settings, then become
   // independently persistent under their own NVS keys.
   context.rear_config = context.config;
@@ -9074,23 +13920,26 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
   context.tower_pieces_config.side_line_timeout_ms =
       preferences.getUInt(
           "tptmo", context.tower_pieces_config.side_line_timeout_ms);
+  context.tower_pieces_config.side_line_cooldown_ms =
+      preferences.getUInt(
+          "tpcool", context.tower_pieces_config.side_line_cooldown_ms);
+  context.tower_pieces_config.side_line_rearm_ms =
+      preferences.getUInt(
+          "tprearm", context.tower_pieces_config.side_line_rearm_ms);
   context.tower_pieces_config.post_line_delay_ms = preferences.getUInt(
       "tpdelay", context.tower_pieces_config.post_line_delay_ms);
-  context.tower_pieces_config.strafe_right_duty = std::fabs(
-      preferences.getFloat(
-          "tpsduty", context.tower_pieces_config.strafe_right_duty));
   context.tower_pieces_config.strafe_right_duration_ms =
       preferences.getUInt(
           "tpsdur", context.tower_pieces_config.strafe_right_duration_ms);
+  context.tower_pieces_config.strafe_right_duty =
+      preferences.getFloat(
+          "tpsduty", context.imu_heading_hold_config.maximum_strafe_duty);
   context.tower_pieces_config.post_strafe_pause_ms = preferences.getUInt(
       "tppause", context.tower_pieces_config.post_strafe_pause_ms);
-  context.tower_pieces_config.clockwise_rotation_duty = std::fabs(
+  context.tower_pieces_config.clockwise_rotation_angle_deg = std::fabs(
       preferences.getFloat(
-          "tprduty", context.tower_pieces_config.clockwise_rotation_duty));
-  context.tower_pieces_config.clockwise_rotation_duration_ms =
-      preferences.getUInt(
-          "tprdur",
-          context.tower_pieces_config.clockwise_rotation_duration_ms);
+          "tprdeg",
+          context.tower_pieces_config.clockwise_rotation_angle_deg));
   context.tower_pieces_config.post_rotation_pause_ms = preferences.getUInt(
       "tprpause", context.tower_pieces_config.post_rotation_pause_ms);
   context.tower_pieces_config.reverse_duty = std::fabs(
@@ -9098,9 +13947,6 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
                            context.tower_pieces_config.reverse_duty));
   context.tower_pieces_config.reverse_duration_ms = preferences.getUInt(
       "tpbkdur", context.tower_pieces_config.reverse_duration_ms);
-  context.tower_pieces_config.shimmy_duty = std::fabs(
-      preferences.getFloat("tpshduty",
-                           context.tower_pieces_config.shimmy_duty));
   const robot::Milliseconds legacy_shimmy_duration_ms =
       preferences.getUInt("tpshdur", 0U);
   context.tower_pieces_config.shimmy_right_duration_ms =
@@ -9119,6 +13965,12 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       "tpshtmo",
       preferences.getUInt(
           "tprtmo", context.tower_pieces_config.shimmy_timeout_ms));
+  context.tower_pieces_config.shimmy_duty =
+      preferences.getFloat(
+          "tpshduty",
+          preferences.getFloat(
+              "tplapp",
+              context.imu_heading_hold_config.maximum_strafe_duty));
   context.tower_pieces_config.final_reverse_duty = std::fabs(
       preferences.getFloat(
           "tp_end_d",
@@ -9143,6 +13995,10 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       "tp_co_p",
       preferences.getUInt(
           "pf_co_p", context.tower_pieces_config.post_claws_open_delay_ms));
+  context.tower_pieces_config.pre_stepper_bottom_delay_ms =
+      preferences.getUInt(
+          "tp_pre_dn",
+          context.tower_pieces_config.pre_stepper_bottom_delay_ms);
   context.tower_pieces_config.stepper_down_speed_steps_per_second =
       preferences.getUInt(
           "tp_dn_spd",
@@ -9168,11 +14024,9 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
           preferences.getUInt(
               "pf_up_spd",
               context.tower_pieces_config.stepper_up_speed_steps_per_second));
-  context.peg_finder_config.clockwise_duty = std::fabs(
-      preferences.getFloat("pf_cw_d",
-                           context.peg_finder_config.clockwise_duty));
-  context.peg_finder_config.clockwise_duration_ms = preferences.getUInt(
-      "pf_cw_ms", context.peg_finder_config.clockwise_duration_ms);
+  context.peg_finder_config.clockwise_angle_deg = std::fabs(
+      preferences.getFloat(
+          "pf_cw_deg", context.peg_finder_config.clockwise_angle_deg));
   context.peg_finder_config.post_rotation_pause_ms = preferences.getUInt(
       "pf_cw_p", context.peg_finder_config.post_rotation_pause_ms);
   context.peg_finder_config.reverse_duty = std::fabs(
@@ -9198,12 +14052,22 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
           context.peg_finder_config.post_funnel_limit_delay_ms);
   context.peg_finder_config.claw_open_interval_ms = preferences.getUInt(
       "pf_claw_p", context.peg_finder_config.claw_open_interval_ms);
+  context.peg_finder_config.claw_open_order_1 = preferences.getUChar(
+      "pf_claw_1", context.peg_finder_config.claw_open_order_1);
+  context.peg_finder_config.claw_open_order_2 = preferences.getUChar(
+      "pf_claw_2", context.peg_finder_config.claw_open_order_2);
+  context.peg_finder_config.claw_open_order_3 = preferences.getUChar(
+      "pf_claw_3", context.peg_finder_config.claw_open_order_3);
+  context.peg_finder_config.post_claws_open_delay_ms = preferences.getUInt(
+      "pf_claw_d", context.peg_finder_config.post_claws_open_delay_ms);
+  context.peg_finder_config.funnel_reverse_duty = std::fabs(
+      preferences.getFloat("pf_revfun_d",
+                           context.peg_finder_config.funnel_reverse_duty));
+  context.peg_finder_config.funnel_reverse_duration_ms = preferences.getUInt(
+      "pf_revfun_ms",
+      context.peg_finder_config.funnel_reverse_duration_ms);
   context.time_trial_config.post_solar_delay_ms = preferences.getUInt(
       "tt_sdly", context.time_trial_config.post_solar_delay_ms);
-  context.time_trial_config.solar_to_tower_strafe_right_duty = std::fabs(
-      preferences.getFloat(
-          "tt_sduty",
-          context.time_trial_config.solar_to_tower_strafe_right_duty));
   context.time_trial_config.solar_to_tower_strafe_right_duration_ms =
       preferences.getUInt(
           "tt_sms",
@@ -9240,13 +14104,22 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
   context.solar_contact_config.timeout_ms =
       preferences.getUInt("sctmo",
                           context.solar_contact_config.timeout_ms);
+  context.solar_contact_config.initial_strafe_right_duty =
+      preferences.getFloat(
+          "si_str_d", context.imu_heading_hold_config.maximum_strafe_duty);
+  context.solar_contact_config.retry_strafe_left_duty =
+      preferences.getFloat(
+          "sl_str_d", context.imu_heading_hold_config.maximum_strafe_duty);
+  context.solar_contact_config.retry_strafe_right_duty =
+      preferences.getFloat(
+          "sr_str_d", context.imu_heading_hold_config.maximum_strafe_duty);
   context.solar_contact_config.strafe_start_delay_ms =
       preferences.getUInt(
           "sdelay",
           context.solar_contact_config.strafe_start_delay_ms);
-  context.solar_contact_config.strafe_duty =
+  context.solar_contact_config.retry_forward_duty =
       preferences.getFloat("sstrfd",
-                           context.solar_contact_config.strafe_duty);
+                           context.solar_contact_config.retry_forward_duty);
   context.solar_contact_config.retry_strafe_left_duration_ms =
       preferences.getUInt(
           "srleft",
@@ -9265,10 +14138,6 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       preferences.getFloat(
           "spcfduty",
           context.solar_contact_config.post_contact_forward_duty);
-  context.solar_contact_config.line_reacquire_strafe_duty =
-      preferences.getFloat(
-          "slrduty",
-          context.solar_contact_config.line_reacquire_strafe_duty);
   context.solar_contact_config.post_contact_forward_start_delay_ms =
       preferences.getUInt(
           "sfdly",
@@ -9277,6 +14146,30 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       preferences.getUInt(
           "slfdly",
           context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
+  context.solar_contact_config.line_reacquire_strafe_duty =
+      preferences.getFloat(
+          "slstrd",
+          preferences.getFloat(
+              "slapp",
+              context.imu_heading_hold_config.maximum_strafe_duty));
+  context.solar_contact_config.rear_line_follow_duration_ms =
+      preferences.getUInt(
+          "slpidms",
+          context.solar_contact_config.rear_line_follow_duration_ms);
+  context.solar_hook_servo_settings.open_angle_deg =
+      preferences.getInt(
+          "shopen",
+          context.solar_hook_servo_settings.open_angle_deg);
+  context.solar_hook_servo_settings.closed_angle_deg =
+      preferences.getInt(
+          "shclosed",
+          context.solar_hook_servo_settings.closed_angle_deg);
+  if (!solarHookAngleSettingValid(
+          context.solar_hook_servo_settings.open_angle_deg) ||
+      !solarHookAngleSettingValid(
+          context.solar_hook_servo_settings.closed_angle_deg)) {
+    context.solar_hook_servo_settings = {};
+  }
 
   ClawServoSettings claw_settings = claws.settings();
   constexpr const char* kOpenPreferenceKeys[kClawServoCount] = {
@@ -9315,6 +14208,14 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       "wopen", claw_settings.open_angle_deg[kWinchServoIndex]);
   claw_settings.closed_angle_deg[kWinchServoIndex] = preferences.getInt(
       "wclosed", claw_settings.closed_angle_deg[kWinchServoIndex]);
+  claw_settings.open_angle_deg[kHabitatPusherServoIndex] =
+      preferences.getInt(
+          "pushopen",
+          claw_settings.open_angle_deg[kHabitatPusherServoIndex]);
+  claw_settings.closed_angle_deg[kHabitatPusherServoIndex] =
+      preferences.getInt(
+          "pushclose",
+          claw_settings.closed_angle_deg[kHabitatPusherServoIndex]);
   claws.applySettings(claw_settings);
 
   const robot::CommandValidationResult validation =
@@ -9325,6 +14226,16 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
     context.config.maxDuty = cap;
     context.config.maxCorrection =
         clampFloat(context.config.maxCorrection, 0.0F, cap);
+  }
+  if (!std::isfinite(context.habitat_pieces_config.line_follow_duty) ||
+      context.habitat_pieces_config.line_follow_duty <= 0.0F ||
+      context.habitat_pieces_config.line_follow_duty >
+          activeMotionDutyCap(context)) {
+    context.habitat_pieces_config.line_follow_duty =
+        robot::kDefaultHabitatPiecesLineFollowDuty <=
+                activeMotionDutyCap(context)
+            ? robot::kDefaultHabitatPiecesLineFollowDuty
+            : 0.0F;
   }
   const robot::CommandValidationResult rear_validation =
       robot::validateLineFollowerConfig(context.rear_config,
@@ -9380,6 +14291,7 @@ void motionControlTask(void* parameters) {
   ClawServoBank claws{robot::esp2::kHardwareConfig.servo_claw_1,
                       robot::esp2::kHardwareConfig.servo_claw_2,
                       robot::esp2::kHardwareConfig.servo_claw_3,
+                      robot::esp2::kHardwareConfig.servo_habitat_pusher,
                       robot::esp2::kHardwareConfig.servo_winch};
   static robot::esp2::ImuAcquisitionService imu_acquisition{};
   Preferences preferences{};
@@ -9400,15 +14312,19 @@ void motionControlTask(void* parameters) {
       static_cast<robot::Milliseconds>(millis());
   (void)sendStoppedRearCommand(rear_link, context.config, startup_now_ms);
   (void)sendStoppedFunnelCommand(rear_link, context.config, startup_now_ms);
+  (void)sendStoppedSolarHookCommand(rear_link);
   delay(kPreCalibrationStopSettleMs);
   startup_now_ms = static_cast<robot::Milliseconds>(millis());
   (void)sendStoppedRearCommand(rear_link, context.config, startup_now_ms);
   (void)sendStoppedFunnelCommand(rear_link, context.config, startup_now_ms);
+  (void)sendStoppedSolarHookCommand(rear_link);
 
   const bool imu_ready = imu_acquisition.initialize(
       Wire, robot::esp2::kPins.imu_sda, robot::esp2::kPins.imu_scl,
       kImuI2cAddress, kImuCalibrationSampleCount);
-  (void)imu_acquisition.latest(context.latest_imu_snapshot);
+  context.imu_shared_snapshot_available =
+      imu_acquisition.latest(context.latest_imu_snapshot);
+  context.imu_shared_snapshot_fetched_at_us = micros();
   const robot::esp2::ImuState& startup_imu_state =
       context.latest_imu_snapshot.state;
   char imu_event_message[robot::kEventMessageSize]{};
@@ -9454,17 +14370,17 @@ void motionControlTask(void* parameters) {
              robot::EventSeverity::Warn, robot::EventSource::System,
              "IMU sensor acquisition task failed to start");
   }
-  (void)imu_acquisition.latest(context.latest_imu_snapshot);
-  context.imu_health_observed = true;
-  context.imu_was_healthy =
-      context.latest_imu_snapshot.state.healthy &&
-      robot::esp2::imuSnapshotFresh(
-          context.latest_imu_snapshot, micros(), kImuFreshnessTimeoutUs);
+  context.imu_shared_snapshot_available =
+      imu_acquisition.latest(context.latest_imu_snapshot);
+  context.imu_shared_snapshot_fetched_at_us = micros();
 
   preferences.begin("telemetry", false);
   loadPreferences(preferences, context, front_left_motor, front_right_motor,
                   claws);
   resetSolarPanelAutonomy(context, static_cast<robot::Milliseconds>(millis()));
+  resetHabitatPieces(context, static_cast<robot::Milliseconds>(millis()));
+  resetHabitatPlacement(context,
+                        static_cast<robot::Milliseconds>(millis()));
   resetTowerPieces(context, static_cast<robot::Milliseconds>(millis()));
   resetPegFinder(context, static_cast<robot::Milliseconds>(millis()));
   resetTimeTrial(context, static_cast<robot::Milliseconds>(millis()));
@@ -9498,7 +14414,22 @@ void motionControlTask(void* parameters) {
     previous_loop_started_us = loop_started_us;
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
-    (void)imu_acquisition.latest(context.latest_imu_snapshot);
+    context.imu_shared_snapshot_available =
+        imu_acquisition.latest(context.latest_imu_snapshot);
+    context.imu_shared_snapshot_fetched_at_us = micros();
+    if (context.imu_shared_snapshot_available &&
+        context.latest_imu_snapshot
+                .last_successful_sample_published_at_us != 0U) {
+      const std::uint32_t observed_publication_gap_us =
+          context.imu_shared_snapshot_fetched_at_us -
+          context.latest_imu_snapshot
+              .last_successful_sample_published_at_us;
+      if (observed_publication_gap_us >
+          context.maximum_observed_imu_publication_gap_us) {
+        context.maximum_observed_imu_publication_gap_us =
+            observed_publication_gap_us;
+      }
+    }
     context.diagnostic_imu_update_us =
         context.latest_imu_snapshot.acquisition_duration_us;
     if (context.imu_heading_reset_pending_sequence != 0U &&
@@ -9509,22 +14440,7 @@ void motionControlTask(void* parameters) {
                robot::EventSource::System,
                "IMU relative heading reset applied");
     }
-    const bool imu_healthy =
-        context.latest_imu_snapshot.state.healthy &&
-        robot::esp2::imuSnapshotFresh(
-            context.latest_imu_snapshot, micros(),
-            kImuFreshnessTimeoutUs);
-    if (context.imu_health_observed &&
-        imu_healthy != context.imu_was_healthy) {
-      logEvent(context, now_ms,
-               imu_healthy ? robot::EventSeverity::Info
-                           : robot::EventSeverity::Warn,
-               robot::EventSource::System,
-               imu_healthy ? "IMU recovered"
-                           : "IMU became unhealthy");
-    }
-    context.imu_health_observed = true;
-    context.imu_was_healthy = imu_healthy;
+    recordImuAvailabilityDiagnostics(context, now_ms);
     const std::uint32_t web_started_us = micros();
     g_server.handleClient();
     context.diagnostic_web_handle_us =
@@ -9557,7 +14473,9 @@ void motionControlTask(void* parameters) {
          context.modes.currentMode() ==
              robot::RobotTestMode::ManualDriveTest ||
          context.modes.currentMode() ==
-             robot::RobotTestMode::DistributedDriveTest);
+             robot::RobotTestMode::DistributedDriveTest ||
+         context.modes.currentMode() ==
+             robot::RobotTestMode::ImuStrafeTest);
     if (timed_mode_expired || stale_command) {
       const robot::Milliseconds diagnostic_now_ms =
           static_cast<robot::Milliseconds>(millis());
@@ -9566,6 +14484,13 @@ void motionControlTask(void* parameters) {
           &context.latest_imu_snapshot,
           robot::MotionDiagnosticEvent::CommandDeadmanExpired,
           diagnostic_now_ms);
+      if (context.modes.currentMode() ==
+          robot::RobotTestMode::ImuStrafeTest) {
+        robot::stopImuHeadingHold(context.imu_heading_hold_state);
+        context.last_imu_heading_hold_update = {};
+        context.last_imu_heading_hold_update.state =
+            context.imu_heading_hold_state.state;
+      }
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
                        now_ms);
       recordMotionDiagnostic(
@@ -9591,6 +14516,18 @@ void motionControlTask(void* parameters) {
             robot::SolarPanelAutonomyState::WaitForStart) {
       resetSolarPanelAutonomy(context, now_ms);
     }
+    if (mode != robot::RobotTestMode::HabitatPieces &&
+        (context.habitat_pieces.state !=
+             robot::HabitatPiecesState::WaitForStart ||
+         context.habitat_pieces_start_requested)) {
+      resetHabitatPieces(context, now_ms);
+    }
+    if (mode != robot::RobotTestMode::HabitatPlacement &&
+        (context.habitat_placement.state !=
+             robot::HabitatPlacementState::WaitForStart ||
+         context.habitat_placement_start_requested)) {
+      resetHabitatPlacement(context, now_ms);
+    }
     if (mode != robot::RobotTestMode::AutonomousTowerPieces &&
         mode != robot::RobotTestMode::TimeTrial &&
         context.tower_pieces.state !=
@@ -9607,8 +14544,20 @@ void motionControlTask(void* parameters) {
       resetTimeTrial(context, now_ms);
     }
     if (mode != robot::RobotTestMode::ImuTurnTest &&
+        mode != robot::RobotTestMode::AutonomousTowerPieces &&
+        mode != robot::RobotTestMode::HabitatPlacement &&
+        mode != robot::RobotTestMode::PegFinder &&
+        mode != robot::RobotTestMode::TimeTrial &&
         context.imu_turn_state.state != robot::ImuTurnState::Idle) {
       resetImuTurn(context);
+    }
+    if (mode != robot::RobotTestMode::ImuStrafeTest &&
+        mode != robot::RobotTestMode::AutonomousSolarPanel &&
+        mode != robot::RobotTestMode::AutonomousTowerPieces &&
+        mode != robot::RobotTestMode::TimeTrial &&
+        context.imu_heading_hold_state.state !=
+            robot::ImuHeadingHoldState::Idle) {
+      resetImuHeadingHold(context);
     }
     if (robot::robotTestModeIsSensorOnly(mode)) {
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
@@ -9621,10 +14570,21 @@ void motionControlTask(void* parameters) {
       }
     } else if (mode == robot::RobotTestMode::ImuTurnTest) {
       runImuTurnTest(context, front_left_motor, front_right_motor,
-                     rear_link, context.latest_imu_snapshot, now_ms);
+                     rear_link, imu_acquisition, now_ms);
+    } else if (mode == robot::RobotTestMode::ImuStrafeTest) {
+      runImuHeadingHoldTest(
+          context, front_left_motor, front_right_motor, rear_link,
+          imu_acquisition, now_ms);
     } else if (mode == robot::RobotTestMode::AutonomousSolarPanel) {
       runSolarPanelAutonomy(context, line_sensor_reader, front_left_motor,
                             front_right_motor, rear_link, now_ms);
+    } else if (mode == robot::RobotTestMode::HabitatPieces) {
+      runHabitatPieces(context, line_sensor_reader, front_left_motor,
+                       front_right_motor, rear_link, now_ms);
+    } else if (mode == robot::RobotTestMode::HabitatPlacement) {
+      runHabitatPlacement(context, line_sensor_reader, front_left_motor,
+                          front_right_motor, rear_link, claws, stepper,
+                          now_ms);
     } else if (mode == robot::RobotTestMode::AutonomousTowerPieces) {
       runTowerPiecesAutonomy(context, front_left_motor, front_right_motor,
                              rear_link, claws, stepper, now_ms);
@@ -9757,7 +14717,8 @@ void motionControlTask(void* parameters) {
         mode == robot::RobotTestMode::PegFinder ||
         time_trial_rear_phase;
     const robot::Milliseconds configured_period_ms =
-        mode == robot::RobotTestMode::ImuTurnTest
+        (mode == robot::RobotTestMode::ImuTurnTest ||
+         mode == robot::RobotTestMode::ImuStrafeTest)
             ? kDefaultMotionTaskPeriodMs
             : (rear_line_mode ? context.rear_config.controlPeriodMs
                               : context.config.controlPeriodMs);

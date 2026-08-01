@@ -9,7 +9,8 @@
 
 namespace robot {
 
-constexpr std::uint16_t kEsp1StatusPayloadSize = 45U;
+constexpr std::uint16_t kLegacyEsp1StatusPayloadSize = 45U;
+constexpr std::uint16_t kEsp1StatusPayloadSize = 47U;
 constexpr std::uint8_t kEsp1StatusFaultActiveFlag = 0x01U;
 constexpr std::uint8_t kEsp1StatusBackLeftInvertedFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusBackRightInvertedFlag = 0x04U;
@@ -24,6 +25,9 @@ constexpr std::uint8_t kEsp1StatusSideLineConfiguredFlag = 0x08U;
 constexpr std::uint8_t kEsp1StatusSideLineHighFlag = 0x10U;
 constexpr std::uint8_t kEsp1StatusUltrasonic1ConfiguredFlag = 0x20U;
 constexpr std::uint8_t kEsp1StatusUltrasonic1EchoValidFlag = 0x40U;
+constexpr std::uint8_t kEsp1StatusSolarHookConfiguredFlag = 0x01U;
+constexpr std::uint8_t kEsp1StatusSolarHookOutputEnabledFlag = 0x02U;
+constexpr std::uint8_t kEsp1StatusSolarHookUnsetAngle = 0xFFU;
 
 struct Esp1StatusReport {
   Milliseconds uptime_ms{0};
@@ -45,6 +49,9 @@ struct Esp1StatusReport {
   bool ultrasonic_1_echo_valid{false};
   std::uint16_t ultrasonic_1_distance_mm{0};
   std::uint32_t ultrasonic_1_echo_duration_us{0};
+  bool solar_hook_configured{false};
+  bool solar_hook_output_enabled{false};
+  std::int16_t solar_hook_commanded_angle_deg{-1};
   std::uint16_t ir_adc_average{0};
   std::uint16_t ir_adc_min{0};
   std::uint16_t ir_adc_max{0};

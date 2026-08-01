@@ -18,9 +18,21 @@ mechanical orientation before enabling hardware outputs.
   bias-corrected gyro Z rate. It is not wrapped at `+/-180` or `360` degrees.
 - An IMU turn captures the current heading once and adds `+90` or `-90` degrees
   to form the target.
+- Mode fields labeled clockwise are positive physical angles. Firmware converts
+  them into the IMU heading sign with `yaw_command_polarity`; entering `90`
+  therefore requests a 90-degree clockwise chassis turn for either valid IMU
+  mounting polarity.
+- An IMU heading-held strafe captures the current heading once at strafe start
+  and retains that target until Stop, fault, deadman expiry, or mode change.
 - The sensor's positive mounted Z direction is not assumed to match the
   drivetrain's positive-yaw direction. `yaw_command_polarity` must be measured
   with the wheels raised and set to `+1` or `-1` before turn motion is allowed.
+- Stage 2 turns and Stage 3 strafes have independently tuned gains but use the
+  same measured yaw-command polarity convention.
+- Autonomous Solar, Tower Pieces (including shimmy), PegFinder, and the
+  Time Trial transition reuse those same live Stage 2/Stage 3 tuning objects;
+  mode panels provide only the required turn angles and strafe durations or
+  timeouts.
 - Line-following error and steering polarity remain independent of IMU heading.
 
 ## Line Error

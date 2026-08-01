@@ -64,6 +64,9 @@ RobotTestMode byteToMode(const std::uint8_t value) {
     case RobotTestMode::PegFinder:
     case RobotTestMode::TimeTrial:
     case RobotTestMode::ImuTurnTest:
+    case RobotTestMode::ImuStrafeTest:
+    case RobotTestMode::HabitatPieces:
+    case RobotTestMode::HabitatPlacement:
       return static_cast<RobotTestMode>(value);
   }
   return RobotTestMode::Disabled;
@@ -148,6 +151,20 @@ UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
   packet.payload[38] = sensor_flags;
   putU16(&packet.payload[39], report.ultrasonic_1_distance_mm);
   putU32(&packet.payload[41], report.ultrasonic_1_echo_duration_us);
+  std::uint8_t solar_hook_flags = 0U;
+  solar_hook_flags |= report.solar_hook_configured
+                          ? kEsp1StatusSolarHookConfiguredFlag
+                          : 0U;
+  solar_hook_flags |= report.solar_hook_output_enabled
+                          ? kEsp1StatusSolarHookOutputEnabledFlag
+                          : 0U;
+  packet.payload[45] = solar_hook_flags;
+  packet.payload[46] =
+      report.solar_hook_commanded_angle_deg >= 0 &&
+              report.solar_hook_commanded_angle_deg <= 180
+          ? static_cast<std::uint8_t>(
+                report.solar_hook_commanded_angle_deg)
+          : kEsp1StatusSolarHookUnsetAngle;
   packet.header.integrity_crc16 = calculatePacketIntegrity(packet);
   return packet;
 }
@@ -156,7 +173,8 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
                             Esp1StatusReport& report) {
   if (!packetLooksValid(packet) ||
       packet.header.message_type != UartMessageType::HealthReport ||
-      packet.header.payload_size != kEsp1StatusPayloadSize) {
+      (packet.header.payload_size != kEsp1StatusPayloadSize &&
+       packet.header.payload_size != kLegacyEsp1StatusPayloadSize)) {
     report = {};
     return false;
   }
@@ -210,6 +228,16 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
       (sensor_flags & kEsp1StatusUltrasonic1EchoValidFlag) != 0U;
   report.ultrasonic_1_distance_mm = getU16(&packet.payload[39]);
   report.ultrasonic_1_echo_duration_us = getU32(&packet.payload[41]);
+  if (packet.header.payload_size >= kEsp1StatusPayloadSize) {
+    const std::uint8_t solar_hook_flags = packet.payload[45];
+    report.solar_hook_configured =
+        (solar_hook_flags & kEsp1StatusSolarHookConfiguredFlag) != 0U;
+    report.solar_hook_output_enabled =
+        (solar_hook_flags & kEsp1StatusSolarHookOutputEnabledFlag) != 0U;
+    const std::uint8_t angle_deg = packet.payload[46];
+    report.solar_hook_commanded_angle_deg =
+        angle_deg <= 180U ? static_cast<std::int16_t>(angle_deg) : -1;
+  }
   return true;
 }
 

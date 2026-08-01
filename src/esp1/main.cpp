@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <Wire.h>
+
+#include <freertos/queue.h>
 
 #include <cmath>
 #include <cstdint>
@@ -7,13 +10,16 @@
 #include "common/Esp1Status.h"
 #include "common/FaultHealth.h"
 #include "common/FunnelCommand.h"
+#include "common/LaserDistance.h"
 #include "common/MotorOutput.h"
 #include "common/RearDriveCommand.h"
 #include "common/RearLineSensor.h"
+#include "common/SolarHookServo.h"
 #include "common/Ultrasonic.h"
 #include "common/UartProtocol.h"
 #include "esp1/MissionStateMachine.h"
 #include "esp1/PinConfig.h"
+#include "esp1/Vl53l0xDistanceSensor.h"
 
 namespace {
 
@@ -36,6 +42,10 @@ constexpr int kSolarLimitFrontRightSideGpio =
     robot::esp1::kHardwareConfig.pins.limit_switch_front_right_side;
 constexpr int kSideLineSensorGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_side;
+constexpr int kSideLineSensor2Gpio =
+    robot::esp1::kHardwareConfig.pins.line_sensor_side_2;
+constexpr int kSideLineSensor3Gpio =
+    robot::esp1::kHardwareConfig.pins.line_sensor_side_3;
 constexpr int kRearLineSensorLeftGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_back_left;
 constexpr int kRearLineSensorRightGpio =
@@ -56,6 +66,7 @@ constexpr std::uint16_t kIrAdcSamplesPerYield = 50U;
 constexpr bool kIrDebugTelemetryMode = false;
 constexpr robot::Milliseconds kEsp1StatusPeriodMs =
     kIrDebugTelemetryMode ? 50U : 100U;
+constexpr robot::Milliseconds kSensorServicePeriodMs = 10U;
 constexpr robot::Milliseconds kIrSerialDebugPeriodMs = 100U;
 constexpr std::uint32_t kSensorTaskStackBytes = 8192U;
 constexpr UBaseType_t kSensorTaskPriority = 0U;
@@ -144,6 +155,14 @@ IrAdcWindowResult g_latest_ir_adc_result{};
 std::uint16_t g_ir_adc_samples[kIrAdcSamplesPerWindow]{};
 portMUX_TYPE g_ultrasonic_result_mux = portMUX_INITIALIZER_UNLOCKED;
 UltrasonicReading g_latest_ultrasonic_1_reading{};
+StaticQueue_t g_laser_snapshot_queue_buffer{};
+std::uint8_t g_laser_snapshot_queue_storage[
+    sizeof(robot::LaserDistanceSnapshot)]{};
+QueueHandle_t g_laser_snapshot_queue{nullptr};
+StaticQueue_t g_laser_profile_request_queue_buffer{};
+std::uint8_t g_laser_profile_request_queue_storage[
+    sizeof(robot::LaserDistanceProfile)]{};
+QueueHandle_t g_laser_profile_request_queue{nullptr};
 
 bool gpioAssigned(const int gpio) {
   return gpio >= 0;
@@ -158,6 +177,21 @@ bool motorConfigComplete(
          (config.forward_sign == 1 || config.forward_sign == -1) &&
          config.h_bridge_mode !=
              robot::esp1::DualPwmHBridgeMode::Unconfigured;
+}
+
+bool servoConfigComplete(
+    const robot::esp1::ServoOutputConfig& config) {
+  if (!gpioAssigned(config.gpio) || config.pwm_channel < 0 ||
+      config.pwm_frequency_hz == 0U ||
+      config.pwm_resolution_bits == 0U ||
+      config.pwm_resolution_bits >= 31U ||
+      config.minimum_pulse_us == 0U ||
+      config.maximum_pulse_us <= config.minimum_pulse_us) {
+    return false;
+  }
+  const std::uint32_t period_us =
+      1000000UL / config.pwm_frequency_hz;
+  return period_us > config.maximum_pulse_us;
 }
 
 bool uartConfigComplete(const robot::esp1::UartConfig& config) {
@@ -184,6 +218,14 @@ bool solarPanelLimitSwitchesConfigComplete() {
 
 bool sideLineSensorConfigComplete() {
   return gpioAssigned(kSideLineSensorGpio);
+}
+
+bool sideLineSensor2ConfigComplete() {
+  return gpioAssigned(kSideLineSensor2Gpio);
+}
+
+bool sideLineSensor3ConfigComplete() {
+  return gpioAssigned(kSideLineSensor3Gpio);
 }
 
 bool rearLineSensorsConfigComplete() {
@@ -217,6 +259,57 @@ UltrasonicReading latestUltrasonic1Reading() {
   const UltrasonicReading reading = g_latest_ultrasonic_1_reading;
   portEXIT_CRITICAL(&g_ultrasonic_result_mux);
   return reading;
+}
+
+bool initializeLaserSnapshotMailbox() {
+  if (g_laser_snapshot_queue != nullptr) {
+    return false;
+  }
+  g_laser_snapshot_queue = xQueueCreateStatic(
+      1U, sizeof(robot::LaserDistanceSnapshot),
+      g_laser_snapshot_queue_storage, &g_laser_snapshot_queue_buffer);
+  return g_laser_snapshot_queue != nullptr;
+}
+
+bool initializeLaserProfileRequestMailbox() {
+  if (g_laser_profile_request_queue != nullptr) {
+    return false;
+  }
+  g_laser_profile_request_queue = xQueueCreateStatic(
+      1U, sizeof(robot::LaserDistanceProfile),
+      g_laser_profile_request_queue_storage,
+      &g_laser_profile_request_queue_buffer);
+  return g_laser_profile_request_queue != nullptr;
+}
+
+void requestLaserDistanceProfile(
+    const robot::LaserDistanceProfile profile) {
+  if (g_laser_profile_request_queue != nullptr) {
+    (void)xQueueOverwrite(g_laser_profile_request_queue, &profile);
+  }
+}
+
+bool takeLaserDistanceProfileRequest(
+    robot::LaserDistanceProfile& profile) {
+  return g_laser_profile_request_queue != nullptr &&
+         xQueueReceive(g_laser_profile_request_queue, &profile, 0U) ==
+             pdPASS;
+}
+
+void storeLaserDistanceSnapshot(
+    const robot::LaserDistanceSnapshot& snapshot) {
+  if (g_laser_snapshot_queue != nullptr) {
+    (void)xQueueOverwrite(g_laser_snapshot_queue, &snapshot);
+  }
+}
+
+bool latestLaserDistanceSnapshot(
+    robot::LaserDistanceSnapshot& snapshot) {
+  if (g_laser_snapshot_queue == nullptr) {
+    snapshot = {};
+    return false;
+  }
+  return xQueuePeek(g_laser_snapshot_queue, &snapshot, 0U) == pdPASS;
 }
 
 UltrasonicReading readUltrasonic1() {
@@ -271,6 +364,12 @@ void initializeSideLineSensor() {
   if (sideLineSensorConfigComplete()) {
     pinMode(kSideLineSensorGpio, INPUT);
   }
+  if (sideLineSensor2ConfigComplete()) {
+    pinMode(kSideLineSensor2Gpio, INPUT);
+  }
+  if (sideLineSensor3ConfigComplete()) {
+    pinMode(kSideLineSensor3Gpio, INPUT);
+  }
 }
 
 void initializeRearLineSensors() {
@@ -296,6 +395,16 @@ robot::RearLineSensorSnapshot readRearLineSensors(
   if (snapshot.side_configured) {
     snapshot.side_electrical_high =
         digitalRead(kSideLineSensorGpio) == HIGH;
+  }
+  snapshot.side_2_configured = sideLineSensor2ConfigComplete();
+  if (snapshot.side_2_configured) {
+    snapshot.side_2_electrical_high =
+        digitalRead(kSideLineSensor2Gpio) == HIGH;
+  }
+  snapshot.side_3_configured = sideLineSensor3ConfigComplete();
+  if (snapshot.side_3_configured) {
+    snapshot.side_3_electrical_high =
+        digitalRead(kSideLineSensor3Gpio) == HIGH;
   }
   return snapshot;
 }
@@ -568,6 +677,87 @@ class DualPwmMotorOutput final : public robot::IMotorOutput {
   robot::MotorCommand last_command_{};
 };
 
+class SolarHookServoOutput {
+ public:
+  explicit SolarHookServoOutput(
+      const robot::esp1::ServoOutputConfig& config)
+      : config_(config) {}
+
+  void initializeDisabled() {
+    configured_ = servoConfigComplete(config_);
+    if (!configured_) {
+      return;
+    }
+    ledcSetup(config_.pwm_channel, config_.pwm_frequency_hz,
+              config_.pwm_resolution_bits);
+    pinMode(config_.gpio, INPUT);
+    disable();
+  }
+
+  bool apply(const robot::SolarHookCommand& command) {
+    if (!configured_) {
+      return false;
+    }
+    if (!command.enabled) {
+      disable();
+      return true;
+    }
+
+    ledcSetup(config_.pwm_channel, config_.pwm_frequency_hz,
+              config_.pwm_resolution_bits);
+    ledcAttachPin(config_.gpio, config_.pwm_channel);
+    ledcWrite(config_.pwm_channel,
+              dutyForPulseUs(pulseUsForAngle(command.angle_deg)));
+    output_enabled_ = true;
+    commanded_angle_deg_ =
+        static_cast<std::int16_t>(command.angle_deg);
+    return true;
+  }
+
+  void disable() {
+    if (configured_) {
+      ledcWrite(config_.pwm_channel, 0U);
+      ledcDetachPin(config_.gpio);
+      pinMode(config_.gpio, INPUT);
+    }
+    output_enabled_ = false;
+    commanded_angle_deg_ = -1;
+  }
+
+  bool configured() const { return configured_; }
+  bool outputEnabled() const { return output_enabled_; }
+  std::int16_t commandedAngleDeg() const {
+    return commanded_angle_deg_;
+  }
+
+ private:
+  std::uint32_t pulseUsForAngle(
+      const std::uint8_t angle_deg) const {
+    const std::uint32_t pulse_range_us =
+        static_cast<std::uint32_t>(
+            config_.maximum_pulse_us - config_.minimum_pulse_us);
+    return config_.minimum_pulse_us +
+           ((static_cast<std::uint32_t>(angle_deg) *
+                 pulse_range_us +
+             90U) /
+            180U);
+  }
+
+  std::uint32_t dutyForPulseUs(
+      const std::uint32_t pulse_us) const {
+    const std::uint32_t period_us =
+        1000000UL / config_.pwm_frequency_hz;
+    return ((pulse_us * pwmMaxDuty(config_.pwm_resolution_bits)) +
+            (period_us / 2U)) /
+           period_us;
+  }
+
+  const robot::esp1::ServoOutputConfig& config_;
+  bool configured_{false};
+  bool output_enabled_{false};
+  std::int16_t commanded_angle_deg_{-1};
+};
+
 std::uint16_t motorMagnitudeMilli(const DualPwmMotorOutput& back_left,
                                   const DualPwmMotorOutput& back_right) {
   const std::uint16_t left =
@@ -642,6 +832,7 @@ void publishEsp1Status(RearCommandLink& link,
                        const DualPwmMotorOutput& back_left,
                        const DualPwmMotorOutput& back_right,
                        const DualPwmMotorOutput& funnel_motor,
+                       const SolarHookServoOutput& solar_hook,
                        const robot::RearDriveStatus& rear_status,
                        const robot::FunnelStatus& funnel_status,
                        const robot::RearLineSensorSnapshot& line_sensors,
@@ -675,6 +866,10 @@ void publishEsp1Status(RearCommandLink& link,
   report.funnel_applied_command_milli =
       funnel_motor.lastAppliedCommand().duty_command_milli;
   report.funnel_configured = funnel_motor.configured();
+  report.solar_hook_configured = solar_hook.configured();
+  report.solar_hook_output_enabled = solar_hook.outputEnabled();
+  report.solar_hook_commanded_angle_deg =
+      solar_hook.commandedAngleDeg();
   const SolarPanelLimitSwitchReading solar_limits =
       readSolarPanelLimitSwitches();
   report.solar_panel_limit_switches_configured =
@@ -713,6 +908,39 @@ void publishRearLineSensors(
     const robot::RearLineSensorSnapshot& snapshot) {
   static std::uint16_t sequence = 0U;
   link.send(robot::makeRearLineSensorPacket(snapshot, sequence++));
+}
+
+void publishLaserDistance(RearCommandLink& link,
+                          const robot::Milliseconds now_ms) {
+  static robot::Milliseconds last_publish_ms = 0U;
+  static std::uint16_t packet_sequence = 0U;
+  static std::uint16_t last_measurement_sequence = 0U;
+  static robot::LaserDistanceProfile last_profile =
+      robot::LaserDistanceProfile::HighAccuracy;
+  static bool published_once = false;
+
+  robot::LaserDistanceSnapshot snapshot{};
+  if (!latestLaserDistanceSnapshot(snapshot)) {
+    return;
+  }
+  const bool new_measurement =
+      !published_once ||
+      snapshot.measurement_sequence != last_measurement_sequence;
+  const bool new_profile =
+      !published_once || snapshot.profile != last_profile;
+  const bool heartbeat_due =
+      now_ms - last_publish_ms >= kEsp1StatusPeriodMs;
+  if (!new_measurement && !new_profile && !heartbeat_due) {
+    return;
+  }
+
+  if (link.send(
+          robot::makeLaserDistancePacket(snapshot, packet_sequence++))) {
+    published_once = true;
+    last_measurement_sequence = snapshot.measurement_sequence;
+    last_profile = snapshot.profile;
+    last_publish_ms = now_ms;
+  }
 }
 
 void printRearStatus(const robot::RearDriveStatus& status,
@@ -785,6 +1013,7 @@ void printIrDebugLine(const DualPwmMotorOutput& back_left,
 void sensorAcquisitionTask(void* parameters) {
   (void)parameters;
 
+  robot::esp1::Vl53l0xDistanceSensor laser_distance_sensor{};
   bool detected = false;
   std::uint8_t detect_count = 0U;
   std::uint8_t clear_count = 0U;
@@ -810,31 +1039,57 @@ void sensorAcquisitionTask(void* parameters) {
   initializeUltrasonic1();
   storeUltrasonic1Reading(
       UltrasonicReading{0U, 0U, ultrasonic1ConfigComplete(), false});
+  (void)laser_distance_sensor.initialize(
+      Wire, robot::esp1::kHardwareConfig.laser_distance_sensor);
+  storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
 
   TickType_t last_wake_tick = xTaskGetTickCount();
+  robot::Milliseconds last_slow_acquisition_ms =
+      static_cast<robot::Milliseconds>(millis()) -
+      kEsp1StatusPeriodMs;
 
   for (;;) {
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
-    switch_state = updateIrSwitch(switch_state, now_ms);
-    const std::uint32_t selected_frequency_hz =
-        selectedFrequencyHzForSwitch(switch_state.debounced_high);
-    if (selected_frequency_hz != last_selected_frequency_hz) {
-      detected = false;
-      detect_count = 0U;
-      clear_count = 0U;
-      last_selected_frequency_hz = selected_frequency_hz;
+    robot::LaserDistanceProfile requested_profile{};
+    if (takeLaserDistanceProfileRequest(requested_profile)) {
+      (void)laser_distance_sensor.setProfile(
+          robot::esp1::kHardwareConfig.laser_distance_sensor,
+          requested_profile);
+      storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
+    }
+    if (laser_distance_sensor.service(now_ms)) {
+      storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
     }
 
-    if (irAdcConfigComplete()) {
-      const IrAdcWindowResult result =
-          sampleIrAdcWindow(switch_state, detected, detect_count,
-                            clear_count);
-      storeIrAdcResult(result);
-    }
-    storeUltrasonic1Reading(readUltrasonic1());
+    if (now_ms - last_slow_acquisition_ms >= kEsp1StatusPeriodMs) {
+      last_slow_acquisition_ms = now_ms;
+      switch_state = updateIrSwitch(switch_state, now_ms);
+      const std::uint32_t selected_frequency_hz =
+          selectedFrequencyHzForSwitch(switch_state.debounced_high);
+      if (selected_frequency_hz != last_selected_frequency_hz) {
+        detected = false;
+        detect_count = 0U;
+        clear_count = 0U;
+        last_selected_frequency_hz = selected_frequency_hz;
+      }
 
-    vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(kEsp1StatusPeriodMs));
+      if (irAdcConfigComplete()) {
+        const IrAdcWindowResult result =
+            sampleIrAdcWindow(switch_state, detected, detect_count,
+                              clear_count);
+        storeIrAdcResult(result);
+      }
+      storeUltrasonic1Reading(readUltrasonic1());
+    }
+
+    const TickType_t period_ticks =
+        pdMS_TO_TICKS(kSensorServicePeriodMs);
+    const TickType_t now_tick = xTaskGetTickCount();
+    if (now_tick - last_wake_tick > period_ticks) {
+      last_wake_tick = now_tick;
+    }
+    vTaskDelayUntil(&last_wake_tick, period_ticks);
   }
 }
 
@@ -847,6 +1102,8 @@ void rearDriveTask(void* parameters) {
       robot::esp1::kHardwareConfig.back_right_motor};
   DualPwmMotorOutput funnel_motor{
       robot::esp1::kHardwareConfig.funnel_motor};
+  SolarHookServoOutput solar_hook{
+      robot::esp1::kHardwareConfig.solar_hook_servo};
   RearCommandLink link{robot::esp1::kHardwareConfig.uart_to_esp2};
   robot::RearDriveCommandReceiver receiver{};
   robot::FunnelCommandReceiver funnel_receiver{};
@@ -854,12 +1111,16 @@ void rearDriveTask(void* parameters) {
   back_left_motor.initializeDisabled();
   back_right_motor.initializeDisabled();
   funnel_motor.initializeDisabled();
+  solar_hook.initializeDisabled();
   link.initialize();
   initializeSolarPanelLimitSwitches();
   initializeSideLineSensor();
   initializeRearLineSensors();
 
   TickType_t last_wake_tick = xTaskGetTickCount();
+  robot::LaserDistanceProfile last_requested_laser_profile =
+      robot::LaserDistanceProfile::HighAccuracy;
+  robot::Milliseconds last_laser_profile_request_ms = 0U;
 
   for (;;) {
     const robot::Milliseconds now_ms =
@@ -875,7 +1136,18 @@ void rearDriveTask(void* parameters) {
         receiver.acceptPacket(packet, now_ms);
       } else if (packet.header.message_type ==
                  robot::UartMessageType::MechanismCommand) {
-        funnel_receiver.acceptPacket(packet, now_ms);
+        if (packet.header.payload_size > 0U &&
+            packet.payload[0] ==
+                robot::kMechanismPayloadTargetSolarHook) {
+          robot::SolarHookCommand command{};
+          if (robot::decodeSolarHookCommandPacket(packet, command)) {
+            (void)solar_hook.apply(command);
+          }
+        } else {
+          // Preserve the funnel receiver's existing invalid-packet counting
+          // for malformed and unsupported mechanism commands.
+          funnel_receiver.acceptPacket(packet, now_ms);
+        }
       }
     }
     if (link.consumeInvalidFrameSeen()) {
@@ -886,6 +1158,24 @@ void rearDriveTask(void* parameters) {
 
     back_left_motor.apply(receiver.backLeftCommand(now_ms));
     back_right_motor.apply(receiver.backRightCommand(now_ms));
+    const robot::LaserDistanceProfile requested_laser_profile =
+        receiver.laserProfile(now_ms);
+    robot::LaserDistanceSnapshot laser_snapshot{};
+    const bool laser_profile_ready =
+        latestLaserDistanceSnapshot(laser_snapshot) &&
+        laser_snapshot.initialized && laser_snapshot.ranging &&
+        laser_snapshot.driver_status == 0 &&
+        laser_snapshot.profile == requested_laser_profile;
+    const bool profile_changed =
+        requested_laser_profile != last_requested_laser_profile;
+    const bool retry_due =
+        !laser_profile_ready &&
+        now_ms - last_laser_profile_request_ms >= kEsp1StatusPeriodMs;
+    if (profile_changed || retry_due) {
+      requestLaserDistanceProfile(requested_laser_profile);
+      last_requested_laser_profile = requested_laser_profile;
+      last_laser_profile_request_ms = now_ms;
+    }
     funnel_motor.apply(funnel_receiver.motorCommand(now_ms));
 
     const robot::RearDriveStatus rear_status = receiver.status(now_ms);
@@ -893,8 +1183,10 @@ void rearDriveTask(void* parameters) {
     const robot::RearLineSensorSnapshot line_sensors =
         readRearLineSensors(now_ms);
     publishEsp1Status(link, back_left_motor, back_right_motor, funnel_motor,
-                      rear_status, funnel_status, line_sensors, now_ms);
+                      solar_hook, rear_status, funnel_status, line_sensors,
+                      now_ms);
     publishRearLineSensors(link, line_sensors);
+    publishLaserDistance(link, now_ms);
     printRearStatus(rear_status, back_left_motor, back_right_motor, link,
                     now_ms);
     printIrDebugLine(back_left_motor, back_right_motor, now_ms);
@@ -907,6 +1199,8 @@ void rearDriveTask(void* parameters) {
 
 void setup() {
   Serial.begin(115200);
+  (void)initializeLaserSnapshotMailbox();
+  (void)initializeLaserProfileRequestMailbox();
   xTaskCreatePinnedToCore(sensorAcquisitionTask, "esp1_sensors",
                           kSensorTaskStackBytes, nullptr,
                           kSensorTaskPriority, nullptr, kSensorTaskCore);

@@ -56,6 +56,8 @@ const char* solarPanelAutonomyStateName(
       return "REAR_LINE_REACQUIRED";
     case SolarPanelAutonomyState::WaitBeforeStrafeLeftToRearLine:
       return "WAIT_BEFORE_STRAFE_LEFT_TO_REAR_LINE";
+    case SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection:
+      return "BACKWARD_LINE_FOLLOW_AFTER_REAR_DETECTION";
   }
   return "WAIT_FOR_START";
 }
@@ -75,6 +77,10 @@ const char* solarPanelFaultReasonName(
       return "REAR_LINK_STALE";
     case SolarPanelFaultReason::LimitSwitchTimeout:
       return "LIMIT_SWITCH_TIMEOUT";
+    case SolarPanelFaultReason::ImuUnavailable:
+      return "IMU_UNAVAILABLE";
+    case SolarPanelFaultReason::ImuStrafeFailed:
+      return "IMU_STRAFE_FAILED";
   }
   return "NONE";
 }
@@ -90,14 +96,25 @@ bool solarPanelContactConfigValid(
     const SolarPanelContactConfig& config) {
   return config.timeout_ms > 0U &&
          config.retry_strafe_timeout_ms > 0U &&
-         std::isfinite(config.strafe_duty) && config.strafe_duty >= 0.0F &&
-         config.strafe_duty <= 1.0F &&
-         std::isfinite(config.line_reacquire_strafe_duty) &&
-         config.line_reacquire_strafe_duty >= 0.0F &&
-         config.line_reacquire_strafe_duty <= 1.0F &&
+         std::isfinite(config.initial_strafe_right_duty) &&
+         config.initial_strafe_right_duty > 0.0F &&
+         config.initial_strafe_right_duty <= 1.0F &&
+         std::isfinite(config.retry_strafe_left_duty) &&
+         config.retry_strafe_left_duty > 0.0F &&
+         config.retry_strafe_left_duty <= 1.0F &&
+         std::isfinite(config.retry_strafe_right_duty) &&
+         config.retry_strafe_right_duty > 0.0F &&
+         config.retry_strafe_right_duty <= 1.0F &&
+         std::isfinite(config.retry_forward_duty) &&
+         config.retry_forward_duty >= 0.0F &&
+         config.retry_forward_duty <= 1.0F &&
          std::isfinite(config.post_contact_forward_duty) &&
          config.post_contact_forward_duty >= 0.0F &&
-         config.post_contact_forward_duty <= 1.0F;
+         config.post_contact_forward_duty <= 1.0F &&
+         std::isfinite(config.line_reacquire_strafe_duty) &&
+         config.line_reacquire_strafe_duty > 0.0F &&
+         config.line_reacquire_strafe_duty <= 1.0F &&
+         config.rear_line_follow_duration_ms > 0U;
 }
 
 SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
@@ -165,7 +182,9 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
         return {current_state, false};
       }
       if (reacquisition_line_detected) {
-        return {SolarPanelAutonomyState::RearLineReacquired, true};
+        return {
+            SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection,
+            true};
       }
       return config.line_reacquire_strafe_start_delay_ms > 0U
                  ? SolarPanelContactSequenceUpdate{
@@ -177,7 +196,9 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
 
     case SolarPanelAutonomyState::WaitBeforeStrafeLeftToRearLine:
       if (reacquisition_line_detected) {
-        return {SolarPanelAutonomyState::RearLineReacquired, true};
+        return {
+            SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection,
+            true};
       }
       return time_in_state_ms >=
                      config.line_reacquire_strafe_start_delay_ms
@@ -187,6 +208,14 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
 
     case SolarPanelAutonomyState::StrafeLeftToRearLine:
       return reacquisition_line_detected
+                 ? SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::
+                           BackwardLineFollowAfterRearDetection,
+                       true}
+                 : SolarPanelContactSequenceUpdate{current_state, false};
+
+    case SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection:
+      return time_in_state_ms >= config.rear_line_follow_duration_ms
                  ? SolarPanelContactSequenceUpdate{
                        SolarPanelAutonomyState::RearLineReacquired, true}
                  : SolarPanelContactSequenceUpdate{current_state, false};

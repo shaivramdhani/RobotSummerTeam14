@@ -50,6 +50,8 @@ const char* towerPiecesStateName(const TowerPiecesState state) {
       return "MOVE_STEPPER_TOP";
     case TowerPiecesState::WinchClosed:
       return "WINCH_CLOSED";
+    case TowerPiecesState::PreStepperBottomDelay:
+      return "PRE_STEPPER_BOTTOM_DELAY";
     case TowerPiecesState::Complete:
       return "COMPLETE";
     case TowerPiecesState::Fault:
@@ -83,6 +85,14 @@ const char* towerPiecesFaultReasonName(
       return "STEPPER_LIMIT_SEARCH_FAILED";
     case TowerPiecesFaultReason::ConflictingLimitSwitches:
       return "CONFLICTING_LIMIT_SWITCHES";
+    case TowerPiecesFaultReason::ImuUnavailable:
+      return "IMU_UNAVAILABLE";
+    case TowerPiecesFaultReason::ImuStrafeFailed:
+      return "IMU_STRAFE_FAILED";
+    case TowerPiecesFaultReason::ImuTurnFailed:
+      return "IMU_TURN_FAILED";
+    case TowerPiecesFaultReason::ImuTurnTimeout:
+      return "IMU_TURN_TIMEOUT";
   }
   return "NONE";
 }
@@ -99,31 +109,29 @@ bool towerPiecesConfigValid(const TowerPiecesConfig& config,
        config.final_reverse_duty > 0.0F);
 
   return std::isfinite(config.reverse_line_duty) &&
-         std::isfinite(config.strafe_right_duty) &&
-         std::isfinite(config.clockwise_rotation_duty) &&
+         std::isfinite(config.clockwise_rotation_angle_deg) &&
          std::isfinite(config.reverse_duty) &&
-         std::isfinite(config.shimmy_duty) &&
          std::isfinite(maximum_allowed_duty) &&
          config.reverse_line_duty > 0.0F &&
          config.reverse_line_duty <= maximum_allowed_duty &&
-         config.strafe_right_duty > 0.0F &&
-         config.strafe_right_duty <= maximum_allowed_duty &&
-         config.clockwise_rotation_duty > 0.0F &&
-         config.clockwise_rotation_duty <= maximum_allowed_duty &&
+         config.clockwise_rotation_angle_deg > 0.0F &&
          config.reverse_duty > 0.0F &&
          config.reverse_duty <= maximum_allowed_duty &&
-         config.shimmy_duty > 0.0F &&
-         config.shimmy_duty <= maximum_allowed_duty &&
          config.side_line_timeout_ms > 0U &&
          config.post_line_delay_ms > 0U &&
+         std::isfinite(config.strafe_right_duty) &&
+         config.strafe_right_duty > 0.0F &&
+         config.strafe_right_duty <= maximum_allowed_duty &&
          config.strafe_right_duration_ms > 0U &&
          config.post_strafe_pause_ms > 0U &&
-         config.clockwise_rotation_duration_ms > 0U &&
          config.post_rotation_pause_ms > 0U &&
          config.reverse_duration_ms > 0U &&
          config.shimmy_right_duration_ms > 0U &&
          config.shimmy_left_duration_ms > 0U &&
          config.shimmy_timeout_ms > 0U &&
+         std::isfinite(config.shimmy_duty) &&
+         config.shimmy_duty > 0.0F &&
+         config.shimmy_duty <= maximum_allowed_duty &&
          final_reverse_valid &&
          config.post_final_reverse_delay_ms > 0U &&
          config.post_winch_open_delay_ms > 0U &&
@@ -154,6 +162,9 @@ void startTowerPiecesAutonomy(TowerPiecesAutonomy& autonomy,
   // A line already under the sensor at start is not a new crossing. The
   // sensor must return LOW before a later HIGH can increment the count.
   autonomy.previous_side_line_high = side_line_high;
+  autonomy.side_line_armed = !side_line_high;
+  autonomy.side_line_off_timing = !side_line_high;
+  autonomy.side_line_off_started_at_ms = now_ms;
 }
 
 TowerPiecesUpdate updateTowerPiecesAutonomy(
@@ -174,10 +185,49 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
     case TowerPiecesState::ReverseLineFollow:
       update.side_line_rising_edge =
           !autonomy.previous_side_line_high && inputs.side_line_high;
+      if (!inputs.side_line_high) {
+        if (!autonomy.side_line_off_timing) {
+          autonomy.side_line_off_timing = true;
+          autonomy.side_line_off_started_at_ms = now_ms;
+        }
+        const bool cooldown_complete =
+            autonomy.side_line_count == 0U ||
+            now_ms - autonomy.side_line_last_accepted_at_ms >=
+                config.side_line_cooldown_ms;
+        if (!autonomy.side_line_armed && cooldown_complete &&
+            now_ms - autonomy.side_line_off_started_at_ms >=
+                config.side_line_rearm_ms) {
+          autonomy.side_line_armed = true;
+        }
+      } else {
+        const bool cooldown_complete =
+            autonomy.side_line_count == 0U ||
+            now_ms - autonomy.side_line_last_accepted_at_ms >=
+                config.side_line_cooldown_ms;
+        if (!autonomy.side_line_armed &&
+            autonomy.side_line_off_timing && cooldown_complete &&
+            now_ms - autonomy.side_line_off_started_at_ms >=
+                config.side_line_rearm_ms) {
+          autonomy.side_line_armed = true;
+        }
+        autonomy.side_line_off_timing = false;
+      }
       autonomy.previous_side_line_high = inputs.side_line_high;
-      if (update.side_line_rising_edge &&
+      if (update.side_line_rising_edge && autonomy.side_line_armed &&
           autonomy.side_line_count < kTowerPiecesTargetSideLineCount) {
         ++autonomy.side_line_count;
+        autonomy.side_line_armed = false;
+        autonomy.side_line_last_accepted_at_ms = now_ms;
+        update.side_line_detection_accepted = true;
+        autonomy.last_side_line_detection_accepted = true;
+        autonomy.last_side_line_detection_rejected = false;
+      } else if (update.side_line_rising_edge) {
+        update.side_line_detection_rejected = true;
+        autonomy.last_side_line_detection_accepted = false;
+        autonomy.last_side_line_detection_rejected = true;
+        if (autonomy.side_line_rejected_count < UINT16_MAX) {
+          ++autonomy.side_line_rejected_count;
+        }
       }
 
       if (autonomy.side_line_count >= kTowerPiecesTargetSideLineCount) {
@@ -218,8 +268,7 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
       break;
 
     case TowerPiecesState::RotateClockwise:
-      if (now_ms - autonomy.state_entered_at_ms >=
-          config.clockwise_rotation_duration_ms) {
+      if (inputs.clockwise_turn_complete) {
         autonomy.state = TowerPiecesState::PostRotationPause;
         autonomy.state_entered_at_ms = now_ms;
       }
@@ -295,6 +344,14 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
     case TowerPiecesState::PostClawsOpenDelay:
       if (now_ms - autonomy.state_entered_at_ms >=
           config.post_claws_open_delay_ms) {
+        autonomy.state = TowerPiecesState::PreStepperBottomDelay;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::PreStepperBottomDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.pre_stepper_bottom_delay_ms) {
         autonomy.state = TowerPiecesState::MoveStepperBottom;
         autonomy.state_entered_at_ms = now_ms;
       }
@@ -369,6 +426,13 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
   update.state = autonomy.state;
   update.fault_reason = autonomy.fault_reason;
   update.side_line_count = autonomy.side_line_count;
+  update.side_line_rejected_count =
+      autonomy.side_line_rejected_count;
+  update.side_line_armed = autonomy.side_line_armed;
+  update.side_line_detection_accepted =
+      autonomy.last_side_line_detection_accepted;
+  update.side_line_detection_rejected =
+      autonomy.last_side_line_detection_rejected;
   update.should_line_follow =
       autonomy.state == TowerPiecesState::ReverseLineFollow;
   update.should_initial_strafe_right =
