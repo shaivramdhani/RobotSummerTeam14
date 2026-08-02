@@ -78,6 +78,13 @@ void resetImuTurnController(ImuTurnControllerState& state);
 bool startImuTurn(ImuTurnControllerState& state, float current_heading_deg,
                   float relative_angle_deg, const ImuTurnConfig& config,
                   float maximum_allowed_duty, Milliseconds now_ms);
+// Uses a fixed target in the same continuous heading frame as the current
+// measurement. An already-aligned target is valid and enters settling without
+// commanding rotation.
+bool startImuTurnToHeading(
+    ImuTurnControllerState& state, float current_heading_deg,
+    float target_heading_deg, const ImuTurnConfig& config,
+    float maximum_allowed_duty, Milliseconds now_ms);
 void stopImuTurn(ImuTurnControllerState& state);
 void deferImuTurnTimers(ImuTurnControllerState& state,
                         Milliseconds duration_ms);

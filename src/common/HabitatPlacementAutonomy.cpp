@@ -33,6 +33,11 @@ HabitatPlacementUpdate makeUpdate(
       elapsedSince(now_ms, autonomy.state_entered_at_ms);
   update.should_reverse_line_follow =
       autonomy.state == HabitatPlacementState::ReverseLineFollow;
+  update.should_turn_to_initial_heading =
+      autonomy.state == HabitatPlacementState::TurnToInitialHeading;
+  update.should_strafe_right_before_counter_clockwise =
+      autonomy.state ==
+      HabitatPlacementState::StrafeRightBeforeCounterClockwise;
   update.should_turn_counter_clockwise =
       autonomy.state == HabitatPlacementState::TurnCounterClockwise;
   update.should_drive_forward_to_slide =
@@ -59,6 +64,8 @@ HabitatPlacementUpdate makeUpdate(
       autonomy.state == HabitatPlacementState::ClosePusher;
   update.should_stop_drive =
       !(update.should_reverse_line_follow ||
+        update.should_turn_to_initial_heading ||
+        update.should_strafe_right_before_counter_clockwise ||
         update.should_turn_counter_clockwise ||
         update.should_drive_forward_to_slide ||
         update.should_drive_forward_push ||
@@ -81,6 +88,10 @@ const char* habitatPlacementStateName(const HabitatPlacementState state) {
       return "REVERSE_LINE_FOLLOW";
     case HabitatPlacementState::PostLss1Delay:
       return "POST_LSS1_DELAY";
+    case HabitatPlacementState::TurnToInitialHeading:
+      return "TURN_TO_INITIAL_HEADING";
+    case HabitatPlacementState::StrafeRightBeforeCounterClockwise:
+      return "STRAFE_RIGHT_BEFORE_COUNTER_CLOCKWISE";
     case HabitatPlacementState::TurnCounterClockwise:
       return "TURN_COUNTER_CLOCKWISE";
     case HabitatPlacementState::ForwardToSlide:
@@ -166,6 +177,10 @@ bool habitatPlacementConfigValid(
                    maximum_allowed_duty) &&
          config.lss1_timeout_ms > 0U &&
          config.post_lss1_delay_ms > 0U &&
+         config.initial_heading_turn_timeout_ms > 0U &&
+         dutyValid(config.pre_counter_clockwise_strafe_right_duty,
+                   maximum_allowed_duty) &&
+         config.pre_counter_clockwise_strafe_right_duration_ms > 0U &&
          std::isfinite(config.counter_clockwise_angle_deg) &&
          config.counter_clockwise_angle_deg > 0.0F &&
          config.counter_clockwise_timeout_ms > 0U &&
@@ -203,11 +218,29 @@ void resetHabitatPlacementAutonomy(HabitatPlacementAutonomy& autonomy,
   autonomy.state_entered_at_ms = now_ms;
 }
 
-void startHabitatPlacementAutonomy(HabitatPlacementAutonomy& autonomy,
-                                  const Milliseconds now_ms) {
+bool startHabitatPlacementAutonomy(
+    HabitatPlacementAutonomy& autonomy,
+    const float initial_heading_deg,
+    const float counter_clockwise_relative_angle_deg,
+    const Milliseconds now_ms) {
   resetHabitatPlacementAutonomy(autonomy, now_ms);
+  if (!std::isfinite(initial_heading_deg) ||
+      !std::isfinite(counter_clockwise_relative_angle_deg) ||
+      std::fabs(counter_clockwise_relative_angle_deg) <= 0.0001F) {
+    return false;
+  }
+  const float counter_clockwise_target_heading_deg =
+      initial_heading_deg + counter_clockwise_relative_angle_deg;
+  if (!std::isfinite(counter_clockwise_target_heading_deg)) {
+    return false;
+  }
   autonomy.state = HabitatPlacementState::ReverseLineFollow;
   autonomy.started_at_ms = now_ms;
+  autonomy.initial_heading_captured = true;
+  autonomy.initial_heading_deg = initial_heading_deg;
+  autonomy.counter_clockwise_target_heading_deg =
+      counter_clockwise_target_heading_deg;
+  return true;
 }
 
 void failHabitatPlacementAutonomy(
@@ -251,6 +284,26 @@ HabitatPlacementUpdate updateHabitatPlacementAutonomy(
       break;
     case HabitatPlacementState::PostLss1Delay:
       if (elapsed_ms >= config.post_lss1_delay_ms) {
+        enterState(autonomy,
+                   HabitatPlacementState::TurnToInitialHeading, now_ms);
+      }
+      break;
+    case HabitatPlacementState::TurnToInitialHeading:
+      if (inputs.initial_heading_turn_complete) {
+        enterState(
+            autonomy,
+            HabitatPlacementState::StrafeRightBeforeCounterClockwise,
+            now_ms);
+      } else if (elapsed_ms >=
+                 config.initial_heading_turn_timeout_ms) {
+        failHabitatPlacementAutonomy(
+            autonomy, HabitatPlacementFaultReason::ImuTurnTimeout,
+            now_ms);
+      }
+      break;
+    case HabitatPlacementState::StrafeRightBeforeCounterClockwise:
+      if (elapsed_ms >=
+          config.pre_counter_clockwise_strafe_right_duration_ms) {
         enterState(autonomy,
                    HabitatPlacementState::TurnCounterClockwise, now_ms);
       }

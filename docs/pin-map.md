@@ -20,8 +20,8 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | VL53L0X SDA | 10 | Dedicated ESP1 I2C data; verify carrier pull-ups and supply requirements before power-up |
 | VL53L0X SCL | 9 | Dedicated ESP1 I2C clock; configured for 100 kHz |
 | `LSS` | 4 | Digital comparator, HIGH = black tape |
-| `LSS2` | 11 | Second side line sensor; digital comparator, HIGH = black tape |
-| `LSS3` | 12 | Third side line sensor; digital comparator, HIGH = black tape; telemetry-only |
+| `LSS2` | 11 | Habitat Pieces left-side line sensor; digital comparator, HIGH = black tape |
+| `LSS3` | 12 | Habitat Pieces right-side line sensor; digital comparator, HIGH = black tape |
 | `LSBL` | 17 | Digital comparator, HIGH = black tape |
 | `LSBR` | 18 | Digital comparator, HIGH = black tape |
 | `PWMBL0` | TODO | TODO |

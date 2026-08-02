@@ -52,12 +52,23 @@ while required hardware settings are TODO. See `docs/telemetry.md`.
 The dashboard also reports the ESP1-owned VL53L0X V2 distance sensor on SDA
 GPIO10/SCL GPIO9. The `HABITAT_PIECES` mode follows the front line at an
 independently adjustable duty (default `0.12`), ignores the ESP1-owned LSS2 for
-an adjustable detection delay, and then drives straight backward at an
-adjustable duty for an adjustable duration after LSS2 sees black. It latches
-stop when the reverse completes. The delay, reverse duty, and reverse duration
-default to zero/unconfigured, and the LSS2 search timeout must be explicitly
-set longer than the delay. The laser remains independent telemetry and uses its
-high-accuracy profile through idle, motion, and stopped states.
+an adjustable detection delay shared with LSS3, and then independently stops
+the left wheel side on LSS2 black and the right wheel side on LSS3 black. Once
+both detections latch, it drives straight backward at an adjustable duty for an
+adjustable duration. It then strafes in an adjustable left/right direction and
+counts distinct entries into the valid laser-distance zone above an adjustable
+threshold. Consecutive above-threshold samples count once. At the target count,
+it performs an adjustable opposite-direction compensation strafe, lowers the
+linear slide to the bottom limit, and drives forward until a new valid reading
+is at or below a separately adjustable pickup threshold. It then lifts the
+slide by adjustable microsteps while concurrently reversing and returning in
+the opposite strafe direction until either rear line sensor detects black.
+Each open-loop/search step has its own adjustable duration or timeout; any
+timeout, stepper failure, stale required line data, or command failure stops the
+route. The final line detection prepares the robot for the separate Habitat
+Placement route but does not start it automatically. All new settings default
+to unconfigured. The laser remains in its high-accuracy profile through idle,
+motion, and stopped states.
 
 For the current two-ESP wiring, flash both ESPs and use the ESP2 dashboard to
 test individual wheels, distributed drive, front line sensors, and the

@@ -117,6 +117,44 @@ bool startImuTurn(ImuTurnControllerState& state,
   return true;
 }
 
+bool startImuTurnToHeading(
+    ImuTurnControllerState& state,
+    const float current_heading_deg,
+    const float target_heading_deg,
+    const ImuTurnConfig& config,
+    const float maximum_allowed_duty,
+    const Milliseconds now_ms) {
+  if (!imuTurnConfigValid(config, maximum_allowed_duty)) {
+    state = {};
+    state.state = ImuTurnState::Fault;
+    state.fault_reason = ImuTurnFaultReason::InvalidConfiguration;
+    return false;
+  }
+  if (!std::isfinite(current_heading_deg) ||
+      !std::isfinite(target_heading_deg)) {
+    state = {};
+    state.state = ImuTurnState::Fault;
+    state.fault_reason = ImuTurnFaultReason::InvalidMeasurement;
+    return false;
+  }
+  const float relative_angle_deg =
+      target_heading_deg - current_heading_deg;
+  if (!std::isfinite(relative_angle_deg)) {
+    state = {};
+    state.state = ImuTurnState::Fault;
+    state.fault_reason = ImuTurnFaultReason::InvalidMeasurement;
+    return false;
+  }
+
+  state = {};
+  state.state = ImuTurnState::Turning;
+  state.start_heading_deg = current_heading_deg;
+  state.target_heading_deg = target_heading_deg;
+  state.relative_angle_deg = relative_angle_deg;
+  state.started_at_ms = now_ms;
+  return true;
+}
+
 void stopImuTurn(ImuTurnControllerState& state) {
   state.state = ImuTurnState::Stopped;
   state.fault_reason = ImuTurnFaultReason::None;

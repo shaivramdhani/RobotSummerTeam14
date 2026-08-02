@@ -130,7 +130,7 @@ pass. Stale/unconfigured LSS2 data, front line loss, rear-command failure, or
 timeout stops all four wheels. The laser remains independent telemetry and is
 not consulted by this mode.
 
-## 2026-07-31: Habitat Pieces Reverses After Delayed LSS2 Detection
+## 2026-07-31: Habitat Pieces Reverses After Delayed LSS2 Detection (superseded)
 
 Decision: Retain immediate front-sensor line following and the delayed LSS2
 search, but transition a latched black detection to a new `REVERSING` state.
@@ -147,3 +147,66 @@ explicitly configured. LSS2 must remain configured and fresh through detection.
 Once detection is latched, LSS2 is no longer an input to the bounded reverse;
 configured motors, fresh rear status, expiring rear commands, explicit Stop,
 and mode-exit shutdown remain active throughout it.
+
+## 2026-08-01: Habitat Pieces Independently Aligns LSS2 and LSS3
+
+Decision: Keep the existing front line-follow, detection delay, overall timeout,
+and bounded reverse settings. After the delay, either LSS2-left or LSS3-right
+can initiate `SIDE_LINE_ALIGNING`. Each black detection latches independently:
+LSS2 stops both left wheels and LSS3 stops both right wheels. The undetected
+side continues forward at the configured line-follow duty. The route enters
+`REVERSING` only after both latches are set, including when both sensors detect
+black in the same update.
+
+Reason: The robot must square both physical side sensors to the marking before
+performing the already-configured backward move.
+
+Safety note: A latch never clears during the run, so a stopped wheel side cannot
+restart if its sensor subsequently reads white. Both GPIO configurations and
+the shared sensor-packet freshness are required until both latch. The existing
+`run_timeout_ms` bounds initial line search plus side alignment; timeout, stale
+sensor data, hardware/link loss, or rear-command failure disables all wheels.
+The subsequent reverse retains its independent configured duration and normal
+command-expiry gates.
+
+## 2026-08-01: Habitat Pieces Counts Laser Zones After Reverse
+
+Decision: Extend the pickup route after `REVERSING` with a configurable
+`DISTANCE_STRAFING` state. The robot strafes left or right at the configured
+duty and counts rising entries into the valid distance zone strictly above the
+configured millimetre threshold. Consecutive above-threshold measurements form
+one count; a valid measurement at or below the threshold rearms the next count.
+The target count completes and stops the route.
+
+Reason: Distinct far-distance zones represent gaps between habitat pieces, and
+measurement-sequence gating prevents a repeated UART heartbeat or frozen sample
+from manufacturing extra gaps.
+
+Safety note: Direction, threshold, target count, duty, and timeout all default
+to unconfigured. Laser availability does not block route Start, and invalid,
+stale, wrong-profile, or no-signal samples neither count nor rearm. The strafe
+uses the normal expiring four-wheel command path and faults stopped when its
+configured timeout expires before the target count is reached.
+
+## 2026-08-01: Habitat Pickup Finishes at the Rear Placement Line
+
+Decision: Extend Habitat Pieces after the distance-zone target with an
+opposite-direction timed compensation strafe, slide homing to the bottom limit,
+a forward laser-threshold approach, a relative slide lift, a timed reverse, and
+an opposite-direction return strafe until either rear line sensor detects
+black. Start the slide lift at the same time as the reverse and continue it
+during the rear-line return; completion requires both the lift target and the
+rear-line detection. Do not automatically start Habitat Placement.
+
+Reason: The compensation corrects predictable strafe overshoot, the laser
+approach positions the pickup, and the final rear-line alignment leaves the
+robot at the expected starting condition for the separately controlled
+placement route. The existing nonblocking stepper driver permits mechanism and
+chassis progress in one periodic motion task without a blocking wait.
+
+Safety note: Every new duty, duration, speed, step count, distance threshold,
+and timeout defaults to unconfigured. The forward approach accepts only a new
+valid high-accuracy measurement after the step begins; invalid, repeated,
+stale, and no-signal samples keep the bounded approach moving. Slide command or
+limit failures, stale/unavailable rear-line data during return, chassis command
+failure, and any timeout stop the chassis and stepper.

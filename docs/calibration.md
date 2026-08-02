@@ -10,12 +10,17 @@ calibration values.
 - Digital polarity: HIGH means black tape, LOW means white/non-tape.
 - `LSS` threshold: TODO
 - `LSS2` GPIO11; threshold: TODO
-- `LSS3` GPIO12; threshold: TODO; not yet used by autonomy
+- `LSS3` GPIO12; threshold: TODO
 - `LSBL` threshold: TODO
 - `LSBR` threshold: TODO
 - Rear/side active levels or ADC ranges: TODO
-- Habitat Pieces LSS2 detection delay/search timeout and reverse duty/duration:
-  TODO; set only after raised-wheel and field-path testing.
+- Habitat Pieces shared LSS2/LSS3 detection delay, overall search/alignment
+  timeout, line-follow/alignment duty, reverse duty/duration, distance-strafe
+  left/right direction, distance threshold, target zone count, strafe duty, and
+  strafe timeout; opposite compensation duty/duration; slide down and lift
+  speeds/timeouts/relative steps; forward pickup duty/distance/timeout;
+  post-pickup reverse duty/duration; and rear-line return duty/timeout: TODO;
+  set only after raised-wheel and field-path testing.
 
 ## IR Beacon
 
@@ -74,9 +79,11 @@ calibration values.
 - Winch uses GPIO6/MCPWM unit 0, timer 0, generator A at 50 Hz with a 1 MHz
   timer resolution and 1000–2000 µs pulses. Its existing adjustable open and
   closed angles remain the position calibration.
-- Habitat Placement rear-line duty, LSS1 timeout/delay, both IMU turn angles
-  and timeouts, after-CW reverse and left-strafe duties/durations, all other
+- Habitat Placement rear-line duty, LSS1 timeout/delay, return-to-initial-
+  heading timeout, pre-CCW right-strafe duty/duration, both configured IMU turn
+  angles/timeouts, after-CW reverse and left-strafe duties/durations, all other
   translation duties/durations, slide speed/timeout, and final front-line
-  strafe duty/timeout are TODO field-calibration values.
+  strafe duty/timeout are TODO field-calibration values. The return turn uses
+  the shared adjustable IMU maximum rotation duty.
 - Stepper step timing and direction polarity: TODO
 - Limit switch active levels: TODO

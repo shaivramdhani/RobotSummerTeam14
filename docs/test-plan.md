@@ -30,7 +30,12 @@ Native tests cover pure, hardware-independent logic:
   threshold latching, reset, and millisecond-wrap behavior.
 - `HABITAT_PIECES` default-duty/configuration lockout, LSS2 ignore interval,
   detection arming, black-line transition, timed reverse duty/duration,
-  adjustable search timeout, and terminal stop behavior.
+  adjustable search timeout, distinct above-threshold laser-zone counting,
+  repeated/invalid measurement rejection, left/right strafe mixing, strafe
+  timeout, opposite compensation direction, bottom-limit slide transition,
+  forward threshold behavior with no/repeated readings, concurrent slide lift
+  with reverse/return motion, either rear sensor ending the return strafe,
+  lift-wait completion, and terminal timeout/fault stops.
 - Mission transition logic after transitions are defined.
 
 Native tests must not include Arduino, GPIO, PWM, UART peripherals, or motor
@@ -67,26 +72,43 @@ For the read-only VL53L0X bring-up, keep the robot disabled:
 Keep the wheels raised for the first `HABITAT_PIECES` gate test:
 
 1. Verify ESP1 LSS2 GPIO11 and LSS3 GPIO12. Confirm telemetry shows both
-   configured and fresh with correct white/black polarity; confirm only LSS2
-   affects Habitat Pieces.
+   configured and fresh with correct white/black polarity. Confirm LSS2 is
+   physically left and LSS3 is physically right.
 2. Prove a zero detection delay, zero timeout, timeout not longer than the
-   delay, zero reverse duty, or zero reverse duration prevents an approach
-   command.
+   delay, zero reverse duty/duration, missing distance-strafe direction, zero
+   distance threshold/count/duty/timeout, or distance timeout above 30000 ms
+   prevents an approach command.
 3. With the wheels raised, Start and confirm line following begins immediately
    while `lss2_detection_armed=false`.
-4. Present black to LSS2 during the ignore interval and confirm the wheels keep
-   following. At the configured delay, confirm detection arms and a currently
-   black input transitions to straight reverse at the configured duty.
-5. Repeat with LSS2 white through the delay, then present black and confirm
-   `LSS2_BLACK_DETECTED` and `REVERSING`. Confirm the reverse continues for the
-   full configured duration, then enters `COMPLETE` and latches stop.
-6. Disconnect or freeze the LSS2 sensor packet before detection and confirm both
-   processors stop their locally owned wheels through the normal command
-   expiration path.
-7. During reverse, confirm LSS2 changes no longer alter the latched timed move,
-   while stale rear status or a failed rear command still stops it.
-8. Keep LSS2 white and confirm the search timeout stops all four wheels,
-   enters `FAULT`, and reports `timed_out=true`.
+4. Present black to either side sensor during the ignore interval and confirm
+   the wheels keep following. At the configured delay, confirm both inputs arm.
+5. Present black to LSS2 only. Confirm `SIDE_LINE_ALIGNING`, both left wheels
+   stop, both right wheels continue forward at the configured line-follow duty,
+   and the LSS2 latch stays set even if its raw input returns white.
+6. Present black to LSS3 and confirm `BOTH_SIDE_LINES_DETECTED` followed by
+   `REVERSING`. Repeat in the opposite arrival order and confirm LSS3 stops the
+   right wheels while the left wheels continue. Also confirm simultaneous
+   detection proceeds directly to reverse.
+7. Confirm the reverse continues for the full configured duration, then enters
+   `DISTANCE_STRAFING` in the configured left/right direction at the configured
+   duty. Confirm the high-accuracy laser profile remains selected.
+8. Disconnect or freeze the shared LSS2/LSS3 sensor packet before both sensors
+   latch and confirm both processors stop their locally owned wheels through
+   the normal command-expiration path.
+9. During reverse, confirm side-sensor changes no longer alter the latched timed
+   move, while stale rear status or a failed rear command still stops it.
+10. Keep one side sensor white and confirm the overall search/alignment timeout
+    stops all four wheels, enters `FAULT`, and reports `timed_out=true`.
+11. With the distance strafe active, supply consecutive valid measurements
+    above the configured threshold. Confirm only the first increments the
+    count. Supply one valid at-or-below measurement, then another above, and
+    confirm the count increments once more.
+12. Confirm repeated UART packets carrying the same measurement sequence,
+    invalid/no-signal readings, and stale readings never increment or rearm the
+    count. Confirm they do not prevent the bounded strafe from starting.
+13. Reach the target count and confirm `DISTANCE_ZONE_COUNT_REACHED`,
+    `COMPLETE`, and latched all-wheel stop. Repeat without reaching the count
+    and confirm `DISTANCE_STRAFE_TIMEOUT`, `FAULT`, and all-wheel stop.
 
 For the read-only IMU soak test:
 
@@ -187,16 +209,21 @@ For Stage 3, keep the wheels raised for initial tests:
    and pusher-open settle time. Confirm Start Ready remains false if any field,
    LSS1/rear/front sensor, IMU, stepper limit, pusher target, or link is absent.
 3. Exercise the route one phase at a time with conservative settings. Confirm
-   LSS1 stops reverse line-following, each delay holds all wheels stopped, both
-   turns obey their own timeout, and the slide stops at the bottom switch.
-4. At CCW entry, record the displayed saved start/target headings. Confirm the
-   target equals the start plus or minus the configured offset for the verified
-   IMU polarity and remains unchanged throughout that turn.
-5. After the CW turn, confirm the robot runs the configured backward duty for
+   the initial heading is captured before rear-line motion begins, LSS1 stops
+   reverse line-following, and each delay holds all wheels stopped.
+4. After LSS1 and its delay, confirm the robot returns to the displayed initial
+   heading within the dedicated timeout, then strafes right at the configured
+   duty for the full configured duration before beginning the CCW turn.
+5. Confirm the CCW target equals the initial heading plus or minus the
+   configured offset for the verified IMU polarity and remains unchanged
+   throughout line following, the return turn, right strafe, and CCW turn.
+   Confirm all IMU turns obey their configured timeout and the slide stops at
+   the bottom switch.
+6. After the CW turn, confirm the robot runs the configured backward duty for
    its full duration, then the configured left-strafe duty for its full
    duration, before beginning the existing stopped delay.
-6. Confirm the final right strafe stops when either front sensor reads black,
+7. Confirm the final right strafe stops when either front sensor reads black,
    closes the Habitat Pusher, and remains stopped in Complete.
-7. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
+8. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
    and the final front line. Each condition must stop or time out without
    advancing to the next motion phase.

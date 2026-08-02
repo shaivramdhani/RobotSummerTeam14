@@ -1513,6 +1513,9 @@ void resetSolarPanelAutonomy(RuntimeContext& context,
 
 void resetHabitatPieces(RuntimeContext& context,
                         const robot::Milliseconds now_ms) {
+  if (g_runtime.stepper != nullptr) {
+    g_runtime.stepper->stop();
+  }
   robot::resetHabitatPiecesAutonomy(context.habitat_pieces, now_ms);
   context.last_habitat_pieces_update = {};
   context.habitat_pieces_start_requested = false;
@@ -1619,6 +1622,17 @@ robot::FourWheelCommand makeHabitatPiecesBackwardCommand(
                  activeMotionDutyCap(context));
   return robot::mixOpenLoopMecanum(
       0.0F, -1.0F, 0.0F, duty, now_ms,
+      context.config.remoteCommandTimeoutMs);
+}
+
+robot::FourWheelCommand makeHabitatPiecesTranslationCommand(
+    const RuntimeContext& context, const float lateral,
+    const float forward, const float requested_duty,
+    const robot::Milliseconds now_ms) {
+  const float duty = clampFloat(requested_duty, 0.0F,
+                                activeMotionDutyCap(context));
+  return robot::mixOpenLoopMecanum(
+      lateral, forward, 0.0F, duty, now_ms,
       context.config.remoteCommandTimeoutMs);
 }
 
@@ -1767,6 +1781,9 @@ void disableActuators(RuntimeContext& context, robot::IMotorOutput& front_left,
                       RearCommandLink& rear_link,
                       const robot::Milliseconds now_ms) {
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  if (g_runtime.stepper != nullptr) {
+    g_runtime.stepper->stop();
+  }
   context.requested_funnel_command = robot::disabledMotorCommand();
   sendStoppedFunnelCommand(rear_link, context.config, now_ms);
   sendStoppedSolarHookCommand(rear_link);
@@ -1966,6 +1983,7 @@ bool habitatPiecesMotionRequirementsMet(
     const DualPwmMotorOutput& front_left,
     const DualPwmMotorOutput& front_right,
     const RearCommandLink& rear_link,
+    const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
     const RuntimeContext& context) {
   const robot::LineFollowerConfig line_config =
@@ -1974,8 +1992,20 @@ bool habitatPiecesMotionRequirementsMet(
                               now_ms, context) &&
          robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
              .accepted &&
+         stepper.maximumPositionSteps() > 0 &&
+         stepper.maximumPositionSteps() <=
+             static_cast<std::int64_t>(UINT32_MAX) &&
          robot::habitatPiecesConfigValid(context.habitat_pieces_config,
-                                         activeMotionDutyCap(context));
+                                         activeMotionDutyCap(context),
+                                         kMaxTimedTestDurationMs,
+                                         stepper.maximumSpeedStepsPerSecond(),
+                                         static_cast<std::uint32_t>(
+                                             stepper.maximumPositionSteps())) &&
+         gpioAssigned(robot::esp2::kPins.stepper_sleep) &&
+         gpioAssigned(robot::esp2::kPins.stepper_dir) &&
+         gpioAssigned(robot::esp2::kPins.stepper_step) &&
+         gpioAssigned(robot::esp2::kPins.limit_switch_stepper_bottom) &&
+         gpioAssigned(robot::esp2::kPins.limit_switch_stepper_top);
 }
 
 bool habitatPiecesStartRequirementsMet(
@@ -1983,13 +2013,17 @@ bool habitatPiecesStartRequirementsMet(
     const DualPwmMotorOutput& front_left,
     const DualPwmMotorOutput& front_right,
     const RearCommandLink& rear_link,
+    const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
     const RuntimeContext& context) {
   return habitatPiecesMotionRequirementsMet(
-             sensors, front_left, front_right, rear_link, now_ms, context) &&
+             sensors, front_left, front_right, rear_link, stepper, now_ms,
+             context) &&
          rear_link.rearLineSnapshotFresh(
              now_ms, context.config.remoteCommandTimeoutMs) &&
-         rear_link.latestRearLineSnapshot().side_2_configured;
+         rear_link.latestRearLineSnapshot().side_2_configured &&
+         rear_link.latestRearLineSnapshot().side_3_configured &&
+         rear_link.latestRearLineSnapshot().configured;
 }
 
 bool rearLineStartRequirementsMet(
@@ -2054,6 +2088,10 @@ bool habitatPlacementStartRequirementsMet(
   const bool bounded_timings =
       config.lss1_timeout_ms <= kMaxTimedTestDurationMs &&
       config.post_lss1_delay_ms <= kMaxTimedTestDurationMs &&
+      config.initial_heading_turn_timeout_ms <=
+          kMaxTimedTestDurationMs &&
+      config.pre_counter_clockwise_strafe_right_duration_ms <=
+          kMaxTimedTestDurationMs &&
       config.counter_clockwise_timeout_ms <= kMaxTimedTestDurationMs &&
       config.forward_to_slide_duration_ms <= kMaxTimedTestDurationMs &&
       config.stepper_down_timeout_ms <= kMaxTimedTestDurationMs &&
@@ -2071,6 +2109,10 @@ bool habitatPlacementStartRequirementsMet(
       config.strafe_right_timeout_ms <= kMaxTimedTestDurationMs;
   robot::ImuTurnConfig ccw_turn_config = context.imu_turn_config;
   ccw_turn_config.timeout_ms = config.counter_clockwise_timeout_ms;
+  robot::ImuTurnConfig initial_heading_turn_config =
+      context.imu_turn_config;
+  initial_heading_turn_config.timeout_ms =
+      config.initial_heading_turn_timeout_ms;
   robot::ImuTurnConfig cw_turn_config = context.imu_turn_config;
   cw_turn_config.timeout_ms = config.clockwise_timeout_ms;
   return sensors.configured() &&
@@ -2084,6 +2126,7 @@ bool habitatPlacementStartRequirementsMet(
          gpioAssigned(robot::esp2::kPins.limit_switch_stepper_bottom) &&
          !(stepper.lowerLimitActive() && stepper.upperLimitActive()) &&
          imuReadyForAutonomousMotion(context) &&
+         imuTurnRuntimeConfigValid(initial_heading_turn_config) &&
          imuTurnRuntimeConfigValid(ccw_turn_config) &&
          imuTurnRuntimeConfigValid(cw_turn_config) && bounded_timings &&
          robot::validateLineFollowerConfig(
@@ -2491,12 +2534,14 @@ void stopAutonomousImuTurn(RuntimeContext& context) {
   }
 }
 
-AutonomousImuMotionResult runAutonomousImuTurn(
+AutonomousImuMotionResult runAutonomousImuTurnImpl(
     RuntimeContext& context, DualPwmMotorOutput& front_left,
     DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
     const robot::LineFollowerConfig& command_config,
-    const float relative_angle_deg, const robot::Milliseconds now_ms,
-    const robot::Milliseconds timeout_override_ms = 0U) {
+    const float requested_heading_deg,
+    const bool target_is_absolute,
+    const robot::Milliseconds now_ms,
+    const robot::Milliseconds timeout_override_ms) {
   robot::ImuTurnConfig active_config = context.imu_turn_config;
   if (timeout_override_ms > 0U) {
     active_config.timeout_ms = timeout_override_ms;
@@ -2528,10 +2573,18 @@ AutonomousImuMotionResult runAutonomousImuTurn(
   if (!robot::imuTurnActive(context.imu_turn_state)) {
     const robot::esp2::ImuState& imu_state =
         context.latest_imu_snapshot.state;
-    if (!robot::startImuTurn(
-            context.imu_turn_state, imu_state.heading_deg,
-            relative_angle_deg, active_config,
-            hardwareDutyCap(), now_ms)) {
+    const bool started = target_is_absolute
+                             ? robot::startImuTurnToHeading(
+                                   context.imu_turn_state,
+                                   imu_state.heading_deg,
+                                   requested_heading_deg, active_config,
+                                   hardwareDutyCap(), now_ms)
+                             : robot::startImuTurn(
+                                   context.imu_turn_state,
+                                   imu_state.heading_deg,
+                                   requested_heading_deg, active_config,
+                                   hardwareDutyCap(), now_ms);
+    if (!started) {
       return AutonomousImuMotionResult::ControllerFault;
     }
     context.last_imu_turn_update = {};
@@ -2542,7 +2595,8 @@ AutonomousImuMotionResult runAutonomousImuTurn(
     context.last_imu_turn_update.target_heading_deg =
         context.imu_turn_state.target_heading_deg;
     context.last_imu_turn_update.angle_error_deg =
-        relative_angle_deg;
+        context.imu_turn_state.target_heading_deg -
+        imu_state.heading_deg;
     context.last_imu_turn_update.yaw_rate_dps =
         imu_state.yaw_rate_dps;
   }
@@ -2598,6 +2652,28 @@ AutonomousImuMotionResult runAutonomousImuTurn(
   context.command_deadman_armed = true;
   context.mode_expires_at_ms = 0U;
   return AutonomousImuMotionResult::Running;
+}
+
+AutonomousImuMotionResult runAutonomousImuTurn(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::LineFollowerConfig& command_config,
+    const float relative_angle_deg, const robot::Milliseconds now_ms,
+    const robot::Milliseconds timeout_override_ms = 0U) {
+  return runAutonomousImuTurnImpl(
+      context, front_left, front_right, rear_link, command_config,
+      relative_angle_deg, false, now_ms, timeout_override_ms);
+}
+
+AutonomousImuMotionResult runAutonomousImuTurnToHeading(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::LineFollowerConfig& command_config,
+    const float target_heading_deg, const robot::Milliseconds now_ms,
+    const robot::Milliseconds timeout_override_ms) {
+  return runAutonomousImuTurnImpl(
+      context, front_left, front_right, rear_link, command_config,
+      target_heading_deg, true, now_ms, timeout_override_ms);
 }
 
 void enterImuTurnFault(RuntimeContext& context,
@@ -3223,6 +3299,9 @@ void enterHabitatPiecesFault(
     const robot::FaultCode fault_code, const char* const message,
     const robot::EventSource source,
     const robot::Milliseconds now_ms) {
+  if (g_runtime.stepper != nullptr) {
+    g_runtime.stepper->stop();
+  }
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   robot::failHabitatPiecesAutonomy(context.habitat_pieces, stop_reason,
                                    now_ms);
@@ -3231,6 +3310,19 @@ void enterHabitatPiecesFault(
   context.last_habitat_pieces_update.stop_reason = stop_reason;
   context.last_habitat_pieces_update.should_stop = true;
   context.last_habitat_pieces_update.should_line_follow = false;
+  context.last_habitat_pieces_update.should_align_side_lines = false;
+  context.last_habitat_pieces_update.should_drive_left_side = false;
+  context.last_habitat_pieces_update.should_drive_right_side = false;
+  context.last_habitat_pieces_update.should_reverse = false;
+  context.last_habitat_pieces_update.should_distance_strafe = false;
+  context.last_habitat_pieces_update.should_compensation_strafe = false;
+  context.last_habitat_pieces_update.should_start_slide_down = false;
+  context.last_habitat_pieces_update.should_lower_slide = false;
+  context.last_habitat_pieces_update.should_drive_forward_to_distance = false;
+  context.last_habitat_pieces_update.should_start_slide_lift = false;
+  context.last_habitat_pieces_update.should_post_pickup_reverse = false;
+  context.last_habitat_pieces_update.should_return_line_strafe = false;
+  context.last_habitat_pieces_update.should_wait_for_slide_lift = false;
   setFault(context, fault_code, message);
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
 }
@@ -3238,7 +3330,8 @@ void enterHabitatPiecesFault(
 void runHabitatPieces(
     RuntimeContext& context, DigitalFrontLineSensorReader& sensors,
     DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
-    RearCommandLink& rear_link, const robot::Milliseconds now_ms) {
+    RearCommandLink& rear_link, robot::esp2::StepperAxis& stepper,
+    const robot::Milliseconds now_ms) {
   if (context.habitat_pieces.state ==
       robot::HabitatPiecesState::WaitForStart) {
     disableMotionActuators(context, front_left, front_right, rear_link,
@@ -3251,23 +3344,34 @@ void runHabitatPieces(
             now_ms, context.config.remoteCommandTimeoutMs)) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::Lss2DataStale,
+          robot::HabitatPiecesStopReason::SideSensorDataStale,
           robot::FaultCode::CommunicationStale,
-          "Habitat Pieces start rejected: LSS2 sensor data stale",
+          "Habitat Pieces start rejected: LSS2/LSS3 sensor data stale",
           robot::EventSource::Uart, now_ms);
       return;
     }
-    if (!rear_link.latestRearLineSnapshot().side_2_configured) {
+    if (!rear_link.latestRearLineSnapshot().side_2_configured ||
+        !rear_link.latestRearLineSnapshot().side_3_configured) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::Lss2Unavailable,
+          robot::HabitatPiecesStopReason::SideSensorsUnavailable,
           robot::FaultCode::HardwareNotConfigured,
-          "Habitat Pieces start rejected: LSS2 GPIO is not configured",
+          "Habitat Pieces start rejected: LSS2/LSS3 GPIO is not configured",
           robot::EventSource::Line, now_ms);
       return;
     }
+    if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::ConflictingSlideLimits,
+          robot::FaultCode::LimitSwitchConflict,
+          "Habitat Pieces start rejected: slide limit switches conflict",
+          robot::EventSource::Motor, now_ms);
+      return;
+    }
     if (!habitatPiecesStartRequirementsMet(
-            sensors, front_left, front_right, rear_link, now_ms, context)) {
+            sensors, front_left, front_right, rear_link, stepper, now_ms,
+            context)) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
           robot::HabitatPiecesStopReason::ConfigurationIncomplete,
@@ -3282,20 +3386,32 @@ void runHabitatPieces(
     clearFault(context);
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
-             "Habitat Pieces front line follow started; LSS2 detection delay active");
+             "Habitat Pieces front line follow started; LSS2/LSS3 detection delay active");
   }
 
   if (context.habitat_pieces.state ==
           robot::HabitatPiecesState::Complete ||
       context.habitat_pieces.state ==
           robot::HabitatPiecesState::Fault) {
+    stepper.stop();
     disableMotionActuators(context, front_left, front_right, rear_link,
                            now_ms);
     return;
   }
 
+  if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
+    enterHabitatPiecesFault(
+        context, front_left, front_right, rear_link,
+        robot::HabitatPiecesStopReason::ConflictingSlideLimits,
+        robot::FaultCode::LimitSwitchConflict,
+        "Habitat Pieces stopped: slide limit switches conflict",
+        robot::EventSource::Motor, now_ms);
+    return;
+  }
+
   if (!habitatPiecesMotionRequirementsMet(
-          sensors, front_left, front_right, rear_link, now_ms, context)) {
+          sensors, front_left, front_right, rear_link, stepper, now_ms,
+          context)) {
     enterHabitatPiecesFault(
         context, front_left, front_right, rear_link,
         robot::HabitatPiecesStopReason::ConfigurationIncomplete,
@@ -3306,43 +3422,253 @@ void runHabitatPieces(
   }
 
   bool lss2_black = false;
+  bool lss3_black = false;
   if (context.habitat_pieces.state ==
-      robot::HabitatPiecesState::LineFollowing) {
+          robot::HabitatPiecesState::LineFollowing ||
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::SideLineAligning) {
     if (!rear_link.rearLineSnapshotFresh(
             now_ms, context.config.remoteCommandTimeoutMs)) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::Lss2DataStale,
+          robot::HabitatPiecesStopReason::SideSensorDataStale,
           robot::FaultCode::CommunicationStale,
-          "Habitat Pieces stopped: LSS2 sensor data stale",
+          "Habitat Pieces stopped: LSS2/LSS3 sensor data stale",
           robot::EventSource::Uart, now_ms);
       return;
     }
     const robot::RearLineSensorSnapshot& line_sensors =
         rear_link.latestRearLineSnapshot();
-    if (!line_sensors.side_2_configured) {
+    if (!line_sensors.side_2_configured ||
+        !line_sensors.side_3_configured) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::Lss2Unavailable,
+          robot::HabitatPiecesStopReason::SideSensorsUnavailable,
           robot::FaultCode::HardwareNotConfigured,
-          "Habitat Pieces stopped: LSS2 is not configured",
+          "Habitat Pieces stopped: LSS2/LSS3 is not configured",
           robot::EventSource::Line, now_ms);
       return;
     }
     lss2_black = line_sensors.side_2_electrical_high;
+    lss3_black = line_sensors.side_3_electrical_high;
+  }
+
+  robot::HabitatPiecesDistanceSample distance_sample{};
+  if (rear_link.laserSnapshotAvailable()) {
+    const robot::LaserDistanceSnapshot& laser =
+        rear_link.latestLaserSnapshot();
+    const robot::Milliseconds measurement_received_at_ms =
+        rear_link.lastLaserMeasurementReceivedAtMs();
+    const robot::Milliseconds maximum_sample_age_ms =
+        static_cast<robot::Milliseconds>(
+            laser.intermeasurement_period_ms) *
+        4U;
+    distance_sample.available =
+        laser.configured && laser.initialized && laser.ranging &&
+        laser.data_valid &&
+        laser.profile == robot::LaserDistanceProfile::HighAccuracy &&
+        laser.sensor_range_status == robot::kVl53l0xValidRangeStatus &&
+        laser.driver_status == 0 && measurement_received_at_ms != 0U &&
+        maximum_sample_age_ms > 0U &&
+        elapsedSince(now_ms, measurement_received_at_ms) <=
+            maximum_sample_age_ms;
+    distance_sample.distance_mm = laser.distance_mm;
+    distance_sample.measurement_sequence =
+        laser.measurement_sequence;
+  }
+
+  const robot::HabitatPiecesState previous_habitat_state =
+      context.habitat_pieces.state;
+  if (previous_habitat_state ==
+      robot::HabitatPiecesState::ReturnLineStrafing) {
+    if (!rear_link.rearLineSnapshotFresh(
+            now_ms, context.rear_config.remoteCommandTimeoutMs)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearLineDataStale,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: rear line data stale during return strafe",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    if (!rear_link.latestRearLineSnapshot().configured) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearLineSensorsUnavailable,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Pieces stopped: rear line sensors unavailable",
+          robot::EventSource::Line, now_ms);
+      return;
+    }
+  }
+
+  robot::HabitatPiecesInputs habitat_inputs{};
+  habitat_inputs.lss2_black = lss2_black;
+  habitat_inputs.lss3_black = lss3_black;
+  habitat_inputs.distance_sample = distance_sample;
+  habitat_inputs.slide_bottom_limit_active =
+      stepper.lowerLimitActive();
+  habitat_inputs.slide_bottom_ready =
+      stepper.lowerLimitActive() && stepper.isHomed();
+  habitat_inputs.slide_top_limit_active = stepper.upperLimitActive();
+  habitat_inputs.slide_down_failed =
+      previous_habitat_state == robot::HabitatPiecesState::LoweringSlide &&
+      !habitat_inputs.slide_bottom_ready &&
+      (stepper.motionState() ==
+           robot::esp2::StepperMotionState::LimitSearchFailed ||
+       stepper.motionState() == robot::esp2::StepperMotionState::Stopped);
+  if (context.habitat_pieces.slide_lift_started) {
+    habitat_inputs.slide_lift_complete =
+        stepper.positionSteps() >=
+            static_cast<std::int64_t>(
+                context.habitat_pieces_config.slide_lift_steps) &&
+        !stepper.isBusy();
+    habitat_inputs.slide_lift_failed =
+        !habitat_inputs.slide_lift_complete &&
+        ((stepper.upperLimitActive() &&
+          stepper.positionSteps() <
+              static_cast<std::int64_t>(
+                  context.habitat_pieces_config.slide_lift_steps)) ||
+         !stepper.isBusy());
+  }
+  if (rear_link.rearLineSnapshotFresh(
+          now_ms, context.rear_config.remoteCommandTimeoutMs) &&
+      rear_link.latestRearLineSnapshot().configured) {
+    const robot::RearLineSensorSnapshot& rear_line =
+        rear_link.latestRearLineSnapshot();
+    habitat_inputs.rear_left_black = rear_line.left_electrical_high;
+    habitat_inputs.rear_right_black = rear_line.right_electrical_high;
   }
 
   context.last_habitat_pieces_update =
       robot::updateHabitatPiecesAutonomy(
           context.habitat_pieces, context.habitat_pieces_config,
-          lss2_black, now_ms);
+          habitat_inputs, now_ms);
+
+  if (context.last_habitat_pieces_update.should_start_slide_down) {
+    const bool accepted = stepper.setLimitSearchSpeed(
+                              context.habitat_pieces_config
+                                  .slide_down_speed_steps_per_second) &&
+                          stepper.moveToLowerLimit();
+    if (!accepted) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::SlideCommandFailed,
+          robot::FaultCode::InvalidCommand,
+          "Habitat Pieces stopped: slide-down command rejected",
+          robot::EventSource::Motor, now_ms);
+      return;
+    }
+  }
+
+  if (context.last_habitat_pieces_update.should_start_slide_lift) {
+    const bool accepted = stepper.isHomed() &&
+                          stepper.setSpeed(
+                              context.habitat_pieces_config
+                                  .slide_lift_speed_steps_per_second) &&
+                          stepper.jogSteps(static_cast<std::int64_t>(
+                              context.habitat_pieces_config
+                                  .slide_lift_steps));
+    if (!accepted) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::SlideCommandFailed,
+          robot::FaultCode::InvalidCommand,
+          "Habitat Pieces stopped: slide-lift command rejected",
+          robot::EventSource::Motor, now_ms);
+      return;
+    }
+  }
+
+  if (context.habitat_pieces.state == robot::HabitatPiecesState::Fault) {
+    const robot::HabitatPiecesStopReason reason =
+        context.habitat_pieces.stop_reason;
+    robot::FaultCode fault_code = robot::FaultCode::InvalidCommand;
+    const char* message = "Habitat Pieces stopped: autonomous state fault";
+    robot::EventSource source = robot::EventSource::System;
+    switch (reason) {
+      case robot::HabitatPiecesStopReason::RunTimeout:
+        fault_code = robot::FaultCode::SearchTimeout;
+        message = "Habitat Pieces stopped: LSS2/LSS3 alignment timeout reached";
+        break;
+      case robot::HabitatPiecesStopReason::DistanceStrafeTimeout:
+        fault_code = robot::FaultCode::SearchTimeout;
+        message = "Habitat Pieces stopped: distance strafe timeout reached";
+        break;
+      case robot::HabitatPiecesStopReason::SlideDownTimeout:
+        fault_code = robot::FaultCode::SearchTimeout;
+        message = "Habitat Pieces stopped: slide-down timeout reached";
+        source = robot::EventSource::Motor;
+        break;
+      case robot::HabitatPiecesStopReason::ForwardDistanceTimeout:
+        fault_code = robot::FaultCode::SearchTimeout;
+        message = "Habitat Pieces stopped: forward distance timeout reached";
+        break;
+      case robot::HabitatPiecesStopReason::SlideLiftTimeout:
+        fault_code = robot::FaultCode::SearchTimeout;
+        message = "Habitat Pieces stopped: slide-lift timeout reached";
+        source = robot::EventSource::Motor;
+        break;
+      case robot::HabitatPiecesStopReason::ReturnLineTimeout:
+        fault_code = robot::FaultCode::SearchTimeout;
+        message = "Habitat Pieces stopped: rear-line return timeout reached";
+        source = robot::EventSource::Line;
+        break;
+      case robot::HabitatPiecesStopReason::SlideCommandFailed:
+        message = "Habitat Pieces stopped: slide motion failed";
+        source = robot::EventSource::Motor;
+        break;
+      case robot::HabitatPiecesStopReason::ConflictingSlideLimits:
+        fault_code = robot::FaultCode::LimitSwitchConflict;
+        message = "Habitat Pieces stopped: slide limit switches conflict";
+        source = robot::EventSource::Motor;
+        break;
+      default:
+        break;
+    }
+    enterHabitatPiecesFault(
+        context, front_left, front_right, rear_link, reason,
+        fault_code, message, source, now_ms);
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.should_align_side_lines) {
+    robot::stopLineFollower(context.follower_state);
+    if (context.last_habitat_pieces_update.transitioned) {
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Line,
+               "Habitat Pieces first side line detected; aligning LSS2/LSS3");
+    }
+    const float alignment_duty = clampFloat(
+        context.habitat_pieces_config.line_follow_duty, 0.0F,
+        activeMotionDutyCap(context));
+    const robot::FourWheelCommand wheels =
+        robot::makeHabitatPiecesSideAlignmentCommand(
+            alignment_duty,
+            context.last_habitat_pieces_update.lss2_latched,
+            context.last_habitat_pieces_update.lss3_latched, now_ms,
+            context.config.remoteCommandTimeoutMs);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: side-line alignment command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    printTelemetry(context, sensors, rear_link, now_ms);
+    return;
+  }
 
   if (context.last_habitat_pieces_update.should_reverse) {
     robot::stopLineFollower(context.follower_state);
     if (context.last_habitat_pieces_update.transitioned) {
       logEvent(context, now_ms, robot::EventSeverity::Info,
                robot::EventSource::Line,
-               "Habitat Pieces LSS2 detected black line; reversing");
+               "Habitat Pieces LSS2 and LSS3 aligned; reversing");
     }
     const robot::FourWheelCommand wheels =
         makeHabitatPiecesBackwardCommand(context, now_ms);
@@ -3361,6 +3687,150 @@ void runHabitatPieces(
     return;
   }
 
+  if (context.last_habitat_pieces_update.should_distance_strafe) {
+    robot::stopLineFollower(context.follower_state);
+    if (context.last_habitat_pieces_update.transitioned) {
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::System,
+               "Habitat Pieces reverse complete; distance-zone strafe started");
+    }
+    const float strafe_duty = clampFloat(
+        context.habitat_pieces_config.distance_strafe_duty, 0.0F,
+        activeMotionDutyCap(context));
+    const robot::FourWheelCommand wheels =
+        robot::makeHabitatPiecesDistanceStrafeCommand(
+            context.habitat_pieces_config.distance_strafe_direction,
+            strafe_duty, now_ms,
+            context.config.remoteCommandTimeoutMs);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms,
+                           robot::LaserDistanceProfile::HighAccuracy)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: distance strafe command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    printTelemetry(context, sensors, rear_link, now_ms);
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.should_compensation_strafe) {
+    robot::stopLineFollower(context.follower_state);
+    const robot::HabitatPiecesStrafeDirection direction =
+        robot::oppositeHabitatPiecesStrafeDirection(
+            context.habitat_pieces_config.distance_strafe_direction);
+    const robot::FourWheelCommand wheels =
+        robot::makeHabitatPiecesDistanceStrafeCommand(
+            direction,
+            clampFloat(
+                context.habitat_pieces_config.compensation_strafe_duty,
+                0.0F, activeMotionDutyCap(context)),
+            now_ms, context.config.remoteCommandTimeoutMs);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: compensation strafe command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.should_lower_slide) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
+  if (context.last_habitat_pieces_update
+          .should_drive_forward_to_distance) {
+    const robot::FourWheelCommand wheels =
+        makeHabitatPiecesTranslationCommand(
+            context, 0.0F, 1.0F,
+            context.habitat_pieces_config.forward_to_distance_duty,
+            now_ms);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: forward distance command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.should_post_pickup_reverse) {
+    const robot::FourWheelCommand wheels =
+        makeHabitatPiecesTranslationCommand(
+            context, 0.0F, -1.0F,
+            context.habitat_pieces_config.post_pickup_reverse_duty,
+            now_ms);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: post-pickup reverse command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.should_return_line_strafe) {
+    const robot::HabitatPiecesStrafeDirection direction =
+        robot::oppositeHabitatPiecesStrafeDirection(
+            context.habitat_pieces_config.distance_strafe_direction);
+    const robot::FourWheelCommand wheels =
+        robot::makeHabitatPiecesDistanceStrafeCommand(
+            direction,
+            clampFloat(context.habitat_pieces_config.return_strafe_duty,
+                       0.0F, activeMotionDutyCap(context)),
+            now_ms, context.config.remoteCommandTimeoutMs);
+    if (!applyWheelCommand(context, front_left, front_right, rear_link,
+                           wheels, context.config, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: rear-line return strafe command failed",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    context.last_command_ms = now_ms;
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.should_wait_for_slide_lift) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
+  if (context.last_habitat_pieces_update.transitioned &&
+      (context.habitat_pieces.state ==
+           robot::HabitatPiecesState::ForwardToDistance ||
+       context.habitat_pieces.state ==
+           robot::HabitatPiecesState::ReturnLineStrafing)) {
+    disableMotionActuators(context, front_left, front_right, rear_link,
+                           now_ms);
+    return;
+  }
+
   if (!context.last_habitat_pieces_update.should_line_follow) {
     disableMotionActuators(context, front_left, front_right, rear_link,
                            now_ms);
@@ -3370,19 +3840,26 @@ void runHabitatPieces(
       clearFault(context);
       logEvent(context, now_ms, robot::EventSeverity::Info,
                robot::EventSource::System,
-               "Habitat Pieces reverse duration complete; stopped");
-    } else if (context.habitat_pieces.timed_out) {
+               "Habitat Pieces rear line reached and slide lift complete; stopped");
+    } else if (context.habitat_pieces.stop_reason ==
+               robot::HabitatPiecesStopReason::DistanceStrafeTimeout) {
       setFault(context, robot::FaultCode::SearchTimeout,
-               "Habitat Pieces stopped: LSS2 detection timeout reached");
+               "Habitat Pieces stopped: distance strafe timeout reached");
       logEvent(context, now_ms, robot::EventSeverity::Fault,
                robot::EventSource::System,
-               "Habitat Pieces stopped: LSS2 detection timeout reached");
+               "Habitat Pieces stopped: distance strafe timeout reached");
+    } else if (context.habitat_pieces.timed_out) {
+      setFault(context, robot::FaultCode::SearchTimeout,
+               "Habitat Pieces stopped: LSS2/LSS3 alignment timeout reached");
+      logEvent(context, now_ms, robot::EventSeverity::Fault,
+               robot::EventSource::System,
+               "Habitat Pieces stopped: LSS2/LSS3 alignment timeout reached");
     } else {
       setFault(context, robot::FaultCode::InvalidCommand,
-               "Habitat Pieces stopped: LSS2 gate unsafe");
+               "Habitat Pieces stopped: side-line gate unsafe");
       logEvent(context, now_ms, robot::EventSeverity::Fault,
                robot::EventSource::Line,
-               "Habitat Pieces stopped: LSS2 gate unsafe");
+               "Habitat Pieces stopped: side-line gate unsafe");
     }
     return;
   }
@@ -3467,8 +3944,23 @@ void runHabitatPlacement(
           robot::EventSource::System, now_ms);
       return;
     }
-    robot::startHabitatPlacementAutonomy(context.habitat_placement,
-                                         now_ms);
+    const float counter_clockwise_relative_angle_deg =
+        -robot::clockwiseTurnRelativeAngleDeg(
+            context.habitat_placement_config
+                .counter_clockwise_angle_deg,
+            context.imu_turn_config.yaw_command_polarity);
+    if (!robot::startHabitatPlacementAutonomy(
+            context.habitat_placement,
+            context.latest_imu_snapshot.state.heading_deg,
+            counter_clockwise_relative_angle_deg, now_ms)) {
+      enterHabitatPlacementFault(
+          context, front_left, front_right, rear_link, stepper,
+          robot::HabitatPlacementFaultReason::ImuUnavailable,
+          robot::FaultCode::HardwareNotConfigured,
+          "Habitat Placement start rejected: initial IMU heading unavailable",
+          robot::EventSource::System, now_ms);
+      return;
+    }
     robot::startLineFollower(context.follower_state, now_ms);
     context.last_rear_update = {};
     context.last_command_ms = now_ms;
@@ -3557,19 +4049,28 @@ void runHabitatPlacement(
       context.habitat_placement.state;
   const robot::RearLineSensorSnapshot& rear =
       rear_link.latestRearLineSnapshot();
-  const robot::HabitatPlacementInputs inputs{
-      rear.side_configured && rear.side_electrical_high,
+  robot::HabitatPlacementInputs inputs{};
+  inputs.lss1_black =
+      rear.side_configured && rear.side_electrical_high;
+  inputs.initial_heading_turn_complete =
+      previous_state ==
+              robot::HabitatPlacementState::TurnToInitialHeading &&
+      context.imu_turn_state.state == robot::ImuTurnState::Complete;
+  inputs.counter_clockwise_turn_complete =
       previous_state ==
               robot::HabitatPlacementState::TurnCounterClockwise &&
-          context.imu_turn_state.state == robot::ImuTurnState::Complete,
-      stepper.lowerLimitActive(),
-      stepper.upperLimitActive(),
-      claws.habitatPusherCommandedOpen(),
+      context.imu_turn_state.state == robot::ImuTurnState::Complete;
+  inputs.bottom_limit_active = stepper.lowerLimitActive();
+  inputs.top_limit_active = stepper.upperLimitActive();
+  inputs.pusher_open_commanded = claws.habitatPusherCommandedOpen();
+  inputs.clockwise_turn_complete =
       previous_state == robot::HabitatPlacementState::TurnClockwise &&
-          context.imu_turn_state.state == robot::ImuTurnState::Complete,
+      context.imu_turn_state.state == robot::ImuTurnState::Complete;
+  inputs.front_line_black =
       context.last_line_observation.left_black ||
-          context.last_line_observation.right_black,
-      claws.habitatPusherCommandedClosed()};
+      context.last_line_observation.right_black;
+  inputs.pusher_closed_commanded =
+      claws.habitatPusherCommandedClosed();
   context.last_habitat_placement_update =
       robot::updateHabitatPlacementAutonomy(
           context.habitat_placement, inputs,
@@ -3603,6 +4104,8 @@ void runHabitatPlacement(
 
   if (update.state != previous_state) {
     if (update.state ==
+            robot::HabitatPlacementState::TurnToInitialHeading ||
+        update.state ==
             robot::HabitatPlacementState::TurnCounterClockwise ||
         update.state == robot::HabitatPlacementState::TurnClockwise) {
       robot::resetImuTurnController(context.imu_turn_state);
@@ -3681,34 +4184,38 @@ void runHabitatPlacement(
   }
 
   robot::stopLineFollower(context.follower_state);
-  if (update.should_turn_counter_clockwise || update.should_turn_clockwise) {
+  if (update.should_turn_to_initial_heading ||
+      update.should_turn_counter_clockwise ||
+      update.should_turn_clockwise) {
+    const bool turn_to_initial_heading =
+        update.should_turn_to_initial_heading;
     const bool clockwise = update.should_turn_clockwise;
-    const float physical_angle_deg =
-        clockwise ? context.habitat_placement_config.clockwise_angle_deg
-                  : context.habitat_placement_config
-                        .counter_clockwise_angle_deg;
-    float relative_angle_deg = robot::clockwiseTurnRelativeAngleDeg(
-        physical_angle_deg, context.imu_turn_config.yaw_command_polarity);
-    if (!clockwise) {
-      relative_angle_deg = -relative_angle_deg;
-    }
     const robot::Milliseconds timeout_ms =
-        clockwise ? context.habitat_placement_config.clockwise_timeout_ms
-                  : context.habitat_placement_config
-                        .counter_clockwise_timeout_ms;
-    const AutonomousImuMotionResult result = runAutonomousImuTurn(
-        context, front_left, front_right, rear_link, context.rear_config,
-        relative_angle_deg, now_ms, timeout_ms);
-    if (!clockwise &&
-        !context.habitat_placement
-             .counter_clockwise_heading_captured &&
-        (robot::imuTurnActive(context.imu_turn_state) ||
-         context.imu_turn_state.state == robot::ImuTurnState::Complete)) {
-      context.habitat_placement.counter_clockwise_heading_captured = true;
-      context.habitat_placement.counter_clockwise_start_heading_deg =
-          context.imu_turn_state.start_heading_deg;
-      context.habitat_placement.counter_clockwise_target_heading_deg =
-          context.imu_turn_state.target_heading_deg;
+        turn_to_initial_heading
+            ? context.habitat_placement_config
+                  .initial_heading_turn_timeout_ms
+            : (clockwise
+                   ? context.habitat_placement_config.clockwise_timeout_ms
+                   : context.habitat_placement_config
+                         .counter_clockwise_timeout_ms);
+    AutonomousImuMotionResult result{};
+    if (turn_to_initial_heading || update.should_turn_counter_clockwise) {
+      const float target_heading_deg =
+          turn_to_initial_heading
+              ? context.habitat_placement.initial_heading_deg
+              : context.habitat_placement
+                    .counter_clockwise_target_heading_deg;
+      result = runAutonomousImuTurnToHeading(
+          context, front_left, front_right, rear_link,
+          context.rear_config, target_heading_deg, now_ms, timeout_ms);
+    } else {
+      const float relative_angle_deg =
+          robot::clockwiseTurnRelativeAngleDeg(
+              context.habitat_placement_config.clockwise_angle_deg,
+              context.imu_turn_config.yaw_command_polarity);
+      result = runAutonomousImuTurn(
+          context, front_left, front_right, rear_link,
+          context.rear_config, relative_angle_deg, now_ms, timeout_ms);
     }
     if (result != AutonomousImuMotionResult::Running &&
         result != AutonomousImuMotionResult::Complete) {
@@ -3740,7 +4247,14 @@ void runHabitatPlacement(
 
   bool moving = false;
   robot::FourWheelCommand wheels = robot::disabledFourWheelCommand();
-  if (update.should_drive_forward_to_slide) {
+  if (update.should_strafe_right_before_counter_clockwise) {
+    moving = true;
+    wheels = makeHabitatPlacementTranslationCommand(
+        context, 1.0F, 0.0F,
+        context.habitat_placement_config
+            .pre_counter_clockwise_strafe_right_duty,
+        now_ms);
+  } else if (update.should_drive_forward_to_slide) {
     moving = true;
     wheels = makeHabitatPlacementTranslationCommand(
         context, 0.0F, 1.0F,
@@ -6531,27 +7045,148 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
           ? context.habitat_pieces_config.reverse_duration_ms -
                 context.habitat_pieces.reverse_elapsed_ms
           : 0U;
+  snapshot.habitat_pieces_distance_strafe_direction =
+      context.habitat_pieces_config.distance_strafe_direction;
+  snapshot.habitat_pieces_distance_threshold_mm =
+      context.habitat_pieces_config.distance_threshold_mm;
+  snapshot.habitat_pieces_distance_zone_target_count =
+      context.habitat_pieces_config.distance_zone_target_count;
+  snapshot.habitat_pieces_distance_strafe_duty =
+      context.habitat_pieces_config.distance_strafe_duty;
+  snapshot.habitat_pieces_distance_strafe_timeout_ms =
+      context.habitat_pieces_config.distance_strafe_timeout_ms;
+  snapshot.habitat_pieces_distance_strafe_elapsed_ms =
+      context.habitat_pieces.distance_strafe_elapsed_ms;
+  snapshot.habitat_pieces_distance_strafe_remaining_ms =
+      context.habitat_pieces_config.distance_strafe_timeout_ms >
+              context.habitat_pieces.distance_strafe_elapsed_ms
+          ? context.habitat_pieces_config.distance_strafe_timeout_ms -
+                context.habitat_pieces.distance_strafe_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_distance_mm =
+      context.habitat_pieces.latest_distance_mm;
+  snapshot.habitat_pieces_distance_zone_count =
+      context.habitat_pieces.distance_zone_count;
+  snapshot.habitat_pieces_compensation_strafe_duty =
+      context.habitat_pieces_config.compensation_strafe_duty;
+  snapshot.habitat_pieces_compensation_strafe_duration_ms =
+      context.habitat_pieces_config.compensation_strafe_duration_ms;
+  snapshot.habitat_pieces_compensation_strafe_elapsed_ms =
+      context.habitat_pieces.compensation_strafe_elapsed_ms;
+  snapshot.habitat_pieces_compensation_strafe_remaining_ms =
+      context.habitat_pieces_config.compensation_strafe_duration_ms >
+              context.habitat_pieces.compensation_strafe_elapsed_ms
+          ? context.habitat_pieces_config.compensation_strafe_duration_ms -
+                context.habitat_pieces.compensation_strafe_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_slide_down_speed_steps_per_second =
+      context.habitat_pieces_config.slide_down_speed_steps_per_second;
+  snapshot.habitat_pieces_slide_down_timeout_ms =
+      context.habitat_pieces_config.slide_down_timeout_ms;
+  snapshot.habitat_pieces_slide_down_elapsed_ms =
+      context.habitat_pieces.slide_down_elapsed_ms;
+  snapshot.habitat_pieces_slide_down_remaining_ms =
+      context.habitat_pieces_config.slide_down_timeout_ms >
+              context.habitat_pieces.slide_down_elapsed_ms
+          ? context.habitat_pieces_config.slide_down_timeout_ms -
+                context.habitat_pieces.slide_down_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_forward_to_distance_duty =
+      context.habitat_pieces_config.forward_to_distance_duty;
+  snapshot.habitat_pieces_forward_stop_distance_mm =
+      context.habitat_pieces_config.forward_stop_distance_mm;
+  snapshot.habitat_pieces_forward_to_distance_timeout_ms =
+      context.habitat_pieces_config.forward_to_distance_timeout_ms;
+  snapshot.habitat_pieces_forward_to_distance_elapsed_ms =
+      context.habitat_pieces.forward_to_distance_elapsed_ms;
+  snapshot.habitat_pieces_forward_to_distance_remaining_ms =
+      context.habitat_pieces_config.forward_to_distance_timeout_ms >
+              context.habitat_pieces.forward_to_distance_elapsed_ms
+          ? context.habitat_pieces_config.forward_to_distance_timeout_ms -
+                context.habitat_pieces.forward_to_distance_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_slide_lift_steps =
+      context.habitat_pieces_config.slide_lift_steps;
+  snapshot.habitat_pieces_slide_lift_speed_steps_per_second =
+      context.habitat_pieces_config.slide_lift_speed_steps_per_second;
+  snapshot.habitat_pieces_slide_lift_timeout_ms =
+      context.habitat_pieces_config.slide_lift_timeout_ms;
+  snapshot.habitat_pieces_slide_lift_elapsed_ms =
+      context.habitat_pieces.slide_lift_elapsed_ms;
+  snapshot.habitat_pieces_slide_lift_remaining_ms =
+      context.habitat_pieces_config.slide_lift_timeout_ms >
+              context.habitat_pieces.slide_lift_elapsed_ms
+          ? context.habitat_pieces_config.slide_lift_timeout_ms -
+                context.habitat_pieces.slide_lift_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_post_pickup_reverse_duty =
+      context.habitat_pieces_config.post_pickup_reverse_duty;
+  snapshot.habitat_pieces_post_pickup_reverse_duration_ms =
+      context.habitat_pieces_config.post_pickup_reverse_duration_ms;
+  snapshot.habitat_pieces_post_pickup_reverse_elapsed_ms =
+      context.habitat_pieces.post_pickup_reverse_elapsed_ms;
+  snapshot.habitat_pieces_post_pickup_reverse_remaining_ms =
+      context.habitat_pieces_config.post_pickup_reverse_duration_ms >
+              context.habitat_pieces.post_pickup_reverse_elapsed_ms
+          ? context.habitat_pieces_config.post_pickup_reverse_duration_ms -
+                context.habitat_pieces.post_pickup_reverse_elapsed_ms
+          : 0U;
+  snapshot.habitat_pieces_return_strafe_duty =
+      context.habitat_pieces_config.return_strafe_duty;
+  snapshot.habitat_pieces_return_line_timeout_ms =
+      context.habitat_pieces_config.return_line_timeout_ms;
+  snapshot.habitat_pieces_return_strafe_elapsed_ms =
+      context.habitat_pieces.return_strafe_elapsed_ms;
+  snapshot.habitat_pieces_return_strafe_remaining_ms =
+      context.habitat_pieces_config.return_line_timeout_ms >
+              context.habitat_pieces.return_strafe_elapsed_ms
+          ? context.habitat_pieces_config.return_line_timeout_ms -
+                context.habitat_pieces.return_strafe_elapsed_ms
+          : 0U;
   snapshot.habitat_pieces_configuration_valid =
-      robot::habitatPiecesConfigValid(context.habitat_pieces_config,
-                                      activeMotionDutyCap(context)) &&
+      g_runtime.stepper != nullptr &&
+      g_runtime.stepper->maximumPositionSteps() > 0 &&
+      g_runtime.stepper->maximumPositionSteps() <=
+          static_cast<std::int64_t>(UINT32_MAX) &&
+      robot::habitatPiecesConfigValid(
+          context.habitat_pieces_config, activeMotionDutyCap(context),
+          kMaxTimedTestDurationMs,
+          g_runtime.stepper->maximumSpeedStepsPerSecond(),
+          static_cast<std::uint32_t>(
+              g_runtime.stepper->maximumPositionSteps())) &&
       robot::validateLineFollowerConfig(habitat_line_config,
                                         hardwareDutyCap())
           .accepted;
   snapshot.habitat_pieces_start_ready =
+      g_runtime.stepper != nullptr &&
       habitatPiecesStartRequirementsMet(
-          sensors, front_left, front_right, rear_link, now_ms, context);
+          sensors, front_left, front_right, rear_link,
+          *g_runtime.stepper, now_ms, context);
   snapshot.habitat_pieces_lss2_data_fresh =
       rear_link.rearLineSnapshotFresh(
           now_ms, context.config.remoteCommandTimeoutMs);
   snapshot.habitat_pieces_lss2_configured =
       rear_link.rearLineSnapshotAvailable() &&
       rear_link.latestRearLineSnapshot().side_2_configured;
+  snapshot.habitat_pieces_lss3_data_fresh =
+      snapshot.habitat_pieces_lss2_data_fresh;
+  snapshot.habitat_pieces_lss3_configured =
+      rear_link.rearLineSnapshotAvailable() &&
+      rear_link.latestRearLineSnapshot().side_3_configured;
   snapshot.habitat_pieces_lss2_detection_armed =
       context.habitat_pieces.lss2_detection_armed;
   snapshot.habitat_pieces_lss2_black =
       snapshot.habitat_pieces_lss2_data_fresh &&
       snapshot.habitat_pieces_lss2_configured &&
       rear_link.latestRearLineSnapshot().side_2_electrical_high;
+  snapshot.habitat_pieces_lss3_black =
+      snapshot.habitat_pieces_lss3_data_fresh &&
+      snapshot.habitat_pieces_lss3_configured &&
+      rear_link.latestRearLineSnapshot().side_3_electrical_high;
+  snapshot.habitat_pieces_lss2_latched =
+      context.habitat_pieces.lss2_latched;
+  snapshot.habitat_pieces_lss3_latched =
+      context.habitat_pieces.lss3_latched;
   snapshot.habitat_pieces_should_stop =
       context.last_habitat_pieces_update.should_stop;
   snapshot.habitat_pieces_target_reached =
@@ -6561,10 +7196,82 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.habitat_pieces.state ==
           robot::HabitatPiecesState::LineFollowing &&
       context.follower_state.enabled;
+  snapshot.habitat_pieces_side_line_aligning =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::SideLineAligning;
+  snapshot.habitat_pieces_left_side_driving =
+      snapshot.habitat_pieces_side_line_aligning &&
+      context.last_habitat_pieces_update.should_drive_left_side;
+  snapshot.habitat_pieces_right_side_driving =
+      snapshot.habitat_pieces_side_line_aligning &&
+      context.last_habitat_pieces_update.should_drive_right_side;
   snapshot.habitat_pieces_reversing =
       context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
       context.habitat_pieces.state ==
           robot::HabitatPiecesState::Reversing;
+  snapshot.habitat_pieces_distance_strafing =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::DistanceStrafing;
+  snapshot.habitat_pieces_distance_measurement_available =
+      context.last_habitat_pieces_update.distance_measurement_available;
+  snapshot.habitat_pieces_distance_sample_new =
+      context.last_habitat_pieces_update.distance_sample_new;
+  snapshot.habitat_pieces_distance_zone_active =
+      context.habitat_pieces.distance_zone_active;
+  snapshot.habitat_pieces_distance_zone_entered =
+      context.last_habitat_pieces_update.distance_zone_entered;
+  snapshot.habitat_pieces_compensation_strafing =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::CompensationStrafing;
+  snapshot.habitat_pieces_lowering_slide =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::LoweringSlide;
+  snapshot.habitat_pieces_slide_bottom_ready =
+      g_runtime.stepper != nullptr &&
+      g_runtime.stepper->lowerLimitActive() &&
+      g_runtime.stepper->isHomed();
+  snapshot.habitat_pieces_forward_to_distance =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::ForwardToDistance;
+  snapshot.habitat_pieces_forward_distance_reached =
+      context.habitat_pieces.slide_lift_started;
+  snapshot.habitat_pieces_slide_lift_started =
+      context.habitat_pieces.slide_lift_started;
+  snapshot.habitat_pieces_slide_lift_complete =
+      context.habitat_pieces.slide_lift_complete;
+  snapshot.habitat_pieces_post_pickup_reversing =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::PostPickupReversing;
+  snapshot.habitat_pieces_return_line_strafing =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::ReturnLineStrafing;
+  snapshot.habitat_pieces_waiting_for_slide_lift =
+      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::WaitForSlideLift;
+  snapshot.habitat_pieces_rear_line_data_fresh =
+      rear_link.rearLineSnapshotFresh(
+          now_ms, context.rear_config.remoteCommandTimeoutMs);
+  snapshot.habitat_pieces_rear_line_configured =
+      rear_link.rearLineSnapshotAvailable() &&
+      rear_link.latestRearLineSnapshot().configured;
+  snapshot.habitat_pieces_rear_left_black =
+      snapshot.habitat_pieces_rear_line_data_fresh &&
+      snapshot.habitat_pieces_rear_line_configured &&
+      rear_link.latestRearLineSnapshot().left_electrical_high;
+  snapshot.habitat_pieces_rear_right_black =
+      snapshot.habitat_pieces_rear_line_data_fresh &&
+      snapshot.habitat_pieces_rear_line_configured &&
+      rear_link.latestRearLineSnapshot().right_electrical_high;
+  snapshot.habitat_pieces_rear_line_detected =
+      context.habitat_pieces.rear_line_detected;
   snapshot.habitat_pieces_timed_out = context.habitat_pieces.timed_out;
 
   snapshot.habitat_placement_state = context.habitat_placement.state;
@@ -6585,10 +7292,10 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       habitatPlacementStartRequirementsMet(
           sensors, front_left, front_right, rear_link, claws,
           *g_runtime.stepper, now_ms, context);
-  snapshot.habitat_placement_counter_clockwise_heading_captured =
-      context.habitat_placement.counter_clockwise_heading_captured;
-  snapshot.habitat_placement_counter_clockwise_start_heading_deg =
-      context.habitat_placement.counter_clockwise_start_heading_deg;
+  snapshot.habitat_placement_initial_heading_captured =
+      context.habitat_placement.initial_heading_captured;
+  snapshot.habitat_placement_initial_heading_deg =
+      context.habitat_placement.initial_heading_deg;
   snapshot.habitat_placement_counter_clockwise_target_heading_deg =
       context.habitat_placement.counter_clockwise_target_heading_deg;
 
@@ -7268,25 +7975,55 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Habitat Pieces</h2>
-    <div class="muted">Follows the line with the front sensors immediately. LSS2 detection is ignored for the configured delay; a black LSS2 reading then starts the configured straight-backward move. The robot latches stop when that reverse duration completes. Missing/stale LSS2 data before detection, lost front line, rear-link failure, or the search timeout also stops the robot.</div>
+    <div class="muted">Follows the front line, aligns independently on LSS2/LSS3, reverses, and strafes while counting distinct above-threshold laser zones. At the target count it compensates in the opposite direction, lowers the slide to its bottom switch, then drives forward until a valid laser reading is at or below the pickup threshold. The slide lift starts with the timed reverse and continues concurrently while the robot strafes opposite the initial count direction until either rear line sensor sees black. Invalid/no-signal laser samples do not stop the forward approach; every search and open-loop drive remains timeout-bounded.</div>
     <div class="kv">
       <span>Configuration</span><span id="habitatConfig" class="mono"></span>
       <span>Start ready</span><span id="habitatReady" class="mono"></span>
       <span>State</span><span id="habitatState" class="mono"></span>
-      <span>LSS2 stop gate</span><span id="habitatGate" class="mono"></span>
-      <span>LSS2 input</span><span id="habitatLss2" class="mono"></span>
+      <span>Side-line gate</span><span id="habitatGate" class="mono"></span>
+      <span>LSS2 left input</span><span id="habitatLss2" class="mono"></span>
+      <span>LSS3 right input</span><span id="habitatLss3" class="mono"></span>
+      <span>Side alignment</span><span id="habitatAlign" class="mono"></span>
       <span>Detection delay</span><span id="habitatDelay" class="mono"></span>
       <span>Search elapsed / timeout</span><span id="habitatTimeout" class="mono"></span>
       <span>Reverse elapsed / duration</span><span id="habitatReverse" class="mono"></span>
+      <span>Distance reading / threshold</span><span id="habitatDistance" class="mono"></span>
+      <span>Distance-zone count</span><span id="habitatDistanceCount" class="mono"></span>
+      <span>Distance strafe</span><span id="habitatDistanceStrafe" class="mono"></span>
+      <span>Overshoot compensation</span><span id="habitatCompensation" class="mono"></span>
+      <span>Slide down</span><span id="habitatSlideDown" class="mono"></span>
+      <span>Forward pickup approach</span><span id="habitatForwardPickup" class="mono"></span>
+      <span>Concurrent slide lift</span><span id="habitatSlideLift" class="mono"></span>
+      <span>Post-pickup reverse</span><span id="habitatPostReverse" class="mono"></span>
+      <span>Return rear-line strafe</span><span id="habitatReturnStrafe" class="mono"></span>
       <span>Line following</span><span id="habitatFollowing" class="mono"></span>
       <span>Last request</span><span id="habitatResult" class="mono muted">none</span>
     </div>
     <div class="two">
       <label>Front line-follow duty <input id="habitatDuty" type="number" min="0.001" max="1" step="0.01"></label>
-      <label>LSS2 detection delay (ms) <input id="habitatDetectionDelay" type="number" min="1" step="100"></label>
-      <label>LSS2 search timeout (ms) <input id="habitatRunTimeout" type="number" min="1" step="100"></label>
+      <label>LSS2/LSS3 detection delay (ms) <input id="habitatDetectionDelay" type="number" min="1" step="100"></label>
+      <label>Side-line search/alignment timeout (ms) <input id="habitatRunTimeout" type="number" min="1" step="100"></label>
       <label>Reverse duty <input id="habitatReverseDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Reverse duration (ms) <input id="habitatReverseDuration" type="number" min="1" step="100"></label>
+      <label>Distance strafe direction <select id="habitatDistanceDirection"><option value="">Select</option><option value="LEFT">Left</option><option value="RIGHT">Right</option></select></label>
+      <label>Distance threshold (mm) <input id="habitatDistanceThreshold" type="number" min="1" max="65535" step="1"></label>
+      <label>Distance-zone target count <input id="habitatDistanceCountTarget" type="number" min="1" max="65535" step="1"></label>
+      <label>Distance strafe duty <input id="habitatDistanceDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Distance strafe timeout (ms) <input id="habitatDistanceTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Opposite compensation duty <input id="habitatCompensationDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Opposite compensation duration (ms) <input id="habitatCompensationDuration" type="number" min="1" max="30000" step="100"></label>
+      <label>Slide-down speed (microsteps/s) <input id="habitatSlideDownSpeed" type="number" min="1" step="100"></label>
+      <label>Slide-down timeout (ms) <input id="habitatSlideDownTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Forward pickup duty <input id="habitatForwardDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Forward pickup stop distance (mm) <input id="habitatForwardDistance" type="number" min="1" max="65535" step="1"></label>
+      <label>Forward pickup timeout (ms) <input id="habitatForwardTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Slide lift (microsteps) <input id="habitatSlideLiftSteps" type="number" min="1" step="100"></label>
+      <label>Slide-lift speed (microsteps/s) <input id="habitatSlideLiftSpeed" type="number" min="1" step="100"></label>
+      <label>Slide-lift timeout (ms) <input id="habitatSlideLiftTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Post-pickup reverse duty <input id="habitatPostReverseDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Post-pickup reverse duration (ms) <input id="habitatPostReverseDuration" type="number" min="1" max="30000" step="100"></label>
+      <label>Return strafe duty <input id="habitatReturnDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Return rear-line timeout (ms) <input id="habitatReturnTimeout" type="number" min="1" max="30000" step="100"></label>
     </div>
     <div class="row">
       <button class="run" onclick="habitatStart()">Start</button>
@@ -7298,20 +8035,23 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Habitat Placement</h2>
-    <div class="muted">Standalone route intended to run after Habitat Pieces pickup: rear-line follow to LSS1, fixed-target CCW IMU turn, lower the slide, open/push/retreat, CW IMU turn, timed reverse, timed left strafe, then strafe right until either front line sensor sees black and close the pusher. Every motion has an adjustable bound.</div>
+    <div class="muted">Standalone route intended to run after Habitat Pieces pickup: capture the initial IMU heading, rear-line follow to LSS1, return to the captured heading, timed right strafe, fixed-target CCW IMU turn, lower the slide, open/push/retreat, CW IMU turn, timed reverse, timed left strafe, then strafe right until either front line sensor sees black and close the pusher. Every motion has an adjustable bound.</div>
     <div class="kv">
       <span>Configuration</span><span id="placementConfig" class="mono"></span>
       <span>Start ready</span><span id="placementReady" class="mono"></span>
       <span>State</span><span id="placementState" class="mono"></span>
       <span>Fault reason</span><span id="placementFault" class="mono"></span>
       <span>Time in state</span><span id="placementTime" class="mono"></span>
-      <span>CCW saved start / target</span><span id="placementCcwSaved" class="mono"></span>
+      <span>Initial heading / CCW target</span><span id="placementCcwSaved" class="mono"></span>
       <span>Last request</span><span id="placementResult" class="mono muted">none</span>
     </div>
     <div class="two">
       <label>Rear line-follow duty <input id="placementRearDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>LSS1 timeout ms <input id="placementLssTimeout" type="number" min="1" max="30000" step="100"></label>
       <label>Delay after LSS1 ms <input id="placementLssDelay" type="number" min="1" max="30000" step="100"></label>
+      <label>Return-to-initial-heading timeout ms <input id="placementInitialHeadingTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Pre-CCW strafe-right duty <input id="placementPreCcwStrafeDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Pre-CCW strafe-right ms <input id="placementPreCcwStrafeMs" type="number" min="1" max="30000" step="100"></label>
       <label>CCW angle deg <input id="placementCcwAngle" type="number" min="0.1" step="1"></label>
       <label>CCW timeout ms <input id="placementCcwTimeout" type="number" min="1" max="30000" step="100"></label>
       <label>Forward-to-slide duty <input id="placementSlideDuty" type="number" min="0.001" max="1" step="0.01"></label>
@@ -8020,6 +8760,40 @@ function loadHabitatControls(j){
   setLfValue('habitatRunTimeout', h.run_timeout_ms || '');
   setLfValue('habitatReverseDuty', h.reverse_duty || '');
   setLfValue('habitatReverseDuration', h.reverse_duration_ms || '');
+  setLfValue('habitatDistanceDirection',
+             h.distance_strafe_direction === 'NONE'
+               ? '' : h.distance_strafe_direction);
+  setLfValue('habitatDistanceThreshold', h.distance_threshold_mm || '');
+  setLfValue('habitatDistanceCountTarget',
+             h.distance_zone_target_count || '');
+  setLfValue('habitatDistanceDuty', h.distance_strafe_duty || '');
+  setLfValue('habitatDistanceTimeout',
+             h.distance_strafe_timeout_ms || '');
+  setLfValue('habitatCompensationDuty',
+             h.compensation_strafe_duty || '');
+  setLfValue('habitatCompensationDuration',
+             h.compensation_strafe_duration_ms || '');
+  setLfValue('habitatSlideDownSpeed',
+             h.slide_down_speed_steps_per_second || '');
+  setLfValue('habitatSlideDownTimeout',
+             h.slide_down_timeout_ms || '');
+  setLfValue('habitatForwardDuty',
+             h.forward_to_distance_duty || '');
+  setLfValue('habitatForwardDistance',
+             h.forward_stop_distance_mm || '');
+  setLfValue('habitatForwardTimeout',
+             h.forward_to_distance_timeout_ms || '');
+  setLfValue('habitatSlideLiftSteps', h.slide_lift_steps || '');
+  setLfValue('habitatSlideLiftSpeed',
+             h.slide_lift_speed_steps_per_second || '');
+  setLfValue('habitatSlideLiftTimeout',
+             h.slide_lift_timeout_ms || '');
+  setLfValue('habitatPostReverseDuty',
+             h.post_pickup_reverse_duty || '');
+  setLfValue('habitatPostReverseDuration',
+             h.post_pickup_reverse_duration_ms || '');
+  setLfValue('habitatReturnDuty', h.return_strafe_duty || '');
+  setLfValue('habitatReturnTimeout', h.return_line_timeout_ms || '');
   habitatLoaded = true;
 }
 function habitatParams(){
@@ -8028,7 +8802,26 @@ function habitatParams(){
     'lss2-detection-delay-ms': qs('habitatDetectionDelay').value,
     'run-timeout-ms': qs('habitatRunTimeout').value,
     'reverse-duty': qs('habitatReverseDuty').value,
-    'reverse-duration-ms': qs('habitatReverseDuration').value
+    'reverse-duration-ms': qs('habitatReverseDuration').value,
+    'distance-strafe-direction': qs('habitatDistanceDirection').value,
+    'distance-threshold-mm': qs('habitatDistanceThreshold').value,
+    'distance-zone-count': qs('habitatDistanceCountTarget').value,
+    'distance-strafe-duty': qs('habitatDistanceDuty').value,
+    'distance-strafe-timeout-ms': qs('habitatDistanceTimeout').value,
+    'compensation-strafe-duty': qs('habitatCompensationDuty').value,
+    'compensation-strafe-duration-ms': qs('habitatCompensationDuration').value,
+    'slide-down-speed-steps-per-second': qs('habitatSlideDownSpeed').value,
+    'slide-down-timeout-ms': qs('habitatSlideDownTimeout').value,
+    'forward-to-distance-duty': qs('habitatForwardDuty').value,
+    'forward-stop-distance-mm': qs('habitatForwardDistance').value,
+    'forward-to-distance-timeout-ms': qs('habitatForwardTimeout').value,
+    'slide-lift-steps': qs('habitatSlideLiftSteps').value,
+    'slide-lift-speed-steps-per-second': qs('habitatSlideLiftSpeed').value,
+    'slide-lift-timeout-ms': qs('habitatSlideLiftTimeout').value,
+    'post-pickup-reverse-duty': qs('habitatPostReverseDuty').value,
+    'post-pickup-reverse-duration-ms': qs('habitatPostReverseDuration').value,
+    'return-strafe-duty': qs('habitatReturnDuty').value,
+    'return-line-timeout-ms': qs('habitatReturnTimeout').value
   });
 }
 function habitatShowResult(result){
@@ -8064,6 +8857,9 @@ function loadPlacementControls(j){
     placementRearDuty:p.reverse_line_follow_duty,
     placementLssTimeout:p.lss1_timeout_ms,
     placementLssDelay:p.post_lss1_delay_ms,
+    placementInitialHeadingTimeout:p.initial_heading_turn_timeout_ms,
+    placementPreCcwStrafeDuty:p.pre_counter_clockwise_strafe_right_duty,
+    placementPreCcwStrafeMs:p.pre_counter_clockwise_strafe_right_duration_ms,
     placementCcwAngle:p.counter_clockwise_angle_deg,
     placementCcwTimeout:p.counter_clockwise_timeout_ms,
     placementSlideDuty:p.forward_to_slide_duty,
@@ -8097,6 +8893,9 @@ function placementParams(){
     'reverse-line-duty':qs('placementRearDuty').value,
     'lss1-timeout-ms':qs('placementLssTimeout').value,
     'post-lss1-delay-ms':qs('placementLssDelay').value,
+    'initial-heading-timeout-ms':qs('placementInitialHeadingTimeout').value,
+    'pre-ccw-strafe-right-duty':qs('placementPreCcwStrafeDuty').value,
+    'pre-ccw-strafe-right-ms':qs('placementPreCcwStrafeMs').value,
     'ccw-angle-deg':qs('placementCcwAngle').value,
     'ccw-timeout-ms':qs('placementCcwTimeout').value,
     'forward-to-slide-duty':qs('placementSlideDuty').value,
@@ -8858,7 +9657,10 @@ function update(){
       `${habitatReason} · armed=${yn(habitat.lss2_detection_armed)} · stop=${yn(habitat.should_stop)} · target=${yn(habitat.target_reached)}`;
     qs('habitatGate').className =
       (!habitat.timed_out &&
-      (habitatReason === 'NONE' || habitatReason === 'LSS2_BLACK_DETECTED')
+      (habitatReason === 'NONE' ||
+       habitatReason === 'BOTH_SIDE_LINES_DETECTED' ||
+       habitatReason === 'DISTANCE_ZONE_COUNT_REACHED' ||
+       habitatReason === 'RETURN_LINE_DETECTED')
         ? 'mono good' : 'mono bad');
     const habitatLss2Level =
       habitat.lss2_configured && habitat.lss2_data_fresh
@@ -8867,12 +9669,62 @@ function update(){
       `${habitatLss2Level} · configured=${yn(habitat.lss2_configured)} · fresh=${yn(habitat.lss2_data_fresh)}`;
     qs('habitatLss2').className =
       habitat.lss2_configured && habitat.lss2_data_fresh ? 'mono good' : 'mono bad';
+    const habitatLss3Level =
+      habitat.lss3_configured && habitat.lss3_data_fresh
+        ? (habitat.lss3_black ? 'BLACK' : 'WHITE') : 'UNKNOWN';
+    qs('habitatLss3').textContent =
+      `${habitatLss3Level} · configured=${yn(habitat.lss3_configured)} · fresh=${yn(habitat.lss3_data_fresh)}`;
+    qs('habitatLss3').className =
+      habitat.lss3_configured && habitat.lss3_data_fresh ? 'mono good' : 'mono bad';
+    qs('habitatAlign').textContent =
+      `active=${yn(habitat.side_line_aligning)} · LSS2/left latched=${yn(habitat.lss2_latched)} drive=${yn(habitat.left_side_driving)} · LSS3/right latched=${yn(habitat.lss3_latched)} drive=${yn(habitat.right_side_driving)}`;
+    qs('habitatAlign').className =
+      habitat.side_line_aligning ? 'mono good' : 'mono muted';
     qs('habitatDelay').textContent =
       `${habitat.run_elapsed_ms ?? 0} / ${habitat.lss2_detection_delay_ms ?? 0} ms (${habitat.lss2_detection_remaining_ms ?? 0} ms remaining)`;
     qs('habitatTimeout').textContent =
       `${habitat.run_elapsed_ms ?? 0} / ${habitat.run_timeout_ms ?? 0} ms (${habitat.timeout_remaining_ms ?? 0} ms remaining)`;
     qs('habitatReverse').textContent =
       `${habitat.reverse_elapsed_ms ?? 0} / ${habitat.reverse_duration_ms ?? 0} ms at duty ${Number(habitat.reverse_duty ?? 0).toFixed(3)} · active=${yn(habitat.reversing)}`;
+    qs('habitatDistance').textContent = habitat.distance_measurement_available
+      ? `${habitat.distance_mm ?? 0} / ${habitat.distance_threshold_mm ?? 0} mm · zone=${habitat.distance_zone_active ? 'ABOVE' : 'AT/BELOW'} · new=${yn(habitat.distance_sample_new)}`
+      : `NO VALID READING / ${habitat.distance_threshold_mm ?? 0} mm · zone latched=${yn(habitat.distance_zone_active)}`;
+    qs('habitatDistance').className = habitat.distance_measurement_available
+      ? 'mono good' : 'mono bad';
+    qs('habitatDistanceCount').textContent =
+      `${habitat.distance_zone_count ?? 0} / ${habitat.distance_zone_target_count ?? 0} · entered this update=${yn(habitat.distance_zone_entered)}`;
+    qs('habitatDistanceStrafe').textContent =
+      `${habitat.distance_strafe_direction || 'NONE'} at duty ${Number(habitat.distance_strafe_duty ?? 0).toFixed(3)} · ${habitat.distance_strafe_elapsed_ms ?? 0} / ${habitat.distance_strafe_timeout_ms ?? 0} ms (${habitat.distance_strafe_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.distance_strafing)}`;
+    qs('habitatDistanceStrafe').className =
+      habitat.distance_strafing ? 'mono good' : 'mono muted';
+    qs('habitatCompensation').textContent =
+      `${habitat.return_strafe_direction || 'NONE'} at duty ${Number(habitat.compensation_strafe_duty ?? 0).toFixed(3)} · ${habitat.compensation_strafe_elapsed_ms ?? 0} / ${habitat.compensation_strafe_duration_ms ?? 0} ms (${habitat.compensation_strafe_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.compensation_strafing)}`;
+    qs('habitatCompensation').className =
+      habitat.compensation_strafing ? 'mono good' : 'mono muted';
+    qs('habitatSlideDown').textContent =
+      `${habitat.slide_down_speed_steps_per_second ?? 0} microsteps/s · ${habitat.slide_down_elapsed_ms ?? 0} / ${habitat.slide_down_timeout_ms ?? 0} ms (${habitat.slide_down_remaining_ms ?? 0} ms remaining) · bottom ready=${yn(habitat.slide_bottom_ready)} · active=${yn(habitat.lowering_slide)}`;
+    qs('habitatSlideDown').className =
+      habitat.lowering_slide ? 'mono good' : 'mono muted';
+    qs('habitatForwardPickup').textContent = habitat.distance_measurement_available
+      ? `${habitat.distance_mm ?? 0} / ${habitat.forward_stop_distance_mm ?? 0} mm at duty ${Number(habitat.forward_to_distance_duty ?? 0).toFixed(3)} · ${habitat.forward_to_distance_elapsed_ms ?? 0} / ${habitat.forward_to_distance_timeout_ms ?? 0} ms (${habitat.forward_to_distance_remaining_ms ?? 0} ms remaining) · reached=${yn(habitat.forward_distance_reached)} · active=${yn(habitat.forward_to_distance)}`
+      : `NO VALID READING / ${habitat.forward_stop_distance_mm ?? 0} mm at duty ${Number(habitat.forward_to_distance_duty ?? 0).toFixed(3)} · ${habitat.forward_to_distance_elapsed_ms ?? 0} / ${habitat.forward_to_distance_timeout_ms ?? 0} ms (${habitat.forward_to_distance_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.forward_to_distance)}`;
+    qs('habitatForwardPickup').className =
+      habitat.forward_to_distance ? 'mono good' : 'mono muted';
+    qs('habitatSlideLift').textContent =
+      `${habitat.slide_lift_steps ?? 0} microsteps at ${habitat.slide_lift_speed_steps_per_second ?? 0} microsteps/s · ${habitat.slide_lift_elapsed_ms ?? 0} / ${habitat.slide_lift_timeout_ms ?? 0} ms (${habitat.slide_lift_remaining_ms ?? 0} ms remaining) · started=${yn(habitat.slide_lift_started)} complete=${yn(habitat.slide_lift_complete)} wait=${yn(habitat.waiting_for_slide_lift)}`;
+    qs('habitatSlideLift').className = habitat.slide_lift_complete
+      ? 'mono good' : (habitat.slide_lift_started ? 'mono' : 'mono muted');
+    qs('habitatPostReverse').textContent =
+      `duty ${Number(habitat.post_pickup_reverse_duty ?? 0).toFixed(3)} · ${habitat.post_pickup_reverse_elapsed_ms ?? 0} / ${habitat.post_pickup_reverse_duration_ms ?? 0} ms (${habitat.post_pickup_reverse_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.post_pickup_reversing)}`;
+    qs('habitatPostReverse').className =
+      habitat.post_pickup_reversing ? 'mono good' : 'mono muted';
+    const habitatRearLine = habitat.rear_line_configured && habitat.rear_line_data_fresh
+      ? `left=${habitat.rear_left_black ? 'BLACK' : 'WHITE'} right=${habitat.rear_right_black ? 'BLACK' : 'WHITE'}`
+      : 'rear line UNKNOWN';
+    qs('habitatReturnStrafe').textContent =
+      `${habitat.return_strafe_direction || 'NONE'} at duty ${Number(habitat.return_strafe_duty ?? 0).toFixed(3)} · ${habitat.return_strafe_elapsed_ms ?? 0} / ${habitat.return_line_timeout_ms ?? 0} ms (${habitat.return_strafe_remaining_ms ?? 0} ms remaining) · ${habitatRearLine} · detected=${yn(habitat.rear_line_detected)} active=${yn(habitat.return_line_strafing)}`;
+    qs('habitatReturnStrafe').className =
+      habitat.return_line_strafing ? 'mono good' : 'mono muted';
     qs('habitatFollowing').textContent = yn(habitat.line_following);
     qs('habitatFollowing').className =
       habitat.line_following ? 'mono good' : 'mono muted';
@@ -8892,8 +9744,8 @@ function update(){
     qs('placementTime').textContent =
       `${placement.time_in_state_ms ?? 0} ms`;
     qs('placementCcwSaved').textContent =
-      placement.counter_clockwise_heading_captured
-        ? `${Number(placement.counter_clockwise_start_heading_deg ?? 0).toFixed(2)}\u00b0 / ${Number(placement.counter_clockwise_target_heading_deg ?? 0).toFixed(2)}\u00b0`
+      placement.initial_heading_captured
+        ? `${Number(placement.initial_heading_deg ?? 0).toFixed(2)}\u00b0 / ${Number(placement.counter_clockwise_target_heading_deg ?? 0).toFixed(2)}\u00b0`
         : 'not captured';
     const imu = j.imu || {};
     const hexByte = value =>
@@ -9737,10 +10589,11 @@ void handleHabitatPiecesConfig() {
     return;
   }
   RuntimeContext& context = *g_runtime.context;
-  if (context.habitat_pieces.state ==
-          robot::HabitatPiecesState::LineFollowing ||
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::Reversing) {
+  if (context.habitat_pieces.state !=
+          robot::HabitatPiecesState::WaitForStart &&
+      context.habitat_pieces.state !=
+          robot::HabitatPiecesState::Complete &&
+      context.habitat_pieces.state != robot::HabitatPiecesState::Fault) {
     sendErrorJson(409, "stop Habitat Pieces before changing its config");
     return;
   }
@@ -9748,6 +10601,11 @@ void handleHabitatPiecesConfig() {
   robot::HabitatPiecesConfig next = context.habitat_pieces_config;
   float duty = next.line_follow_duty;
   float reverse_duty = next.reverse_duty;
+  float distance_strafe_duty = next.distance_strafe_duty;
+  float compensation_strafe_duty = next.compensation_strafe_duty;
+  float forward_to_distance_duty = next.forward_to_distance_duty;
+  float post_pickup_reverse_duty = next.post_pickup_reverse_duty;
+  float return_strafe_duty = next.return_strafe_duty;
   robot::Milliseconds value = 0U;
   if (g_server.hasArg("duty") &&
       !argFloat("duty", duty, next.line_follow_duty, true)) {
@@ -9785,16 +10643,182 @@ void handleHabitatPiecesConfig() {
     }
     next.reverse_duration_ms = value;
   }
+  if (g_server.hasArg("distance-strafe-direction")) {
+    const String direction =
+        g_server.arg("distance-strafe-direction");
+    if (direction == "LEFT" || direction == "left" || direction == "L" ||
+        direction == "l") {
+      next.distance_strafe_direction =
+          robot::HabitatPiecesStrafeDirection::Left;
+    } else if (direction == "RIGHT" || direction == "right" ||
+               direction == "R" || direction == "r") {
+      next.distance_strafe_direction =
+          robot::HabitatPiecesStrafeDirection::Right;
+    } else {
+      sendErrorJson(400, "distance-strafe-direction must be LEFT or RIGHT");
+      return;
+    }
+  }
+  if (g_server.hasArg("distance-threshold-mm")) {
+    if (!argUnsigned("distance-threshold-mm", value,
+                     next.distance_threshold_mm, true) ||
+        value > UINT16_MAX) {
+      sendErrorJson(400, "malformed distance-threshold-mm");
+      return;
+    }
+    next.distance_threshold_mm = static_cast<std::uint16_t>(value);
+  }
+  if (g_server.hasArg("distance-zone-count")) {
+    if (!argUnsigned("distance-zone-count", value,
+                     next.distance_zone_target_count, true) ||
+        value > UINT16_MAX) {
+      sendErrorJson(400, "malformed distance-zone-count");
+      return;
+    }
+    next.distance_zone_target_count =
+        static_cast<std::uint16_t>(value);
+  }
+  if (g_server.hasArg("distance-strafe-duty") &&
+      !argFloat("distance-strafe-duty", distance_strafe_duty,
+                next.distance_strafe_duty, true)) {
+    sendErrorJson(400, "malformed distance-strafe-duty");
+    return;
+  }
+  next.distance_strafe_duty = distance_strafe_duty;
+  if (g_server.hasArg("distance-strafe-timeout-ms")) {
+    if (!argUnsigned("distance-strafe-timeout-ms", value,
+                     next.distance_strafe_timeout_ms, true)) {
+      sendErrorJson(400, "malformed distance-strafe-timeout-ms");
+      return;
+    }
+    next.distance_strafe_timeout_ms = value;
+  }
+  if (g_server.hasArg("compensation-strafe-duty") &&
+      !argFloat("compensation-strafe-duty", compensation_strafe_duty,
+                next.compensation_strafe_duty, true)) {
+    sendErrorJson(400, "malformed compensation-strafe-duty");
+    return;
+  }
+  next.compensation_strafe_duty = compensation_strafe_duty;
+  if (g_server.hasArg("compensation-strafe-duration-ms")) {
+    if (!argUnsigned("compensation-strafe-duration-ms", value,
+                     next.compensation_strafe_duration_ms, true)) {
+      sendErrorJson(400, "malformed compensation-strafe-duration-ms");
+      return;
+    }
+    next.compensation_strafe_duration_ms = value;
+  }
+  if (g_server.hasArg("slide-down-speed-steps-per-second")) {
+    if (!argUnsigned("slide-down-speed-steps-per-second", value,
+                     next.slide_down_speed_steps_per_second, true)) {
+      sendErrorJson(400, "malformed slide-down-speed-steps-per-second");
+      return;
+    }
+    next.slide_down_speed_steps_per_second = value;
+  }
+  if (g_server.hasArg("slide-down-timeout-ms")) {
+    if (!argUnsigned("slide-down-timeout-ms", value,
+                     next.slide_down_timeout_ms, true)) {
+      sendErrorJson(400, "malformed slide-down-timeout-ms");
+      return;
+    }
+    next.slide_down_timeout_ms = value;
+  }
+  if (g_server.hasArg("forward-to-distance-duty") &&
+      !argFloat("forward-to-distance-duty", forward_to_distance_duty,
+                next.forward_to_distance_duty, true)) {
+    sendErrorJson(400, "malformed forward-to-distance-duty");
+    return;
+  }
+  next.forward_to_distance_duty = forward_to_distance_duty;
+  if (g_server.hasArg("forward-stop-distance-mm")) {
+    if (!argUnsigned("forward-stop-distance-mm", value,
+                     next.forward_stop_distance_mm, true) ||
+        value > UINT16_MAX) {
+      sendErrorJson(400, "malformed forward-stop-distance-mm");
+      return;
+    }
+    next.forward_stop_distance_mm = static_cast<std::uint16_t>(value);
+  }
+  if (g_server.hasArg("forward-to-distance-timeout-ms")) {
+    if (!argUnsigned("forward-to-distance-timeout-ms", value,
+                     next.forward_to_distance_timeout_ms, true)) {
+      sendErrorJson(400, "malformed forward-to-distance-timeout-ms");
+      return;
+    }
+    next.forward_to_distance_timeout_ms = value;
+  }
+  if (g_server.hasArg("slide-lift-steps")) {
+    if (!argUnsigned("slide-lift-steps", value,
+                     next.slide_lift_steps, true)) {
+      sendErrorJson(400, "malformed slide-lift-steps");
+      return;
+    }
+    next.slide_lift_steps = value;
+  }
+  if (g_server.hasArg("slide-lift-speed-steps-per-second")) {
+    if (!argUnsigned("slide-lift-speed-steps-per-second", value,
+                     next.slide_lift_speed_steps_per_second, true)) {
+      sendErrorJson(400, "malformed slide-lift-speed-steps-per-second");
+      return;
+    }
+    next.slide_lift_speed_steps_per_second = value;
+  }
+  if (g_server.hasArg("slide-lift-timeout-ms")) {
+    if (!argUnsigned("slide-lift-timeout-ms", value,
+                     next.slide_lift_timeout_ms, true)) {
+      sendErrorJson(400, "malformed slide-lift-timeout-ms");
+      return;
+    }
+    next.slide_lift_timeout_ms = value;
+  }
+  if (g_server.hasArg("post-pickup-reverse-duty") &&
+      !argFloat("post-pickup-reverse-duty", post_pickup_reverse_duty,
+                next.post_pickup_reverse_duty, true)) {
+    sendErrorJson(400, "malformed post-pickup-reverse-duty");
+    return;
+  }
+  next.post_pickup_reverse_duty = post_pickup_reverse_duty;
+  if (g_server.hasArg("post-pickup-reverse-duration-ms")) {
+    if (!argUnsigned("post-pickup-reverse-duration-ms", value,
+                     next.post_pickup_reverse_duration_ms, true)) {
+      sendErrorJson(400, "malformed post-pickup-reverse-duration-ms");
+      return;
+    }
+    next.post_pickup_reverse_duration_ms = value;
+  }
+  if (g_server.hasArg("return-strafe-duty") &&
+      !argFloat("return-strafe-duty", return_strafe_duty,
+                next.return_strafe_duty, true)) {
+    sendErrorJson(400, "malformed return-strafe-duty");
+    return;
+  }
+  next.return_strafe_duty = return_strafe_duty;
+  if (g_server.hasArg("return-line-timeout-ms")) {
+    if (!argUnsigned("return-line-timeout-ms", value,
+                     next.return_line_timeout_ms, true)) {
+      sendErrorJson(400, "malformed return-line-timeout-ms");
+      return;
+    }
+    next.return_line_timeout_ms = value;
+  }
 
   robot::LineFollowerConfig line_config = context.config;
   line_config.baseDuty = next.line_follow_duty;
-  if (!robot::habitatPiecesConfigValid(next,
-                                       activeMotionDutyCap(context)) ||
+  if (g_runtime.stepper == nullptr ||
+      g_runtime.stepper->maximumPositionSteps() <= 0 ||
+      g_runtime.stepper->maximumPositionSteps() >
+          static_cast<std::int64_t>(UINT32_MAX) ||
+      !robot::habitatPiecesConfigValid(
+          next, activeMotionDutyCap(context), kMaxTimedTestDurationMs,
+          g_runtime.stepper->maximumSpeedStepsPerSecond(),
+          static_cast<std::uint32_t>(
+              g_runtime.stepper->maximumPositionSteps())) ||
       !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
            .accepted) {
     sendErrorJson(
         409,
-        "Habitat Pieces requires line-follow and reverse duties within the active cap, a nonzero LSS2 detection delay, a search timeout longer than that delay, and a nonzero reverse duration");
+        "Habitat Pieces requires every duty, duration, timeout, distance, count, and slide setting; LEFT/RIGHT initial direction; duties within the active cap; time bounds no greater than 30000 ms; and slide values within hardware limits");
     return;
   }
 
@@ -9895,6 +10919,15 @@ void handleHabitatPlacementConfig() {
       !readMilliseconds("lss1-timeout-ms", next.lss1_timeout_ms) ||
       !readMilliseconds("post-lss1-delay-ms",
                         next.post_lss1_delay_ms) ||
+      !readMilliseconds(
+          "initial-heading-timeout-ms",
+          next.initial_heading_turn_timeout_ms) ||
+      !readFloat(
+          "pre-ccw-strafe-right-duty",
+          next.pre_counter_clockwise_strafe_right_duty) ||
+      !readMilliseconds(
+          "pre-ccw-strafe-right-ms",
+          next.pre_counter_clockwise_strafe_right_duration_ms) ||
       !readFloat("ccw-angle-deg", next.counter_clockwise_angle_deg) ||
       !readMilliseconds("ccw-timeout-ms",
                         next.counter_clockwise_timeout_ms) ||
@@ -9943,6 +10976,10 @@ void handleHabitatPlacementConfig() {
   const bool timings_bounded =
       next.lss1_timeout_ms <= kMaxTimedTestDurationMs &&
       next.post_lss1_delay_ms <= kMaxTimedTestDurationMs &&
+      next.initial_heading_turn_timeout_ms <=
+          kMaxTimedTestDurationMs &&
+      next.pre_counter_clockwise_strafe_right_duration_ms <=
+          kMaxTimedTestDurationMs &&
       next.counter_clockwise_timeout_ms <= kMaxTimedTestDurationMs &&
       next.forward_to_slide_duration_ms <= kMaxTimedTestDurationMs &&
       next.stepper_down_timeout_ms <= kMaxTimedTestDurationMs &&
@@ -9969,7 +11006,7 @@ void handleHabitatPlacementConfig() {
            .accepted) {
     sendErrorJson(
         409,
-        "Habitat Placement needs nonzero duties and durations (including after-CW reverse/left strafe), search/turn timeouts, positive turn angles, a valid slide speed, and every timing at or below 30000 ms");
+        "Habitat Placement needs nonzero duties and durations (including pre-CCW right strafe and after-CW reverse/left strafe), search/turn timeouts, positive turn angles, a valid slide speed, and every timing at or below 30000 ms");
     return;
   }
 
@@ -12257,11 +13294,67 @@ void handleConfigSave() {
       "hprevduty", context.habitat_pieces_config.reverse_duty);
   g_runtime.preferences->putUInt(
       "hprevms", context.habitat_pieces_config.reverse_duration_ms);
+  g_runtime.preferences->putInt(
+      "hpdsdir", static_cast<int>(
+                     context.habitat_pieces_config
+                         .distance_strafe_direction));
+  g_runtime.preferences->putUInt(
+      "hpdsthr", context.habitat_pieces_config.distance_threshold_mm);
+  g_runtime.preferences->putUInt(
+      "hpdscnt",
+      context.habitat_pieces_config.distance_zone_target_count);
+  g_runtime.preferences->putFloat(
+      "hpdsduty", context.habitat_pieces_config.distance_strafe_duty);
+  g_runtime.preferences->putUInt(
+      "hpdstmo",
+      context.habitat_pieces_config.distance_strafe_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "hpcmpd",
+      context.habitat_pieces_config.compensation_strafe_duty);
+  g_runtime.preferences->putUInt(
+      "hpcmpms",
+      context.habitat_pieces_config.compensation_strafe_duration_ms);
+  g_runtime.preferences->putUInt(
+      "hpkdnspd",
+      context.habitat_pieces_config.slide_down_speed_steps_per_second);
+  g_runtime.preferences->putUInt(
+      "hpkdntmo", context.habitat_pieces_config.slide_down_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "hpkfwdd", context.habitat_pieces_config.forward_to_distance_duty);
+  g_runtime.preferences->putUInt(
+      "hpkfwdmm", context.habitat_pieces_config.forward_stop_distance_mm);
+  g_runtime.preferences->putUInt(
+      "hpkfwdtmo",
+      context.habitat_pieces_config.forward_to_distance_timeout_ms);
+  g_runtime.preferences->putUInt(
+      "hpklftstp", context.habitat_pieces_config.slide_lift_steps);
+  g_runtime.preferences->putUInt(
+      "hpklftspd",
+      context.habitat_pieces_config.slide_lift_speed_steps_per_second);
+  g_runtime.preferences->putUInt(
+      "hpklfttmo", context.habitat_pieces_config.slide_lift_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "hpkrevd", context.habitat_pieces_config.post_pickup_reverse_duty);
+  g_runtime.preferences->putUInt(
+      "hpkrevms",
+      context.habitat_pieces_config.post_pickup_reverse_duration_ms);
+  g_runtime.preferences->putFloat(
+      "hpkretd", context.habitat_pieces_config.return_strafe_duty);
+  g_runtime.preferences->putUInt(
+      "hpkrettmo", context.habitat_pieces_config.return_line_timeout_ms);
   const robot::HabitatPlacementConfig& placement =
       context.habitat_placement_config;
   g_runtime.preferences->putFloat("hprlduty", placement.reverse_line_follow_duty);
   g_runtime.preferences->putUInt("hplsstmo", placement.lss1_timeout_ms);
   g_runtime.preferences->putUInt("hplssdel", placement.post_lss1_delay_ms);
+  g_runtime.preferences->putUInt(
+      "hpihdtmo", placement.initial_heading_turn_timeout_ms);
+  g_runtime.preferences->putFloat(
+      "hpprestrd",
+      placement.pre_counter_clockwise_strafe_right_duty);
+  g_runtime.preferences->putUInt(
+      "hpprestrms",
+      placement.pre_counter_clockwise_strafe_right_duration_ms);
   g_runtime.preferences->putFloat("hpccwdeg", placement.counter_clockwise_angle_deg);
   g_runtime.preferences->putUInt("hpccwtmo", placement.counter_clockwise_timeout_ms);
   g_runtime.preferences->putFloat("hpfwd1d", placement.forward_to_slide_duty);
@@ -12778,7 +13871,7 @@ void printCommands() {
   Serial.println("  rear-line status");
   Serial.println("  habitat start|stop|status");
   Serial.println(
-      "  habitat config <duty> <distance-mm> <max-age-ms> <timeout-ms>");
+      "  habitat config <duty> <side-delay-ms> <search-align-timeout-ms> <reverse-duty> <reverse-duration-ms> <left|right> <distance-threshold-mm> <zone-count> <strafe-duty> <strafe-timeout-ms>");
   Serial.println("  auto solar|status");
   Serial.println("  lf start|stop|status|reset");
   Serial.println("  lf kp|ki|kd|base|max-duty|max-correction <value>");
@@ -13193,36 +14286,93 @@ void processCommand(RuntimeContext& context, char* line,
       robot::Milliseconds run_timeout_ms = 0U;
       float reverse_duty = 0.0F;
       robot::Milliseconds reverse_duration_ms = 0U;
+      char* distance_strafe_direction_text = nullptr;
+      robot::Milliseconds distance_threshold_mm = 0U;
+      robot::Milliseconds distance_zone_count = 0U;
+      float distance_strafe_duty = 0.0F;
+      robot::Milliseconds distance_strafe_timeout_ms = 0U;
       if (!parseFloat(strtok(nullptr, " \t\r\n"), duty) ||
           !parseUnsigned(strtok(nullptr, " \t\r\n"),
                          lss2_detection_delay_ms) ||
           !parseUnsigned(strtok(nullptr, " \t\r\n"), run_timeout_ms) ||
           !parseFloat(strtok(nullptr, " \t\r\n"), reverse_duty) ||
           !parseUnsigned(strtok(nullptr, " \t\r\n"),
-                         reverse_duration_ms)) {
+                         reverse_duration_ms) ||
+          (distance_strafe_direction_text =
+               strtok(nullptr, " \t\r\n")) == nullptr ||
+          !parseUnsigned(strtok(nullptr, " \t\r\n"),
+                         distance_threshold_mm) ||
+          !parseUnsigned(strtok(nullptr, " \t\r\n"),
+                         distance_zone_count) ||
+          !parseFloat(strtok(nullptr, " \t\r\n"),
+                      distance_strafe_duty) ||
+          !parseUnsigned(strtok(nullptr, " \t\r\n"),
+                         distance_strafe_timeout_ms)) {
         printRejected(
-            "habitat config <duty> <lss2-delay-ms> <search-timeout-ms> <reverse-duty> <reverse-duration-ms>");
+            "habitat config <duty> <side-delay-ms> <search-align-timeout-ms> <reverse-duty> <reverse-duration-ms> <left|right> <distance-threshold-mm> <zone-count> <strafe-duty> <strafe-timeout-ms>");
         return;
       }
-      robot::HabitatPiecesConfig next{};
+      robot::HabitatPiecesStrafeDirection distance_strafe_direction =
+          robot::HabitatPiecesStrafeDirection::None;
+      if (std::strcmp(distance_strafe_direction_text, "left") == 0 ||
+          std::strcmp(distance_strafe_direction_text, "LEFT") == 0 ||
+          std::strcmp(distance_strafe_direction_text, "l") == 0 ||
+          std::strcmp(distance_strafe_direction_text, "L") == 0) {
+        distance_strafe_direction =
+            robot::HabitatPiecesStrafeDirection::Left;
+      } else if (
+          std::strcmp(distance_strafe_direction_text, "right") == 0 ||
+          std::strcmp(distance_strafe_direction_text, "RIGHT") == 0 ||
+          std::strcmp(distance_strafe_direction_text, "r") == 0 ||
+          std::strcmp(distance_strafe_direction_text, "R") == 0) {
+        distance_strafe_direction =
+            robot::HabitatPiecesStrafeDirection::Right;
+      }
+      // The compact serial command retains the pickup-extension settings;
+      // use the web form/API to adjust the full route configuration.
+      robot::HabitatPiecesConfig next = context.habitat_pieces_config;
       next.line_follow_duty = duty;
       next.lss2_detection_delay_ms = lss2_detection_delay_ms;
       next.run_timeout_ms = run_timeout_ms;
       next.reverse_duty = reverse_duty;
       next.reverse_duration_ms = reverse_duration_ms;
+      next.distance_strafe_direction = distance_strafe_direction;
+      if (distance_threshold_mm <= UINT16_MAX) {
+        next.distance_threshold_mm =
+            static_cast<std::uint16_t>(distance_threshold_mm);
+      }
+      if (distance_zone_count <= UINT16_MAX) {
+        next.distance_zone_target_count =
+            static_cast<std::uint16_t>(distance_zone_count);
+      }
+      next.distance_strafe_duty = distance_strafe_duty;
+      next.distance_strafe_timeout_ms =
+          distance_strafe_timeout_ms;
       robot::LineFollowerConfig line_config = context.config;
       line_config.baseDuty = duty;
-      if (!robot::habitatPiecesConfigValid(
-              next, activeMotionDutyCap(context)) ||
+      if (g_runtime.stepper == nullptr ||
+          g_runtime.stepper->maximumPositionSteps() <= 0 ||
+          g_runtime.stepper->maximumPositionSteps() >
+              static_cast<std::int64_t>(UINT32_MAX) ||
+          !robot::habitatPiecesConfigValid(
+              next, activeMotionDutyCap(context),
+              kMaxTimedTestDurationMs,
+              g_runtime.stepper->maximumSpeedStepsPerSecond(),
+              static_cast<std::uint32_t>(
+                  g_runtime.stepper->maximumPositionSteps())) ||
+          distance_threshold_mm > UINT16_MAX ||
+          distance_zone_count > UINT16_MAX ||
           !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
                .accepted) {
         printRejected("Habitat Pieces config is outside safe limits");
         return;
       }
-      if (context.habitat_pieces.state ==
-              robot::HabitatPiecesState::LineFollowing ||
-          context.habitat_pieces.state ==
-              robot::HabitatPiecesState::Reversing) {
+      if (context.habitat_pieces.state !=
+              robot::HabitatPiecesState::WaitForStart &&
+          context.habitat_pieces.state !=
+              robot::HabitatPiecesState::Complete &&
+          context.habitat_pieces.state !=
+              robot::HabitatPiecesState::Fault) {
         printRejected("stop Habitat Pieces before changing config");
         return;
       }
@@ -13783,6 +14933,100 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       "hprevduty", context.habitat_pieces_config.reverse_duty);
   context.habitat_pieces_config.reverse_duration_ms = preferences.getUInt(
       "hprevms", context.habitat_pieces_config.reverse_duration_ms);
+  const int habitat_distance_strafe_direction = preferences.getInt(
+      "hpdsdir",
+      static_cast<int>(context.habitat_pieces_config
+                           .distance_strafe_direction));
+  context.habitat_pieces_config.distance_strafe_direction =
+      habitat_distance_strafe_direction == -1
+          ? robot::HabitatPiecesStrafeDirection::Left
+          : (habitat_distance_strafe_direction == 1
+                 ? robot::HabitatPiecesStrafeDirection::Right
+                 : robot::HabitatPiecesStrafeDirection::None);
+  const std::uint32_t habitat_distance_threshold_mm =
+      preferences.getUInt(
+          "hpdsthr",
+          context.habitat_pieces_config.distance_threshold_mm);
+  context.habitat_pieces_config.distance_threshold_mm =
+      habitat_distance_threshold_mm <= UINT16_MAX
+          ? static_cast<std::uint16_t>(habitat_distance_threshold_mm)
+          : 0U;
+  const std::uint32_t habitat_distance_zone_target_count =
+      preferences.getUInt(
+          "hpdscnt",
+          context.habitat_pieces_config.distance_zone_target_count);
+  context.habitat_pieces_config.distance_zone_target_count =
+      habitat_distance_zone_target_count <= UINT16_MAX
+          ? static_cast<std::uint16_t>(
+                habitat_distance_zone_target_count)
+          : 0U;
+  context.habitat_pieces_config.distance_strafe_duty =
+      preferences.getFloat(
+          "hpdsduty",
+          context.habitat_pieces_config.distance_strafe_duty);
+  context.habitat_pieces_config.distance_strafe_timeout_ms =
+      preferences.getUInt(
+          "hpdstmo",
+          context.habitat_pieces_config.distance_strafe_timeout_ms);
+  context.habitat_pieces_config.compensation_strafe_duty =
+      preferences.getFloat(
+          "hpcmpd",
+          context.habitat_pieces_config.compensation_strafe_duty);
+  context.habitat_pieces_config.compensation_strafe_duration_ms =
+      preferences.getUInt(
+          "hpcmpms",
+          context.habitat_pieces_config.compensation_strafe_duration_ms);
+  context.habitat_pieces_config.slide_down_speed_steps_per_second =
+      preferences.getUInt(
+          "hpkdnspd",
+          context.habitat_pieces_config.slide_down_speed_steps_per_second);
+  context.habitat_pieces_config.slide_down_timeout_ms =
+      preferences.getUInt(
+          "hpkdntmo",
+          context.habitat_pieces_config.slide_down_timeout_ms);
+  context.habitat_pieces_config.forward_to_distance_duty =
+      preferences.getFloat(
+          "hpkfwdd",
+          context.habitat_pieces_config.forward_to_distance_duty);
+  const std::uint32_t habitat_forward_stop_distance_mm =
+      preferences.getUInt(
+          "hpkfwdmm",
+          context.habitat_pieces_config.forward_stop_distance_mm);
+  context.habitat_pieces_config.forward_stop_distance_mm =
+      habitat_forward_stop_distance_mm <= UINT16_MAX
+          ? static_cast<std::uint16_t>(
+                habitat_forward_stop_distance_mm)
+          : 0U;
+  context.habitat_pieces_config.forward_to_distance_timeout_ms =
+      preferences.getUInt(
+          "hpkfwdtmo",
+          context.habitat_pieces_config.forward_to_distance_timeout_ms);
+  context.habitat_pieces_config.slide_lift_steps =
+      preferences.getUInt(
+          "hpklftstp", context.habitat_pieces_config.slide_lift_steps);
+  context.habitat_pieces_config.slide_lift_speed_steps_per_second =
+      preferences.getUInt(
+          "hpklftspd",
+          context.habitat_pieces_config.slide_lift_speed_steps_per_second);
+  context.habitat_pieces_config.slide_lift_timeout_ms =
+      preferences.getUInt(
+          "hpklfttmo",
+          context.habitat_pieces_config.slide_lift_timeout_ms);
+  context.habitat_pieces_config.post_pickup_reverse_duty =
+      preferences.getFloat(
+          "hpkrevd",
+          context.habitat_pieces_config.post_pickup_reverse_duty);
+  context.habitat_pieces_config.post_pickup_reverse_duration_ms =
+      preferences.getUInt(
+          "hpkrevms",
+          context.habitat_pieces_config.post_pickup_reverse_duration_ms);
+  context.habitat_pieces_config.return_strafe_duty =
+      preferences.getFloat(
+          "hpkretd", context.habitat_pieces_config.return_strafe_duty);
+  context.habitat_pieces_config.return_line_timeout_ms =
+      preferences.getUInt(
+          "hpkrettmo",
+          context.habitat_pieces_config.return_line_timeout_ms);
   robot::HabitatPlacementConfig& placement =
       context.habitat_placement_config;
   placement.reverse_line_follow_duty = preferences.getFloat(
@@ -13791,6 +15035,16 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       "hplsstmo", placement.lss1_timeout_ms);
   placement.post_lss1_delay_ms = preferences.getUInt(
       "hplssdel", placement.post_lss1_delay_ms);
+  placement.initial_heading_turn_timeout_ms = preferences.getUInt(
+      "hpihdtmo", placement.initial_heading_turn_timeout_ms);
+  placement.pre_counter_clockwise_strafe_right_duty =
+      preferences.getFloat(
+          "hpprestrd",
+          placement.pre_counter_clockwise_strafe_right_duty);
+  placement.pre_counter_clockwise_strafe_right_duration_ms =
+      preferences.getUInt(
+          "hpprestrms",
+          placement.pre_counter_clockwise_strafe_right_duration_ms);
   placement.counter_clockwise_angle_deg = preferences.getFloat(
       "hpccwdeg", placement.counter_clockwise_angle_deg);
   placement.counter_clockwise_timeout_ms = preferences.getUInt(
@@ -14580,7 +15834,7 @@ void motionControlTask(void* parameters) {
                             front_right_motor, rear_link, now_ms);
     } else if (mode == robot::RobotTestMode::HabitatPieces) {
       runHabitatPieces(context, line_sensor_reader, front_left_motor,
-                       front_right_motor, rear_link, now_ms);
+                       front_right_motor, rear_link, stepper, now_ms);
     } else if (mode == robot::RobotTestMode::HabitatPlacement) {
       runHabitatPlacement(context, line_sensor_reader, front_left_motor,
                           front_right_motor, rear_link, claws, stepper,

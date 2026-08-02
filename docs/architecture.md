@@ -57,19 +57,36 @@ arrival of a new measurement sequence, not from receipt of that heartbeat.
 
 The current ESP1 mission state machine still emits only disabled chassis
 commands. ESP2's explicit `HABITAT_PIECES` mode line-follows with the front
-sensors at a separately adjustable duty. It ignores the ESP1-owned LSS2 input
-for a locked-by-default `lss2_detection_delay_ms`. A fresh black LSS2 snapshot
-after that delay transitions to a straight-backward
-open-loop mecanum command at configured `reverse_duty` for
-`reverse_duration_ms`; completion latches stop. `run_timeout_ms` bounds the
-LSS2 search and must be longer than the detection delay. LSS2 configuration and
-sensor-snapshot freshness are required through detection. The reverse remains
-bounded by its own duration and the normal motor/link command-expiry gates.
-Mission-state integration is still separate future work.
+sensors at a separately adjustable duty. It ignores the ESP1-owned LSS2-left
+and LSS3-right inputs for a locked-by-default `lss2_detection_delay_ms`, whose
+legacy name now applies to both sensors. A fresh black input after that delay
+latches its corresponding wheel side stopped while the undetected side
+continues forward at the same duty. Both latches are required before the route
+transitions to the straight-backward open-loop mecanum command at configured
+`reverse_duty` for `reverse_duration_ms`. The next state strafes left or right
+at configured duty while consuming only valid, fresh, high-accuracy laser
+measurements with a new measurement sequence. A rising entry above
+`distance_threshold_mm` increments the gap count; consecutive above-threshold
+samples count once, and an at-or-below sample rearms the next entry. Reaching
+`distance_zone_target_count` starts a timed opposite-direction compensation
+strafe, while
+`distance_strafe_timeout_ms` bounds the motion even if no valid reading arrives.
+The route then lowers the ESP2-owned slide to its bottom limit and drives
+forward until a new valid high-accuracy measurement reaches the pickup
+threshold. The nonblocking relative slide lift runs concurrently with the
+following timed reverse and opposite return strafe. Either ESP1-owned rear line
+sensor stops the return strafe; route completion waits for the lift if needed.
+`run_timeout_ms` bounds both line search and side alignment and must be longer
+than the detection delay. Both sensor configurations and snapshot freshness
+are required until both latch, and the rear-line packet must be fresh during
+the return strafe. Every added open-loop/search action has an explicit bound
+and uses the normal motor/link command-expiry gates. Mission-state integration
+and automatic placement handoff remain separate future work.
 
-The VL53L0X continues operating in its globally selected high-accuracy profile
-and remains available for telemetry, but Habitat Pieces no longer gates motion
-or stopping on laser data or profile acknowledgement.
+The VL53L0X continues operating in its globally selected high-accuracy profile.
+It is not a start gate and missing/invalid readings do not immediately block or
+stop the pickup route; they cannot increment the distance-zone count, and the
+bounded strafe timeout remains the terminal safety gate.
 
 ESP2 initializes and calibrates the IMU during disabled startup, then transfers
 all runtime updates and heading-reset commands to the sensor-acquisition

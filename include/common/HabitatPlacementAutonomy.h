@@ -27,6 +27,8 @@ enum class HabitatPlacementState : std::uint8_t {
   Fault = 17,
   ReverseAfterClockwise = 18,
   StrafeLeftAfterClockwise = 19,
+  TurnToInitialHeading = 20,
+  StrafeRightBeforeCounterClockwise = 21,
 };
 
 enum class HabitatPlacementFaultReason : std::uint8_t {
@@ -52,6 +54,9 @@ struct HabitatPlacementConfig {
   float reverse_line_follow_duty{0.0F};
   Milliseconds lss1_timeout_ms{0U};
   Milliseconds post_lss1_delay_ms{0U};
+  Milliseconds initial_heading_turn_timeout_ms{0U};
+  float pre_counter_clockwise_strafe_right_duty{0.0F};
+  Milliseconds pre_counter_clockwise_strafe_right_duration_ms{0U};
   float counter_clockwise_angle_deg{0.0F};
   Milliseconds counter_clockwise_timeout_ms{0U};
   float forward_to_slide_duty{0.0F};
@@ -79,6 +84,7 @@ struct HabitatPlacementConfig {
 
 struct HabitatPlacementInputs {
   bool lss1_black{false};
+  bool initial_heading_turn_complete{false};
   bool counter_clockwise_turn_complete{false};
   bool bottom_limit_active{false};
   bool top_limit_active{false};
@@ -94,8 +100,9 @@ struct HabitatPlacementAutonomy {
       HabitatPlacementFaultReason::None};
   Milliseconds state_entered_at_ms{0U};
   Milliseconds started_at_ms{0U};
-  bool counter_clockwise_heading_captured{false};
-  float counter_clockwise_start_heading_deg{0.0F};
+  // Captured once, before the initial rear-line motion is enabled.
+  bool initial_heading_captured{false};
+  float initial_heading_deg{0.0F};
   float counter_clockwise_target_heading_deg{0.0F};
 };
 
@@ -105,6 +112,8 @@ struct HabitatPlacementUpdate {
       HabitatPlacementFaultReason::None};
   Milliseconds time_in_state_ms{0U};
   bool should_reverse_line_follow{false};
+  bool should_turn_to_initial_heading{false};
+  bool should_strafe_right_before_counter_clockwise{false};
   bool should_turn_counter_clockwise{false};
   bool should_drive_forward_to_slide{false};
   bool should_lower_slide{false};
@@ -130,8 +139,9 @@ bool habitatPlacementConfigValid(
     std::uint32_t maximum_stepper_speed_steps_per_second);
 void resetHabitatPlacementAutonomy(HabitatPlacementAutonomy& autonomy,
                                   Milliseconds now_ms);
-void startHabitatPlacementAutonomy(HabitatPlacementAutonomy& autonomy,
-                                  Milliseconds now_ms);
+bool startHabitatPlacementAutonomy(
+    HabitatPlacementAutonomy& autonomy, float initial_heading_deg,
+    float counter_clockwise_relative_angle_deg, Milliseconds now_ms);
 void failHabitatPlacementAutonomy(HabitatPlacementAutonomy& autonomy,
                                  HabitatPlacementFaultReason reason,
                                  Milliseconds now_ms);
