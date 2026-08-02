@@ -115,14 +115,10 @@ unchanged heartbeat does not refresh sensor data.
 The rear-wheel command's laser-profile request expires with the command. ESP1
 retains the high-accuracy profile when the command becomes stale. ESP1 also
 publishes immediately when the active profile changes. Habitat Pieces no longer
-uses laser profile acknowledgement as a Start gate. Its zone-count strafe
+uses laser profile acknowledgement as a Start gate. Its final pickup strafe
 consumes only new, valid, fresh, high-accuracy measurement sequences to count
 distinct entries above the configured distance threshold; invalid or repeated
 snapshots do not affect the count, and the strafe timeout remains authoritative.
-The later forward pickup approach also requires a new valid high-accuracy
-measurement after that step begins; missing or repeated samples leave its
-independent timeout authoritative. High accuracy remains requested throughout
-the complete Habitat Pieces route and its stopped commands.
 
 ## Funnel Mechanism Command Payload
 

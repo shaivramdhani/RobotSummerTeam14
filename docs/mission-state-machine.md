@@ -37,22 +37,13 @@ duty for an explicitly configured duration, then enters `DISTANCE_STRAFING`.
 That final pickup step moves in the configured left/right direction and counts
 distinct valid laser-measurement entries above the configured threshold.
 Consecutive above-threshold values count once; a value at or below the
-threshold rearms the next count. Reaching the configured count ends that
-strafe and begins a timed strafe in the opposite direction to compensate for
-overshoot. The chassis stops while the slide seeks its bottom limit, then
-drives forward until a new valid high-accuracy laser measurement is at or below
-the pickup threshold. A relative slide lift starts at that point and runs
-concurrently with a timed reverse and an opposite-direction return strafe. The
-return strafe stops when either rear line sensor sees black; if the lift is
-still active, the chassis remains stopped until it completes. The route then
-enters `COMPLETE`, ready for the separately started Habitat Placement route.
-Each distance search, slide action, and open-loop motion has an independent
-bound. A separate overall timeout stops the mode if both side lines are not
-acquired. Both side sensors and both rear sensors
+threshold rearms the next count. Reaching the configured count latches stop,
+and a separate distance-strafe timeout faults and stops if the count is never
+reached. A separate overall timeout stops the mode if both lines are not
+acquired. Both sensors
 must be configured and their shared snapshot must remain fresh until both
-latch or while the return-line strafe is active, respectively. The VL53L0X is
-not a start gate; invalid/no-signal readings do not count, do not stop either
-laser-driven motion, and leave the appropriate timeout in control. The separate ESP1
+latch. The VL53L0X is not a start gate; invalid/no-signal readings do not count
+and do not stop the strafe before its timeout. The separate ESP1
 mission-state transition into
 `NavigateToHabitatPieces` remains unimplemented.
 

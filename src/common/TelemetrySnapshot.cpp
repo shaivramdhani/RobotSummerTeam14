@@ -775,7 +775,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"distance_measurement_available\":%s,"
       "\"distance_sample_new\":%s,"
       "\"distance_zone_active\":%s,"
-      "\"distance_zone_entered\":%s,\"timed_out\":%s",
+      "\"distance_zone_entered\":%s,\"timed_out\":%s}",
       habitatPiecesStateName(snapshot.habitat_pieces_state),
       habitatPiecesStopReasonName(snapshot.habitat_pieces_stop_reason),
       static_cast<unsigned>(snapshot.habitat_pieces_time_in_state_ms),
@@ -832,106 +832,6 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.habitat_pieces_distance_zone_active),
       jsonBool(snapshot.habitat_pieces_distance_zone_entered),
       jsonBool(snapshot.habitat_pieces_timed_out));
-
-  writer.append(
-      ",\"compensation_strafe_duty\":%.5f,"
-      "\"compensation_strafe_duration_ms\":%u,"
-      "\"compensation_strafe_elapsed_ms\":%u,"
-      "\"compensation_strafe_remaining_ms\":%u,"
-      "\"slide_down_speed_steps_per_second\":%u,"
-      "\"slide_down_timeout_ms\":%u,"
-      "\"slide_down_elapsed_ms\":%u,"
-      "\"slide_down_remaining_ms\":%u,"
-      "\"forward_to_distance_duty\":%.5f,"
-      "\"forward_stop_distance_mm\":%u,"
-      "\"forward_to_distance_timeout_ms\":%u,"
-      "\"forward_to_distance_elapsed_ms\":%u,"
-      "\"forward_to_distance_remaining_ms\":%u,"
-      "\"slide_lift_steps\":%u,"
-      "\"slide_lift_speed_steps_per_second\":%u,"
-      "\"slide_lift_timeout_ms\":%u,"
-      "\"slide_lift_elapsed_ms\":%u,"
-      "\"slide_lift_remaining_ms\":%u,"
-      "\"post_pickup_reverse_duty\":%.5f,"
-      "\"post_pickup_reverse_duration_ms\":%u,"
-      "\"post_pickup_reverse_elapsed_ms\":%u,"
-      "\"post_pickup_reverse_remaining_ms\":%u,"
-      "\"return_strafe_direction\":\"%s\","
-      "\"return_strafe_duty\":%.5f,"
-      "\"return_line_timeout_ms\":%u,"
-      "\"return_strafe_elapsed_ms\":%u,"
-      "\"return_strafe_remaining_ms\":%u,"
-      "\"compensation_strafing\":%s,"
-      "\"lowering_slide\":%s,"
-      "\"slide_bottom_ready\":%s,"
-      "\"forward_to_distance\":%s,"
-      "\"forward_distance_reached\":%s,"
-      "\"slide_lift_started\":%s,"
-      "\"slide_lift_complete\":%s,"
-      "\"post_pickup_reversing\":%s,"
-      "\"return_line_strafing\":%s,"
-      "\"waiting_for_slide_lift\":%s,"
-      "\"rear_line_configured\":%s,"
-      "\"rear_line_data_fresh\":%s,"
-      "\"rear_left_black\":%s,"
-      "\"rear_right_black\":%s,"
-      "\"rear_line_detected\":%s}",
-      snapshot.habitat_pieces_compensation_strafe_duty,
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_compensation_strafe_duration_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_compensation_strafe_elapsed_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_compensation_strafe_remaining_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_slide_down_speed_steps_per_second),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_down_timeout_ms),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_down_elapsed_ms),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_down_remaining_ms),
-      snapshot.habitat_pieces_forward_to_distance_duty,
-      static_cast<unsigned>(snapshot.habitat_pieces_forward_stop_distance_mm),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_forward_to_distance_timeout_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_forward_to_distance_elapsed_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_forward_to_distance_remaining_ms),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_lift_steps),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_slide_lift_speed_steps_per_second),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_lift_timeout_ms),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_lift_elapsed_ms),
-      static_cast<unsigned>(snapshot.habitat_pieces_slide_lift_remaining_ms),
-      snapshot.habitat_pieces_post_pickup_reverse_duty,
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_post_pickup_reverse_duration_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_post_pickup_reverse_elapsed_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_post_pickup_reverse_remaining_ms),
-      habitatPiecesStrafeDirectionName(
-          oppositeHabitatPiecesStrafeDirection(
-              snapshot.habitat_pieces_distance_strafe_direction)),
-      snapshot.habitat_pieces_return_strafe_duty,
-      static_cast<unsigned>(snapshot.habitat_pieces_return_line_timeout_ms),
-      static_cast<unsigned>(snapshot.habitat_pieces_return_strafe_elapsed_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_return_strafe_remaining_ms),
-      jsonBool(snapshot.habitat_pieces_compensation_strafing),
-      jsonBool(snapshot.habitat_pieces_lowering_slide),
-      jsonBool(snapshot.habitat_pieces_slide_bottom_ready),
-      jsonBool(snapshot.habitat_pieces_forward_to_distance),
-      jsonBool(snapshot.habitat_pieces_forward_distance_reached),
-      jsonBool(snapshot.habitat_pieces_slide_lift_started),
-      jsonBool(snapshot.habitat_pieces_slide_lift_complete),
-      jsonBool(snapshot.habitat_pieces_post_pickup_reversing),
-      jsonBool(snapshot.habitat_pieces_return_line_strafing),
-      jsonBool(snapshot.habitat_pieces_waiting_for_slide_lift),
-      jsonBool(snapshot.habitat_pieces_rear_line_configured),
-      jsonBool(snapshot.habitat_pieces_rear_line_data_fresh),
-      jsonBool(snapshot.habitat_pieces_rear_left_black),
-      jsonBool(snapshot.habitat_pieces_rear_right_black),
-      jsonBool(snapshot.habitat_pieces_rear_line_detected));
 
   const HabitatPlacementConfig& habitat_placement =
       snapshot.habitat_placement_config;

@@ -45,30 +45,18 @@ disabled and line following refuses to start.
   begins the separately bounded distance-zone strafe. Direction, threshold,
   target count, duty, and timeout are locked until explicitly configured. The
   overall search/alignment timeout must be longer than the detection delay.
-  The opposite compensation strafe, slide-down search, forward laser approach,
-  relative slide lift, post-pickup reverse, and rear-line return strafe also
-  remain locked until every duty, distance, speed, step count, duration, and
-  timeout is explicitly configured.
 - Habitat Pieces requires configured LSS2 and LSS3 inputs and a fresh shared
   ESP1 sensor snapshot at start and until both detections latch. Missing
   configuration, stale side-sensor data, front line loss before alignment,
   rear-command failure, or timeout stops all four wheels. No detection delay,
   search/alignment timeout, reverse duty/duration, distance direction,
-  threshold, count, duty, distance timeout, follow-on chassis motion, or slide
-  movement is compiled in; all must be explicitly configured. The slide and
-  rear line sensor hardware must also be configured before Start. During the
-  timed reverse, continued side-
+  threshold, count, duty, or distance timeout is compiled in; all must be
+  explicitly configured. During the timed reverse, continued side-
   sensor data is not required, but motor and communication safety gates remain
   active. During distance strafing, only new valid high-accuracy measurement
   sequences can affect the counter. Repeated, invalid, stale, or no-signal
   readings never increment it; the configured timeout stops the motion if the
-  target count is not reached. The forward pickup approach likewise continues
-  through invalid/no-signal/repeated samples and stops only on a new valid
-  reading at or below its threshold or its timeout. After that detection, the
-  lift runs concurrently with the bounded reverse and return strafe. Either
-  fresh rear sensor detecting black stops the chassis; completion waits for the
-  lift if necessary. Slide failures, limit conflicts, stale rear-line data, and
-  all follow-on timeouts stop both the chassis and slide.
+  target count is not reached.
 - Runtime MPU-6050 I2C transactions execute only in ESP2's sensor-acquisition
   task. The core-1 motion task consumes a copied snapshot and treats data older
   than the IMU freshness limit as unavailable.

@@ -42,10 +42,7 @@ an independent front line-follow duty (default `0.12`), an adjustable LSS2/LSS3
 detection delay, overall search/alignment timeout, reverse duty, reverse
 duration, distance-strafe direction/threshold/target count/duty/timeout, state,
 both sensor inputs/latches, per-side drive state, live distance/count state,
-opposite compensation duty/duration, slide-down speed/timeout, forward pickup
-duty/distance/timeout, slide-lift steps/speed/timeout, post-pickup reverse
-duty/duration, return-strafe duty/timeout, rear-line state, and all associated
-elapsed/remaining times. Apply validates the values; Save stores them in
+and elapsed/remaining times. Apply validates the values; Save stores them in
 ESP2 preferences. The existing `lss2_detection_delay_ms` setting arms both side
 sensors. All motion settings other than the `0.12` front line-follow default
 start unconfigured. The delay must be nonzero and shorter than the overall
@@ -64,36 +61,17 @@ left/right strafe continues while new valid laser measurements are compared
 with `distance_threshold_mm`. Each transition from at-or-below to above the
 threshold increments `distance_zone_count`; consecutive above-threshold values
 count once, and repeated UART snapshots with the same measurement sequence do
-not count again. Reaching `distance_zone_target_count` enters
-`COMPENSATION_STRAFING`, which moves opposite the initial strafe for the
-configured duration. `LOWERING_SLIDE` then holds the chassis stopped while the
-linear slide seeks its bottom limit. `FORWARD_TO_DISTANCE` drives forward until
-a new valid measurement is at or below `forward_stop_distance_mm`.
-Invalid, stale, wrong-profile, repeated, and no-signal readings do
+not count again. Reaching `distance_zone_target_count` enters `COMPLETE` and
+disables all wheels. Invalid, stale, wrong-profile, and no-signal readings do
 not increment or rearm the count, but do not immediately stop the robot; the
 configured `distance_strafe_timeout_ms` faults and stops the strafe if the
-target is not reached. The forward approach uses the same new-measurement gate:
-unavailable data leaves it driving until its separate timeout.
-
-At the forward threshold, the relative slide lift starts non-blockingly while
-`POST_PICKUP_REVERSING` drives backward for its configured duration. The lift
-continues during `RETURN_LINE_STRAFING`, which moves opposite the initial
-distance-count direction until either LSBL or LSBR detects black. If the rear
-line arrives first, `WAIT_FOR_SLIDE_LIFT` keeps all wheels stopped until the
-lift completes; if the lift finishes first, the return strafe continues. Both
-conditions are required before `COMPLETE`. Completion does not automatically
-start Habitat Placement.
-
-The mode is rejected unless both side and rear sensors, slide hardware, and
-limits are configured. Missing/stale side-sensor data
+target is not reached. The mode is rejected unless both side sensors have real ESP1 GPIO
+configurations and their shared packet is fresh. Missing/stale side-sensor data
 before both latch, front line loss before alignment, rear-command failure, or
 expiration of `run_timeout_ms` enters `FAULT` and stops all wheels. During the
-bounded reverse and distance strafe, the side sensors are no longer required;
-fresh rear-line data becomes mandatory only during the return strafe. Slide
-failure, conflicting limits, or any new timeout stops the slide and all wheels.
-Motor/link gates and expiring rear commands remain active throughout. The
-VL53L0X is not a Habitat Pieces Start gate, so the approach can begin without a
-reading.
+bounded reverse and distance strafe, the side sensors are no longer required,
+but motor/link gates and expiring rear commands remain active. The VL53L0X is
+not a Habitat Pieces Start gate, so the approach can begin without a reading.
 
 The `IMU` panel shows ESP2's MPU-6050-compatible sensor state. Runtime I2C reads
 run in the core-0 sensor-acquisition task and are published to the core-1 motion
@@ -271,7 +249,7 @@ heading reset is pending.
 | `REAR_LINE_FOLLOW_TEST` | Yes, gated | Reverse travel using rear sensors and independent rear PID settings. |
 | `MECHANISM_TEST` | Mechanisms only, gated | Open/close claw, winch, and ESP1 Solar Hook servos and test the ESP1 funnel motor with drive outputs stopped. |
 | `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, solar-panel contact, timed forward motion, and rear-line reacquisition. |
-| `HABITAT_PIECES` | Yes, gated | Front-sensor line following, independent LSS2-left/LSS3-right alignment, timed reverse, bounded laser-zone count strafe, opposite compensation, slide down, forward laser approach, concurrent slide lift/reverse, then opposite return strafe until either rear sensor detects black. |
+| `HABITAT_PIECES` | Yes, gated | Front-sensor line following, independent LSS2-left/LSS3-right alignment, timed reverse, then a bounded left/right strafe that counts distinct valid laser-distance zone entries and stops at the configured target count. |
 | `AUTONOMOUS_TOWER_PIECES` | Yes, gated | Reverse line following, timed chassis motion, shimmy search, then the winch/claw/stepper collection tail. |
 | `PEG_FINDER` | Yes, gated | IMU-angle clockwise turn, timed linear chassis sequence, limit-terminated funnel, then sequential claw opening. |
 | `TIME_TRIAL` | Yes, gated | Autonomous Solar, a configurable transition, Tower Pieces, a configurable delay, then PegFinder. |
@@ -483,17 +461,13 @@ timeout.
   LSS2/LSS3 detection delay, a longer nonzero search/alignment timeout, a valid
   reverse duty and nonzero reverse duration, configured LSS2, LSS3 and front
   line sensors and motors, a configured distance-strafe direction, threshold,
-  target count, duty and timeout, all follow-on chassis/slide settings,
-  configured bottom/top slide limits and rear line sensors, fresh ESP1
-  sensor/status data, and a configured rear link. It ignores both side sensors only during the delay, independently stops
+  target count, duty and timeout, fresh ESP1 sensor/status data, and a configured rear
+  link. It ignores both side sensors only during the delay, independently stops
   the detected side, and begins the timed reverse only after both latch. Stale
   side-sensor data before both latch, front-line loss before alignment,
   rear-command failure, or timeout stops all four wheels. Successful reverse
-  completion begins the distance strafe. Its target count advances to the
-  opposite compensation strafe; its timeout stops all motion. The subsequent
-  slide down, forward laser approach, concurrent lift/reverse, and rear-line
-  return strafe each have an independent stop bound. Laser availability does
-  not gate Start.
+  completion begins the distance strafe; its target count or timeout stops all
+  four wheels. Laser availability does not gate Start.
 - `AUTONOMOUS_TOWER_PIECES` adds configured GPIO4 LSS, a positive panel duty,
   and a nonzero panel timeout to the rear-follow requirements. It stops on the
   second distinct LSS rising edge, timeout, or any rear-follow safety fault.
@@ -582,7 +556,7 @@ yaw rate, and rotation output.
 | `/api/rear-line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>` | GET/POST | Update the independent rear PID/config; `base` is a positive reverse-speed magnitude. |
 | `/api/autonomous/habitat-pieces/start` | GET/POST | Enter `HABITAT_PIECES` and request the gated front line-follow approach. |
 | `/api/autonomous/habitat-pieces/stop` | GET/POST | Stop all Habitat Pieces wheel outputs and reset its latch/state. |
-| `/api/autonomous/habitat-pieces/config?duty=<>&lss2-detection-delay-ms=<>&run-timeout-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&distance-strafe-direction=<LEFT_OR_RIGHT>&distance-threshold-mm=<>&distance-zone-count=<>&distance-strafe-duty=<>&distance-strafe-timeout-ms=<>&compensation-strafe-duty=<>&compensation-strafe-duration-ms=<>&slide-down-speed-steps-per-second=<>&slide-down-timeout-ms=<>&forward-to-distance-duty=<>&forward-stop-distance-mm=<>&forward-to-distance-timeout-ms=<>&slide-lift-steps=<>&slide-lift-speed-steps-per-second=<>&slide-lift-timeout-ms=<>&post-pickup-reverse-duty=<>&post-pickup-reverse-duration-ms=<>&return-strafe-duty=<>&return-line-timeout-ms=<>` | GET/POST | Validate and apply the complete pickup route. Search/alignment timeout must exceed the detection delay; each route bound must be nonzero and at most 30000 ms; stepper values must fit the configured hardware; active-run changes are rejected. The legacy parameter name `lss2-detection-delay-ms` applies to both side sensors. The compensation and return directions are automatically opposite `distance-strafe-direction`. |
+| `/api/autonomous/habitat-pieces/config?duty=<>&lss2-detection-delay-ms=<>&run-timeout-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&distance-strafe-direction=<LEFT_OR_RIGHT>&distance-threshold-mm=<>&distance-zone-count=<>&distance-strafe-duty=<>&distance-strafe-timeout-ms=<>` | GET/POST | Validate and apply the line-follow/alignment, reverse, and distance-zone strafe configuration. Search/alignment timeout must exceed the delay; distance strafe timeout must be nonzero and at most 30000 ms; active-run changes are rejected. The legacy parameter name `lss2-detection-delay-ms` applies to both sensors. |
 | `/api/autonomous/habitat-placement/config?...&initial-heading-timeout-ms=<>&pre-ccw-strafe-right-duty=<>&pre-ccw-strafe-right-ms=<>&post-cw-reverse-duty=<>&post-cw-reverse-ms=<>&post-cw-strafe-left-duty=<>&post-cw-strafe-left-ms=<>` | GET/POST | Validate the complete Habitat Placement route, including the return-to-initial-heading turn, pre-CCW right strafe, and the timed reverse/left strafe after the clockwise turn. |
 | `/api/autonomous/habitat-placement/start` | GET/POST | Enter `HABITAT_PLACEMENT` and request the fully gated placement route. |
 | `/api/autonomous/habitat-placement/stop` | GET/POST | Stop the placement route, stepper, and all wheel outputs. |
@@ -678,15 +652,7 @@ initial-right, retry-left, and retry-right strafes.
   states, `should_stop`, `target_reached`, `line_following`,
   `side_line_aligning`, `left_side_driving`, `right_side_driving`, `reversing`,
   `distance_strafing`, `distance_measurement_available`, `distance_sample_new`,
-  `distance_zone_active`, `distance_zone_entered`, compensation
-  duty/duration/elapsed/remaining and `compensation_strafing`, slide-down
-  speed/timeout/elapsed/remaining plus `lowering_slide` and
-  `slide_bottom_ready`, forward pickup duty/threshold/timeout timing and
-  `forward_to_distance`/`forward_distance_reached`, slide-lift
-  steps/speed/timeout timing and started/complete flags, post-pickup reverse
-  duty/duration/timing, return direction/duty/timeout/timing, rear-line
-  configuration/freshness/left/right/detected flags,
-  `waiting_for_slide_lift`, and `timed_out`.
+  `distance_zone_active`, `distance_zone_entered`, and `timed_out`.
 - IMU turn: `imu_turn.configuration_valid`, `active`, controller `state` and
   `fault_reason`; all eight tuning fields; start/current/target/relative
   headings, angle error and yaw rate; proportional, damping, and clamped
@@ -842,11 +808,6 @@ rlf max-correction 0.20
 rlf polarity 1
 rlf telemetry on
 ```
-
-The compact serial `habitat config` command updates the original line,
-alignment, reverse, and zone-count fields while retaining the pickup-extension
-values already in memory. Configure the full pickup-extension field set through
-the Habitat Pieces dashboard/API before using that serial command.
 
 `rlf` tunes a separate rear configuration. Its initial values are copied from
 the front follower, but subsequent `rlf` commands and saves do not change `lf`

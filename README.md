@@ -57,18 +57,10 @@ the left wheel side on LSS2 black and the right wheel side on LSS3 black. Once
 both detections latch, it drives straight backward at an adjustable duty for an
 adjustable duration. It then strafes in an adjustable left/right direction and
 counts distinct entries into the valid laser-distance zone above an adjustable
-threshold. Consecutive above-threshold samples count once. At the target count,
-it performs an adjustable opposite-direction compensation strafe, lowers the
-linear slide to the bottom limit, and drives forward until a new valid reading
-is at or below a separately adjustable pickup threshold. It then lifts the
-slide by adjustable microsteps while concurrently reversing and returning in
-the opposite strafe direction until either rear line sensor detects black.
-Each open-loop/search step has its own adjustable duration or timeout; any
-timeout, stepper failure, stale required line data, or command failure stops the
-route. The final line detection prepares the robot for the separate Habitat
-Placement route but does not start it automatically. All new settings default
-to unconfigured. The laser remains in its high-accuracy profile through idle,
-motion, and stopped states.
+threshold. Consecutive above-threshold samples count once; the route stops at
+the adjustable target count or faults on the independently adjustable strafe
+timeout. All added strafe settings default to unconfigured. The laser remains
+in its high-accuracy profile through idle, motion, and stopped states.
 
 For the current two-ESP wiring, flash both ESPs and use the ESP2 dashboard to
 test individual wheels, distributed drive, front line sensors, and the

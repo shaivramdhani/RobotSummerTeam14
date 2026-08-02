@@ -17,10 +17,7 @@ calibration values.
 - Habitat Pieces shared LSS2/LSS3 detection delay, overall search/alignment
   timeout, line-follow/alignment duty, reverse duty/duration, distance-strafe
   left/right direction, distance threshold, target zone count, strafe duty, and
-  strafe timeout; opposite compensation duty/duration; slide down and lift
-  speeds/timeouts/relative steps; forward pickup duty/distance/timeout;
-  post-pickup reverse duty/duration; and rear-line return duty/timeout: TODO;
-  set only after raised-wheel and field-path testing.
+  strafe timeout: TODO; set only after raised-wheel and field-path testing.
 
 ## IR Beacon
 

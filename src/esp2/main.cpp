@@ -1513,9 +1513,6 @@ void resetSolarPanelAutonomy(RuntimeContext& context,
 
 void resetHabitatPieces(RuntimeContext& context,
                         const robot::Milliseconds now_ms) {
-  if (g_runtime.stepper != nullptr) {
-    g_runtime.stepper->stop();
-  }
   robot::resetHabitatPiecesAutonomy(context.habitat_pieces, now_ms);
   context.last_habitat_pieces_update = {};
   context.habitat_pieces_start_requested = false;
@@ -1622,17 +1619,6 @@ robot::FourWheelCommand makeHabitatPiecesBackwardCommand(
                  activeMotionDutyCap(context));
   return robot::mixOpenLoopMecanum(
       0.0F, -1.0F, 0.0F, duty, now_ms,
-      context.config.remoteCommandTimeoutMs);
-}
-
-robot::FourWheelCommand makeHabitatPiecesTranslationCommand(
-    const RuntimeContext& context, const float lateral,
-    const float forward, const float requested_duty,
-    const robot::Milliseconds now_ms) {
-  const float duty = clampFloat(requested_duty, 0.0F,
-                                activeMotionDutyCap(context));
-  return robot::mixOpenLoopMecanum(
-      lateral, forward, 0.0F, duty, now_ms,
       context.config.remoteCommandTimeoutMs);
 }
 
@@ -1781,9 +1767,6 @@ void disableActuators(RuntimeContext& context, robot::IMotorOutput& front_left,
                       RearCommandLink& rear_link,
                       const robot::Milliseconds now_ms) {
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
-  if (g_runtime.stepper != nullptr) {
-    g_runtime.stepper->stop();
-  }
   context.requested_funnel_command = robot::disabledMotorCommand();
   sendStoppedFunnelCommand(rear_link, context.config, now_ms);
   sendStoppedSolarHookCommand(rear_link);
@@ -1983,7 +1966,6 @@ bool habitatPiecesMotionRequirementsMet(
     const DualPwmMotorOutput& front_left,
     const DualPwmMotorOutput& front_right,
     const RearCommandLink& rear_link,
-    const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
     const RuntimeContext& context) {
   const robot::LineFollowerConfig line_config =
@@ -1992,20 +1974,9 @@ bool habitatPiecesMotionRequirementsMet(
                               now_ms, context) &&
          robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
              .accepted &&
-         stepper.maximumPositionSteps() > 0 &&
-         stepper.maximumPositionSteps() <=
-             static_cast<std::int64_t>(UINT32_MAX) &&
          robot::habitatPiecesConfigValid(context.habitat_pieces_config,
                                          activeMotionDutyCap(context),
-                                         kMaxTimedTestDurationMs,
-                                         stepper.maximumSpeedStepsPerSecond(),
-                                         static_cast<std::uint32_t>(
-                                             stepper.maximumPositionSteps())) &&
-         gpioAssigned(robot::esp2::kPins.stepper_sleep) &&
-         gpioAssigned(robot::esp2::kPins.stepper_dir) &&
-         gpioAssigned(robot::esp2::kPins.stepper_step) &&
-         gpioAssigned(robot::esp2::kPins.limit_switch_stepper_bottom) &&
-         gpioAssigned(robot::esp2::kPins.limit_switch_stepper_top);
+                                         kMaxTimedTestDurationMs);
 }
 
 bool habitatPiecesStartRequirementsMet(
@@ -2013,17 +1984,14 @@ bool habitatPiecesStartRequirementsMet(
     const DualPwmMotorOutput& front_left,
     const DualPwmMotorOutput& front_right,
     const RearCommandLink& rear_link,
-    const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
     const RuntimeContext& context) {
   return habitatPiecesMotionRequirementsMet(
-             sensors, front_left, front_right, rear_link, stepper, now_ms,
-             context) &&
+             sensors, front_left, front_right, rear_link, now_ms, context) &&
          rear_link.rearLineSnapshotFresh(
              now_ms, context.config.remoteCommandTimeoutMs) &&
          rear_link.latestRearLineSnapshot().side_2_configured &&
-         rear_link.latestRearLineSnapshot().side_3_configured &&
-         rear_link.latestRearLineSnapshot().configured;
+         rear_link.latestRearLineSnapshot().side_3_configured;
 }
 
 bool rearLineStartRequirementsMet(
@@ -3299,9 +3267,6 @@ void enterHabitatPiecesFault(
     const robot::FaultCode fault_code, const char* const message,
     const robot::EventSource source,
     const robot::Milliseconds now_ms) {
-  if (g_runtime.stepper != nullptr) {
-    g_runtime.stepper->stop();
-  }
   disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
   robot::failHabitatPiecesAutonomy(context.habitat_pieces, stop_reason,
                                    now_ms);
@@ -3315,14 +3280,6 @@ void enterHabitatPiecesFault(
   context.last_habitat_pieces_update.should_drive_right_side = false;
   context.last_habitat_pieces_update.should_reverse = false;
   context.last_habitat_pieces_update.should_distance_strafe = false;
-  context.last_habitat_pieces_update.should_compensation_strafe = false;
-  context.last_habitat_pieces_update.should_start_slide_down = false;
-  context.last_habitat_pieces_update.should_lower_slide = false;
-  context.last_habitat_pieces_update.should_drive_forward_to_distance = false;
-  context.last_habitat_pieces_update.should_start_slide_lift = false;
-  context.last_habitat_pieces_update.should_post_pickup_reverse = false;
-  context.last_habitat_pieces_update.should_return_line_strafe = false;
-  context.last_habitat_pieces_update.should_wait_for_slide_lift = false;
   setFault(context, fault_code, message);
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
 }
@@ -3330,8 +3287,7 @@ void enterHabitatPiecesFault(
 void runHabitatPieces(
     RuntimeContext& context, DigitalFrontLineSensorReader& sensors,
     DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
-    RearCommandLink& rear_link, robot::esp2::StepperAxis& stepper,
-    const robot::Milliseconds now_ms) {
+    RearCommandLink& rear_link, const robot::Milliseconds now_ms) {
   if (context.habitat_pieces.state ==
       robot::HabitatPiecesState::WaitForStart) {
     disableMotionActuators(context, front_left, front_right, rear_link,
@@ -3360,18 +3316,8 @@ void runHabitatPieces(
           robot::EventSource::Line, now_ms);
       return;
     }
-    if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::ConflictingSlideLimits,
-          robot::FaultCode::LimitSwitchConflict,
-          "Habitat Pieces start rejected: slide limit switches conflict",
-          robot::EventSource::Motor, now_ms);
-      return;
-    }
     if (!habitatPiecesStartRequirementsMet(
-            sensors, front_left, front_right, rear_link, stepper, now_ms,
-            context)) {
+            sensors, front_left, front_right, rear_link, now_ms, context)) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
           robot::HabitatPiecesStopReason::ConfigurationIncomplete,
@@ -3393,25 +3339,13 @@ void runHabitatPieces(
           robot::HabitatPiecesState::Complete ||
       context.habitat_pieces.state ==
           robot::HabitatPiecesState::Fault) {
-    stepper.stop();
     disableMotionActuators(context, front_left, front_right, rear_link,
                            now_ms);
     return;
   }
 
-  if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
-    enterHabitatPiecesFault(
-        context, front_left, front_right, rear_link,
-        robot::HabitatPiecesStopReason::ConflictingSlideLimits,
-        robot::FaultCode::LimitSwitchConflict,
-        "Habitat Pieces stopped: slide limit switches conflict",
-        robot::EventSource::Motor, now_ms);
-    return;
-  }
-
   if (!habitatPiecesMotionRequirementsMet(
-          sensors, front_left, front_right, rear_link, stepper, now_ms,
-          context)) {
+          sensors, front_left, front_right, rear_link, now_ms, context)) {
     enterHabitatPiecesFault(
         context, front_left, front_right, rear_link,
         robot::HabitatPiecesStopReason::ConfigurationIncomplete,
@@ -3477,160 +3411,10 @@ void runHabitatPieces(
         laser.measurement_sequence;
   }
 
-  const robot::HabitatPiecesState previous_habitat_state =
-      context.habitat_pieces.state;
-  if (previous_habitat_state ==
-      robot::HabitatPiecesState::ReturnLineStrafing) {
-    if (!rear_link.rearLineSnapshotFresh(
-            now_ms, context.rear_config.remoteCommandTimeoutMs)) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::RearLineDataStale,
-          robot::FaultCode::CommunicationStale,
-          "Habitat Pieces stopped: rear line data stale during return strafe",
-          robot::EventSource::Uart, now_ms);
-      return;
-    }
-    if (!rear_link.latestRearLineSnapshot().configured) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::RearLineSensorsUnavailable,
-          robot::FaultCode::HardwareNotConfigured,
-          "Habitat Pieces stopped: rear line sensors unavailable",
-          robot::EventSource::Line, now_ms);
-      return;
-    }
-  }
-
-  robot::HabitatPiecesInputs habitat_inputs{};
-  habitat_inputs.lss2_black = lss2_black;
-  habitat_inputs.lss3_black = lss3_black;
-  habitat_inputs.distance_sample = distance_sample;
-  habitat_inputs.slide_bottom_limit_active =
-      stepper.lowerLimitActive();
-  habitat_inputs.slide_bottom_ready =
-      stepper.lowerLimitActive() && stepper.isHomed();
-  habitat_inputs.slide_top_limit_active = stepper.upperLimitActive();
-  habitat_inputs.slide_down_failed =
-      previous_habitat_state == robot::HabitatPiecesState::LoweringSlide &&
-      !habitat_inputs.slide_bottom_ready &&
-      (stepper.motionState() ==
-           robot::esp2::StepperMotionState::LimitSearchFailed ||
-       stepper.motionState() == robot::esp2::StepperMotionState::Stopped);
-  if (context.habitat_pieces.slide_lift_started) {
-    habitat_inputs.slide_lift_complete =
-        stepper.positionSteps() >=
-            static_cast<std::int64_t>(
-                context.habitat_pieces_config.slide_lift_steps) &&
-        !stepper.isBusy();
-    habitat_inputs.slide_lift_failed =
-        !habitat_inputs.slide_lift_complete &&
-        ((stepper.upperLimitActive() &&
-          stepper.positionSteps() <
-              static_cast<std::int64_t>(
-                  context.habitat_pieces_config.slide_lift_steps)) ||
-         !stepper.isBusy());
-  }
-  if (rear_link.rearLineSnapshotFresh(
-          now_ms, context.rear_config.remoteCommandTimeoutMs) &&
-      rear_link.latestRearLineSnapshot().configured) {
-    const robot::RearLineSensorSnapshot& rear_line =
-        rear_link.latestRearLineSnapshot();
-    habitat_inputs.rear_left_black = rear_line.left_electrical_high;
-    habitat_inputs.rear_right_black = rear_line.right_electrical_high;
-  }
-
   context.last_habitat_pieces_update =
       robot::updateHabitatPiecesAutonomy(
           context.habitat_pieces, context.habitat_pieces_config,
-          habitat_inputs, now_ms);
-
-  if (context.last_habitat_pieces_update.should_start_slide_down) {
-    const bool accepted = stepper.setLimitSearchSpeed(
-                              context.habitat_pieces_config
-                                  .slide_down_speed_steps_per_second) &&
-                          stepper.moveToLowerLimit();
-    if (!accepted) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::SlideCommandFailed,
-          robot::FaultCode::InvalidCommand,
-          "Habitat Pieces stopped: slide-down command rejected",
-          robot::EventSource::Motor, now_ms);
-      return;
-    }
-  }
-
-  if (context.last_habitat_pieces_update.should_start_slide_lift) {
-    const bool accepted = stepper.isHomed() &&
-                          stepper.setSpeed(
-                              context.habitat_pieces_config
-                                  .slide_lift_speed_steps_per_second) &&
-                          stepper.jogSteps(static_cast<std::int64_t>(
-                              context.habitat_pieces_config
-                                  .slide_lift_steps));
-    if (!accepted) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::SlideCommandFailed,
-          robot::FaultCode::InvalidCommand,
-          "Habitat Pieces stopped: slide-lift command rejected",
-          robot::EventSource::Motor, now_ms);
-      return;
-    }
-  }
-
-  if (context.habitat_pieces.state == robot::HabitatPiecesState::Fault) {
-    const robot::HabitatPiecesStopReason reason =
-        context.habitat_pieces.stop_reason;
-    robot::FaultCode fault_code = robot::FaultCode::InvalidCommand;
-    const char* message = "Habitat Pieces stopped: autonomous state fault";
-    robot::EventSource source = robot::EventSource::System;
-    switch (reason) {
-      case robot::HabitatPiecesStopReason::RunTimeout:
-        fault_code = robot::FaultCode::SearchTimeout;
-        message = "Habitat Pieces stopped: LSS2/LSS3 alignment timeout reached";
-        break;
-      case robot::HabitatPiecesStopReason::DistanceStrafeTimeout:
-        fault_code = robot::FaultCode::SearchTimeout;
-        message = "Habitat Pieces stopped: distance strafe timeout reached";
-        break;
-      case robot::HabitatPiecesStopReason::SlideDownTimeout:
-        fault_code = robot::FaultCode::SearchTimeout;
-        message = "Habitat Pieces stopped: slide-down timeout reached";
-        source = robot::EventSource::Motor;
-        break;
-      case robot::HabitatPiecesStopReason::ForwardDistanceTimeout:
-        fault_code = robot::FaultCode::SearchTimeout;
-        message = "Habitat Pieces stopped: forward distance timeout reached";
-        break;
-      case robot::HabitatPiecesStopReason::SlideLiftTimeout:
-        fault_code = robot::FaultCode::SearchTimeout;
-        message = "Habitat Pieces stopped: slide-lift timeout reached";
-        source = robot::EventSource::Motor;
-        break;
-      case robot::HabitatPiecesStopReason::ReturnLineTimeout:
-        fault_code = robot::FaultCode::SearchTimeout;
-        message = "Habitat Pieces stopped: rear-line return timeout reached";
-        source = robot::EventSource::Line;
-        break;
-      case robot::HabitatPiecesStopReason::SlideCommandFailed:
-        message = "Habitat Pieces stopped: slide motion failed";
-        source = robot::EventSource::Motor;
-        break;
-      case robot::HabitatPiecesStopReason::ConflictingSlideLimits:
-        fault_code = robot::FaultCode::LimitSwitchConflict;
-        message = "Habitat Pieces stopped: slide limit switches conflict";
-        source = robot::EventSource::Motor;
-        break;
-      default:
-        break;
-    }
-    enterHabitatPiecesFault(
-        context, front_left, front_right, rear_link, reason,
-        fault_code, message, source, now_ms);
-    return;
-  }
+          lss2_black, lss3_black, now_ms, distance_sample);
 
   if (context.last_habitat_pieces_update.should_align_side_lines) {
     robot::stopLineFollower(context.follower_state);
@@ -3718,119 +3502,6 @@ void runHabitatPieces(
     return;
   }
 
-  if (context.last_habitat_pieces_update.should_compensation_strafe) {
-    robot::stopLineFollower(context.follower_state);
-    const robot::HabitatPiecesStrafeDirection direction =
-        robot::oppositeHabitatPiecesStrafeDirection(
-            context.habitat_pieces_config.distance_strafe_direction);
-    const robot::FourWheelCommand wheels =
-        robot::makeHabitatPiecesDistanceStrafeCommand(
-            direction,
-            clampFloat(
-                context.habitat_pieces_config.compensation_strafe_duty,
-                0.0F, activeMotionDutyCap(context)),
-            now_ms, context.config.remoteCommandTimeoutMs);
-    if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                           wheels, context.config, now_ms)) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::RearCommandFailed,
-          robot::FaultCode::CommunicationStale,
-          "Habitat Pieces stopped: compensation strafe command failed",
-          robot::EventSource::Uart, now_ms);
-      return;
-    }
-    context.last_command_ms = now_ms;
-    return;
-  }
-
-  if (context.last_habitat_pieces_update.should_lower_slide) {
-    disableMotionActuators(context, front_left, front_right, rear_link,
-                           now_ms);
-    return;
-  }
-
-  if (context.last_habitat_pieces_update
-          .should_drive_forward_to_distance) {
-    const robot::FourWheelCommand wheels =
-        makeHabitatPiecesTranslationCommand(
-            context, 0.0F, 1.0F,
-            context.habitat_pieces_config.forward_to_distance_duty,
-            now_ms);
-    if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                           wheels, context.config, now_ms)) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::RearCommandFailed,
-          robot::FaultCode::CommunicationStale,
-          "Habitat Pieces stopped: forward distance command failed",
-          robot::EventSource::Uart, now_ms);
-      return;
-    }
-    context.last_command_ms = now_ms;
-    return;
-  }
-
-  if (context.last_habitat_pieces_update.should_post_pickup_reverse) {
-    const robot::FourWheelCommand wheels =
-        makeHabitatPiecesTranslationCommand(
-            context, 0.0F, -1.0F,
-            context.habitat_pieces_config.post_pickup_reverse_duty,
-            now_ms);
-    if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                           wheels, context.config, now_ms)) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::RearCommandFailed,
-          robot::FaultCode::CommunicationStale,
-          "Habitat Pieces stopped: post-pickup reverse command failed",
-          robot::EventSource::Uart, now_ms);
-      return;
-    }
-    context.last_command_ms = now_ms;
-    return;
-  }
-
-  if (context.last_habitat_pieces_update.should_return_line_strafe) {
-    const robot::HabitatPiecesStrafeDirection direction =
-        robot::oppositeHabitatPiecesStrafeDirection(
-            context.habitat_pieces_config.distance_strafe_direction);
-    const robot::FourWheelCommand wheels =
-        robot::makeHabitatPiecesDistanceStrafeCommand(
-            direction,
-            clampFloat(context.habitat_pieces_config.return_strafe_duty,
-                       0.0F, activeMotionDutyCap(context)),
-            now_ms, context.config.remoteCommandTimeoutMs);
-    if (!applyWheelCommand(context, front_left, front_right, rear_link,
-                           wheels, context.config, now_ms)) {
-      enterHabitatPiecesFault(
-          context, front_left, front_right, rear_link,
-          robot::HabitatPiecesStopReason::RearCommandFailed,
-          robot::FaultCode::CommunicationStale,
-          "Habitat Pieces stopped: rear-line return strafe command failed",
-          robot::EventSource::Uart, now_ms);
-      return;
-    }
-    context.last_command_ms = now_ms;
-    return;
-  }
-
-  if (context.last_habitat_pieces_update.should_wait_for_slide_lift) {
-    disableMotionActuators(context, front_left, front_right, rear_link,
-                           now_ms);
-    return;
-  }
-
-  if (context.last_habitat_pieces_update.transitioned &&
-      (context.habitat_pieces.state ==
-           robot::HabitatPiecesState::ForwardToDistance ||
-       context.habitat_pieces.state ==
-           robot::HabitatPiecesState::ReturnLineStrafing)) {
-    disableMotionActuators(context, front_left, front_right, rear_link,
-                           now_ms);
-    return;
-  }
-
   if (!context.last_habitat_pieces_update.should_line_follow) {
     disableMotionActuators(context, front_left, front_right, rear_link,
                            now_ms);
@@ -3840,7 +3511,7 @@ void runHabitatPieces(
       clearFault(context);
       logEvent(context, now_ms, robot::EventSeverity::Info,
                robot::EventSource::System,
-               "Habitat Pieces rear line reached and slide lift complete; stopped");
+               "Habitat Pieces distance-zone count reached; stopped");
     } else if (context.habitat_pieces.stop_reason ==
                robot::HabitatPiecesStopReason::DistanceStrafeTimeout) {
       setFault(context, robot::FaultCode::SearchTimeout,
@@ -7067,101 +6738,16 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.habitat_pieces.latest_distance_mm;
   snapshot.habitat_pieces_distance_zone_count =
       context.habitat_pieces.distance_zone_count;
-  snapshot.habitat_pieces_compensation_strafe_duty =
-      context.habitat_pieces_config.compensation_strafe_duty;
-  snapshot.habitat_pieces_compensation_strafe_duration_ms =
-      context.habitat_pieces_config.compensation_strafe_duration_ms;
-  snapshot.habitat_pieces_compensation_strafe_elapsed_ms =
-      context.habitat_pieces.compensation_strafe_elapsed_ms;
-  snapshot.habitat_pieces_compensation_strafe_remaining_ms =
-      context.habitat_pieces_config.compensation_strafe_duration_ms >
-              context.habitat_pieces.compensation_strafe_elapsed_ms
-          ? context.habitat_pieces_config.compensation_strafe_duration_ms -
-                context.habitat_pieces.compensation_strafe_elapsed_ms
-          : 0U;
-  snapshot.habitat_pieces_slide_down_speed_steps_per_second =
-      context.habitat_pieces_config.slide_down_speed_steps_per_second;
-  snapshot.habitat_pieces_slide_down_timeout_ms =
-      context.habitat_pieces_config.slide_down_timeout_ms;
-  snapshot.habitat_pieces_slide_down_elapsed_ms =
-      context.habitat_pieces.slide_down_elapsed_ms;
-  snapshot.habitat_pieces_slide_down_remaining_ms =
-      context.habitat_pieces_config.slide_down_timeout_ms >
-              context.habitat_pieces.slide_down_elapsed_ms
-          ? context.habitat_pieces_config.slide_down_timeout_ms -
-                context.habitat_pieces.slide_down_elapsed_ms
-          : 0U;
-  snapshot.habitat_pieces_forward_to_distance_duty =
-      context.habitat_pieces_config.forward_to_distance_duty;
-  snapshot.habitat_pieces_forward_stop_distance_mm =
-      context.habitat_pieces_config.forward_stop_distance_mm;
-  snapshot.habitat_pieces_forward_to_distance_timeout_ms =
-      context.habitat_pieces_config.forward_to_distance_timeout_ms;
-  snapshot.habitat_pieces_forward_to_distance_elapsed_ms =
-      context.habitat_pieces.forward_to_distance_elapsed_ms;
-  snapshot.habitat_pieces_forward_to_distance_remaining_ms =
-      context.habitat_pieces_config.forward_to_distance_timeout_ms >
-              context.habitat_pieces.forward_to_distance_elapsed_ms
-          ? context.habitat_pieces_config.forward_to_distance_timeout_ms -
-                context.habitat_pieces.forward_to_distance_elapsed_ms
-          : 0U;
-  snapshot.habitat_pieces_slide_lift_steps =
-      context.habitat_pieces_config.slide_lift_steps;
-  snapshot.habitat_pieces_slide_lift_speed_steps_per_second =
-      context.habitat_pieces_config.slide_lift_speed_steps_per_second;
-  snapshot.habitat_pieces_slide_lift_timeout_ms =
-      context.habitat_pieces_config.slide_lift_timeout_ms;
-  snapshot.habitat_pieces_slide_lift_elapsed_ms =
-      context.habitat_pieces.slide_lift_elapsed_ms;
-  snapshot.habitat_pieces_slide_lift_remaining_ms =
-      context.habitat_pieces_config.slide_lift_timeout_ms >
-              context.habitat_pieces.slide_lift_elapsed_ms
-          ? context.habitat_pieces_config.slide_lift_timeout_ms -
-                context.habitat_pieces.slide_lift_elapsed_ms
-          : 0U;
-  snapshot.habitat_pieces_post_pickup_reverse_duty =
-      context.habitat_pieces_config.post_pickup_reverse_duty;
-  snapshot.habitat_pieces_post_pickup_reverse_duration_ms =
-      context.habitat_pieces_config.post_pickup_reverse_duration_ms;
-  snapshot.habitat_pieces_post_pickup_reverse_elapsed_ms =
-      context.habitat_pieces.post_pickup_reverse_elapsed_ms;
-  snapshot.habitat_pieces_post_pickup_reverse_remaining_ms =
-      context.habitat_pieces_config.post_pickup_reverse_duration_ms >
-              context.habitat_pieces.post_pickup_reverse_elapsed_ms
-          ? context.habitat_pieces_config.post_pickup_reverse_duration_ms -
-                context.habitat_pieces.post_pickup_reverse_elapsed_ms
-          : 0U;
-  snapshot.habitat_pieces_return_strafe_duty =
-      context.habitat_pieces_config.return_strafe_duty;
-  snapshot.habitat_pieces_return_line_timeout_ms =
-      context.habitat_pieces_config.return_line_timeout_ms;
-  snapshot.habitat_pieces_return_strafe_elapsed_ms =
-      context.habitat_pieces.return_strafe_elapsed_ms;
-  snapshot.habitat_pieces_return_strafe_remaining_ms =
-      context.habitat_pieces_config.return_line_timeout_ms >
-              context.habitat_pieces.return_strafe_elapsed_ms
-          ? context.habitat_pieces_config.return_line_timeout_ms -
-                context.habitat_pieces.return_strafe_elapsed_ms
-          : 0U;
   snapshot.habitat_pieces_configuration_valid =
-      g_runtime.stepper != nullptr &&
-      g_runtime.stepper->maximumPositionSteps() > 0 &&
-      g_runtime.stepper->maximumPositionSteps() <=
-          static_cast<std::int64_t>(UINT32_MAX) &&
-      robot::habitatPiecesConfigValid(
-          context.habitat_pieces_config, activeMotionDutyCap(context),
-          kMaxTimedTestDurationMs,
-          g_runtime.stepper->maximumSpeedStepsPerSecond(),
-          static_cast<std::uint32_t>(
-              g_runtime.stepper->maximumPositionSteps())) &&
+      robot::habitatPiecesConfigValid(context.habitat_pieces_config,
+                                      activeMotionDutyCap(context),
+                                      kMaxTimedTestDurationMs) &&
       robot::validateLineFollowerConfig(habitat_line_config,
                                         hardwareDutyCap())
           .accepted;
   snapshot.habitat_pieces_start_ready =
-      g_runtime.stepper != nullptr &&
       habitatPiecesStartRequirementsMet(
-          sensors, front_left, front_right, rear_link,
-          *g_runtime.stepper, now_ms, context);
+          sensors, front_left, front_right, rear_link, now_ms, context);
   snapshot.habitat_pieces_lss2_data_fresh =
       rear_link.rearLineSnapshotFresh(
           now_ms, context.config.remoteCommandTimeoutMs);
@@ -7222,56 +6808,6 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.habitat_pieces.distance_zone_active;
   snapshot.habitat_pieces_distance_zone_entered =
       context.last_habitat_pieces_update.distance_zone_entered;
-  snapshot.habitat_pieces_compensation_strafing =
-      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::CompensationStrafing;
-  snapshot.habitat_pieces_lowering_slide =
-      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::LoweringSlide;
-  snapshot.habitat_pieces_slide_bottom_ready =
-      g_runtime.stepper != nullptr &&
-      g_runtime.stepper->lowerLimitActive() &&
-      g_runtime.stepper->isHomed();
-  snapshot.habitat_pieces_forward_to_distance =
-      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::ForwardToDistance;
-  snapshot.habitat_pieces_forward_distance_reached =
-      context.habitat_pieces.slide_lift_started;
-  snapshot.habitat_pieces_slide_lift_started =
-      context.habitat_pieces.slide_lift_started;
-  snapshot.habitat_pieces_slide_lift_complete =
-      context.habitat_pieces.slide_lift_complete;
-  snapshot.habitat_pieces_post_pickup_reversing =
-      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::PostPickupReversing;
-  snapshot.habitat_pieces_return_line_strafing =
-      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::ReturnLineStrafing;
-  snapshot.habitat_pieces_waiting_for_slide_lift =
-      context.modes.currentMode() == robot::RobotTestMode::HabitatPieces &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::WaitForSlideLift;
-  snapshot.habitat_pieces_rear_line_data_fresh =
-      rear_link.rearLineSnapshotFresh(
-          now_ms, context.rear_config.remoteCommandTimeoutMs);
-  snapshot.habitat_pieces_rear_line_configured =
-      rear_link.rearLineSnapshotAvailable() &&
-      rear_link.latestRearLineSnapshot().configured;
-  snapshot.habitat_pieces_rear_left_black =
-      snapshot.habitat_pieces_rear_line_data_fresh &&
-      snapshot.habitat_pieces_rear_line_configured &&
-      rear_link.latestRearLineSnapshot().left_electrical_high;
-  snapshot.habitat_pieces_rear_right_black =
-      snapshot.habitat_pieces_rear_line_data_fresh &&
-      snapshot.habitat_pieces_rear_line_configured &&
-      rear_link.latestRearLineSnapshot().right_electrical_high;
-  snapshot.habitat_pieces_rear_line_detected =
-      context.habitat_pieces.rear_line_detected;
   snapshot.habitat_pieces_timed_out = context.habitat_pieces.timed_out;
 
   snapshot.habitat_placement_state = context.habitat_placement.state;
@@ -7975,7 +7511,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Habitat Pieces</h2>
-    <div class="muted">Follows the front line, aligns independently on LSS2/LSS3, reverses, and strafes while counting distinct above-threshold laser zones. At the target count it compensates in the opposite direction, lowers the slide to its bottom switch, then drives forward until a valid laser reading is at or below the pickup threshold. The slide lift starts with the timed reverse and continues concurrently while the robot strafes opposite the initial count direction until either rear line sensor sees black. Invalid/no-signal laser samples do not stop the forward approach; every search and open-loop drive remains timeout-bounded.</div>
+    <div class="muted">Follows the front line, aligns independently on LSS2/LSS3, then runs the configured straight-backward move. It next strafes left or right while counting entries into the valid laser-distance zone above the configured threshold. Consecutive above-threshold samples count once; a valid at-or-below sample rearms the next entry. The robot stops when the target count is reached or the bounded strafe timeout expires. Invalid/no-signal laser samples do not count, and repeated packets for one measurement cannot increase the count.</div>
     <div class="kv">
       <span>Configuration</span><span id="habitatConfig" class="mono"></span>
       <span>Start ready</span><span id="habitatReady" class="mono"></span>
@@ -7990,12 +7526,6 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Distance reading / threshold</span><span id="habitatDistance" class="mono"></span>
       <span>Distance-zone count</span><span id="habitatDistanceCount" class="mono"></span>
       <span>Distance strafe</span><span id="habitatDistanceStrafe" class="mono"></span>
-      <span>Overshoot compensation</span><span id="habitatCompensation" class="mono"></span>
-      <span>Slide down</span><span id="habitatSlideDown" class="mono"></span>
-      <span>Forward pickup approach</span><span id="habitatForwardPickup" class="mono"></span>
-      <span>Concurrent slide lift</span><span id="habitatSlideLift" class="mono"></span>
-      <span>Post-pickup reverse</span><span id="habitatPostReverse" class="mono"></span>
-      <span>Return rear-line strafe</span><span id="habitatReturnStrafe" class="mono"></span>
       <span>Line following</span><span id="habitatFollowing" class="mono"></span>
       <span>Last request</span><span id="habitatResult" class="mono muted">none</span>
     </div>
@@ -8010,20 +7540,6 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Distance-zone target count <input id="habitatDistanceCountTarget" type="number" min="1" max="65535" step="1"></label>
       <label>Distance strafe duty <input id="habitatDistanceDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Distance strafe timeout (ms) <input id="habitatDistanceTimeout" type="number" min="1" max="30000" step="100"></label>
-      <label>Opposite compensation duty <input id="habitatCompensationDuty" type="number" min="0.001" max="1" step="0.01"></label>
-      <label>Opposite compensation duration (ms) <input id="habitatCompensationDuration" type="number" min="1" max="30000" step="100"></label>
-      <label>Slide-down speed (microsteps/s) <input id="habitatSlideDownSpeed" type="number" min="1" step="100"></label>
-      <label>Slide-down timeout (ms) <input id="habitatSlideDownTimeout" type="number" min="1" max="30000" step="100"></label>
-      <label>Forward pickup duty <input id="habitatForwardDuty" type="number" min="0.001" max="1" step="0.01"></label>
-      <label>Forward pickup stop distance (mm) <input id="habitatForwardDistance" type="number" min="1" max="65535" step="1"></label>
-      <label>Forward pickup timeout (ms) <input id="habitatForwardTimeout" type="number" min="1" max="30000" step="100"></label>
-      <label>Slide lift (microsteps) <input id="habitatSlideLiftSteps" type="number" min="1" step="100"></label>
-      <label>Slide-lift speed (microsteps/s) <input id="habitatSlideLiftSpeed" type="number" min="1" step="100"></label>
-      <label>Slide-lift timeout (ms) <input id="habitatSlideLiftTimeout" type="number" min="1" max="30000" step="100"></label>
-      <label>Post-pickup reverse duty <input id="habitatPostReverseDuty" type="number" min="0.001" max="1" step="0.01"></label>
-      <label>Post-pickup reverse duration (ms) <input id="habitatPostReverseDuration" type="number" min="1" max="30000" step="100"></label>
-      <label>Return strafe duty <input id="habitatReturnDuty" type="number" min="0.001" max="1" step="0.01"></label>
-      <label>Return rear-line timeout (ms) <input id="habitatReturnTimeout" type="number" min="1" max="30000" step="100"></label>
     </div>
     <div class="row">
       <button class="run" onclick="habitatStart()">Start</button>
@@ -8769,31 +8285,6 @@ function loadHabitatControls(j){
   setLfValue('habitatDistanceDuty', h.distance_strafe_duty || '');
   setLfValue('habitatDistanceTimeout',
              h.distance_strafe_timeout_ms || '');
-  setLfValue('habitatCompensationDuty',
-             h.compensation_strafe_duty || '');
-  setLfValue('habitatCompensationDuration',
-             h.compensation_strafe_duration_ms || '');
-  setLfValue('habitatSlideDownSpeed',
-             h.slide_down_speed_steps_per_second || '');
-  setLfValue('habitatSlideDownTimeout',
-             h.slide_down_timeout_ms || '');
-  setLfValue('habitatForwardDuty',
-             h.forward_to_distance_duty || '');
-  setLfValue('habitatForwardDistance',
-             h.forward_stop_distance_mm || '');
-  setLfValue('habitatForwardTimeout',
-             h.forward_to_distance_timeout_ms || '');
-  setLfValue('habitatSlideLiftSteps', h.slide_lift_steps || '');
-  setLfValue('habitatSlideLiftSpeed',
-             h.slide_lift_speed_steps_per_second || '');
-  setLfValue('habitatSlideLiftTimeout',
-             h.slide_lift_timeout_ms || '');
-  setLfValue('habitatPostReverseDuty',
-             h.post_pickup_reverse_duty || '');
-  setLfValue('habitatPostReverseDuration',
-             h.post_pickup_reverse_duration_ms || '');
-  setLfValue('habitatReturnDuty', h.return_strafe_duty || '');
-  setLfValue('habitatReturnTimeout', h.return_line_timeout_ms || '');
   habitatLoaded = true;
 }
 function habitatParams(){
@@ -8807,21 +8298,7 @@ function habitatParams(){
     'distance-threshold-mm': qs('habitatDistanceThreshold').value,
     'distance-zone-count': qs('habitatDistanceCountTarget').value,
     'distance-strafe-duty': qs('habitatDistanceDuty').value,
-    'distance-strafe-timeout-ms': qs('habitatDistanceTimeout').value,
-    'compensation-strafe-duty': qs('habitatCompensationDuty').value,
-    'compensation-strafe-duration-ms': qs('habitatCompensationDuration').value,
-    'slide-down-speed-steps-per-second': qs('habitatSlideDownSpeed').value,
-    'slide-down-timeout-ms': qs('habitatSlideDownTimeout').value,
-    'forward-to-distance-duty': qs('habitatForwardDuty').value,
-    'forward-stop-distance-mm': qs('habitatForwardDistance').value,
-    'forward-to-distance-timeout-ms': qs('habitatForwardTimeout').value,
-    'slide-lift-steps': qs('habitatSlideLiftSteps').value,
-    'slide-lift-speed-steps-per-second': qs('habitatSlideLiftSpeed').value,
-    'slide-lift-timeout-ms': qs('habitatSlideLiftTimeout').value,
-    'post-pickup-reverse-duty': qs('habitatPostReverseDuty').value,
-    'post-pickup-reverse-duration-ms': qs('habitatPostReverseDuration').value,
-    'return-strafe-duty': qs('habitatReturnDuty').value,
-    'return-line-timeout-ms': qs('habitatReturnTimeout').value
+    'distance-strafe-timeout-ms': qs('habitatDistanceTimeout').value
   });
 }
 function habitatShowResult(result){
@@ -9659,8 +9136,7 @@ function update(){
       (!habitat.timed_out &&
       (habitatReason === 'NONE' ||
        habitatReason === 'BOTH_SIDE_LINES_DETECTED' ||
-       habitatReason === 'DISTANCE_ZONE_COUNT_REACHED' ||
-       habitatReason === 'RETURN_LINE_DETECTED')
+       habitatReason === 'DISTANCE_ZONE_COUNT_REACHED')
         ? 'mono good' : 'mono bad');
     const habitatLss2Level =
       habitat.lss2_configured && habitat.lss2_data_fresh
@@ -9697,34 +9173,6 @@ function update(){
       `${habitat.distance_strafe_direction || 'NONE'} at duty ${Number(habitat.distance_strafe_duty ?? 0).toFixed(3)} · ${habitat.distance_strafe_elapsed_ms ?? 0} / ${habitat.distance_strafe_timeout_ms ?? 0} ms (${habitat.distance_strafe_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.distance_strafing)}`;
     qs('habitatDistanceStrafe').className =
       habitat.distance_strafing ? 'mono good' : 'mono muted';
-    qs('habitatCompensation').textContent =
-      `${habitat.return_strafe_direction || 'NONE'} at duty ${Number(habitat.compensation_strafe_duty ?? 0).toFixed(3)} · ${habitat.compensation_strafe_elapsed_ms ?? 0} / ${habitat.compensation_strafe_duration_ms ?? 0} ms (${habitat.compensation_strafe_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.compensation_strafing)}`;
-    qs('habitatCompensation').className =
-      habitat.compensation_strafing ? 'mono good' : 'mono muted';
-    qs('habitatSlideDown').textContent =
-      `${habitat.slide_down_speed_steps_per_second ?? 0} microsteps/s · ${habitat.slide_down_elapsed_ms ?? 0} / ${habitat.slide_down_timeout_ms ?? 0} ms (${habitat.slide_down_remaining_ms ?? 0} ms remaining) · bottom ready=${yn(habitat.slide_bottom_ready)} · active=${yn(habitat.lowering_slide)}`;
-    qs('habitatSlideDown').className =
-      habitat.lowering_slide ? 'mono good' : 'mono muted';
-    qs('habitatForwardPickup').textContent = habitat.distance_measurement_available
-      ? `${habitat.distance_mm ?? 0} / ${habitat.forward_stop_distance_mm ?? 0} mm at duty ${Number(habitat.forward_to_distance_duty ?? 0).toFixed(3)} · ${habitat.forward_to_distance_elapsed_ms ?? 0} / ${habitat.forward_to_distance_timeout_ms ?? 0} ms (${habitat.forward_to_distance_remaining_ms ?? 0} ms remaining) · reached=${yn(habitat.forward_distance_reached)} · active=${yn(habitat.forward_to_distance)}`
-      : `NO VALID READING / ${habitat.forward_stop_distance_mm ?? 0} mm at duty ${Number(habitat.forward_to_distance_duty ?? 0).toFixed(3)} · ${habitat.forward_to_distance_elapsed_ms ?? 0} / ${habitat.forward_to_distance_timeout_ms ?? 0} ms (${habitat.forward_to_distance_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.forward_to_distance)}`;
-    qs('habitatForwardPickup').className =
-      habitat.forward_to_distance ? 'mono good' : 'mono muted';
-    qs('habitatSlideLift').textContent =
-      `${habitat.slide_lift_steps ?? 0} microsteps at ${habitat.slide_lift_speed_steps_per_second ?? 0} microsteps/s · ${habitat.slide_lift_elapsed_ms ?? 0} / ${habitat.slide_lift_timeout_ms ?? 0} ms (${habitat.slide_lift_remaining_ms ?? 0} ms remaining) · started=${yn(habitat.slide_lift_started)} complete=${yn(habitat.slide_lift_complete)} wait=${yn(habitat.waiting_for_slide_lift)}`;
-    qs('habitatSlideLift').className = habitat.slide_lift_complete
-      ? 'mono good' : (habitat.slide_lift_started ? 'mono' : 'mono muted');
-    qs('habitatPostReverse').textContent =
-      `duty ${Number(habitat.post_pickup_reverse_duty ?? 0).toFixed(3)} · ${habitat.post_pickup_reverse_elapsed_ms ?? 0} / ${habitat.post_pickup_reverse_duration_ms ?? 0} ms (${habitat.post_pickup_reverse_remaining_ms ?? 0} ms remaining) · active=${yn(habitat.post_pickup_reversing)}`;
-    qs('habitatPostReverse').className =
-      habitat.post_pickup_reversing ? 'mono good' : 'mono muted';
-    const habitatRearLine = habitat.rear_line_configured && habitat.rear_line_data_fresh
-      ? `left=${habitat.rear_left_black ? 'BLACK' : 'WHITE'} right=${habitat.rear_right_black ? 'BLACK' : 'WHITE'}`
-      : 'rear line UNKNOWN';
-    qs('habitatReturnStrafe').textContent =
-      `${habitat.return_strafe_direction || 'NONE'} at duty ${Number(habitat.return_strafe_duty ?? 0).toFixed(3)} · ${habitat.return_strafe_elapsed_ms ?? 0} / ${habitat.return_line_timeout_ms ?? 0} ms (${habitat.return_strafe_remaining_ms ?? 0} ms remaining) · ${habitatRearLine} · detected=${yn(habitat.rear_line_detected)} active=${yn(habitat.return_line_strafing)}`;
-    qs('habitatReturnStrafe').className =
-      habitat.return_line_strafing ? 'mono good' : 'mono muted';
     qs('habitatFollowing').textContent = yn(habitat.line_following);
     qs('habitatFollowing').className =
       habitat.line_following ? 'mono good' : 'mono muted';
@@ -10589,11 +10037,14 @@ void handleHabitatPiecesConfig() {
     return;
   }
   RuntimeContext& context = *g_runtime.context;
-  if (context.habitat_pieces.state !=
-          robot::HabitatPiecesState::WaitForStart &&
-      context.habitat_pieces.state !=
-          robot::HabitatPiecesState::Complete &&
-      context.habitat_pieces.state != robot::HabitatPiecesState::Fault) {
+  if (context.habitat_pieces.state ==
+          robot::HabitatPiecesState::LineFollowing ||
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::SideLineAligning ||
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::Reversing ||
+      context.habitat_pieces.state ==
+          robot::HabitatPiecesState::DistanceStrafing) {
     sendErrorJson(409, "stop Habitat Pieces before changing its config");
     return;
   }
@@ -10602,10 +10053,6 @@ void handleHabitatPiecesConfig() {
   float duty = next.line_follow_duty;
   float reverse_duty = next.reverse_duty;
   float distance_strafe_duty = next.distance_strafe_duty;
-  float compensation_strafe_duty = next.compensation_strafe_duty;
-  float forward_to_distance_duty = next.forward_to_distance_duty;
-  float post_pickup_reverse_duty = next.post_pickup_reverse_duty;
-  float return_strafe_duty = next.return_strafe_duty;
   robot::Milliseconds value = 0U;
   if (g_server.hasArg("duty") &&
       !argFloat("duty", duty, next.line_follow_duty, true)) {
@@ -10693,132 +10140,17 @@ void handleHabitatPiecesConfig() {
     }
     next.distance_strafe_timeout_ms = value;
   }
-  if (g_server.hasArg("compensation-strafe-duty") &&
-      !argFloat("compensation-strafe-duty", compensation_strafe_duty,
-                next.compensation_strafe_duty, true)) {
-    sendErrorJson(400, "malformed compensation-strafe-duty");
-    return;
-  }
-  next.compensation_strafe_duty = compensation_strafe_duty;
-  if (g_server.hasArg("compensation-strafe-duration-ms")) {
-    if (!argUnsigned("compensation-strafe-duration-ms", value,
-                     next.compensation_strafe_duration_ms, true)) {
-      sendErrorJson(400, "malformed compensation-strafe-duration-ms");
-      return;
-    }
-    next.compensation_strafe_duration_ms = value;
-  }
-  if (g_server.hasArg("slide-down-speed-steps-per-second")) {
-    if (!argUnsigned("slide-down-speed-steps-per-second", value,
-                     next.slide_down_speed_steps_per_second, true)) {
-      sendErrorJson(400, "malformed slide-down-speed-steps-per-second");
-      return;
-    }
-    next.slide_down_speed_steps_per_second = value;
-  }
-  if (g_server.hasArg("slide-down-timeout-ms")) {
-    if (!argUnsigned("slide-down-timeout-ms", value,
-                     next.slide_down_timeout_ms, true)) {
-      sendErrorJson(400, "malformed slide-down-timeout-ms");
-      return;
-    }
-    next.slide_down_timeout_ms = value;
-  }
-  if (g_server.hasArg("forward-to-distance-duty") &&
-      !argFloat("forward-to-distance-duty", forward_to_distance_duty,
-                next.forward_to_distance_duty, true)) {
-    sendErrorJson(400, "malformed forward-to-distance-duty");
-    return;
-  }
-  next.forward_to_distance_duty = forward_to_distance_duty;
-  if (g_server.hasArg("forward-stop-distance-mm")) {
-    if (!argUnsigned("forward-stop-distance-mm", value,
-                     next.forward_stop_distance_mm, true) ||
-        value > UINT16_MAX) {
-      sendErrorJson(400, "malformed forward-stop-distance-mm");
-      return;
-    }
-    next.forward_stop_distance_mm = static_cast<std::uint16_t>(value);
-  }
-  if (g_server.hasArg("forward-to-distance-timeout-ms")) {
-    if (!argUnsigned("forward-to-distance-timeout-ms", value,
-                     next.forward_to_distance_timeout_ms, true)) {
-      sendErrorJson(400, "malformed forward-to-distance-timeout-ms");
-      return;
-    }
-    next.forward_to_distance_timeout_ms = value;
-  }
-  if (g_server.hasArg("slide-lift-steps")) {
-    if (!argUnsigned("slide-lift-steps", value,
-                     next.slide_lift_steps, true)) {
-      sendErrorJson(400, "malformed slide-lift-steps");
-      return;
-    }
-    next.slide_lift_steps = value;
-  }
-  if (g_server.hasArg("slide-lift-speed-steps-per-second")) {
-    if (!argUnsigned("slide-lift-speed-steps-per-second", value,
-                     next.slide_lift_speed_steps_per_second, true)) {
-      sendErrorJson(400, "malformed slide-lift-speed-steps-per-second");
-      return;
-    }
-    next.slide_lift_speed_steps_per_second = value;
-  }
-  if (g_server.hasArg("slide-lift-timeout-ms")) {
-    if (!argUnsigned("slide-lift-timeout-ms", value,
-                     next.slide_lift_timeout_ms, true)) {
-      sendErrorJson(400, "malformed slide-lift-timeout-ms");
-      return;
-    }
-    next.slide_lift_timeout_ms = value;
-  }
-  if (g_server.hasArg("post-pickup-reverse-duty") &&
-      !argFloat("post-pickup-reverse-duty", post_pickup_reverse_duty,
-                next.post_pickup_reverse_duty, true)) {
-    sendErrorJson(400, "malformed post-pickup-reverse-duty");
-    return;
-  }
-  next.post_pickup_reverse_duty = post_pickup_reverse_duty;
-  if (g_server.hasArg("post-pickup-reverse-duration-ms")) {
-    if (!argUnsigned("post-pickup-reverse-duration-ms", value,
-                     next.post_pickup_reverse_duration_ms, true)) {
-      sendErrorJson(400, "malformed post-pickup-reverse-duration-ms");
-      return;
-    }
-    next.post_pickup_reverse_duration_ms = value;
-  }
-  if (g_server.hasArg("return-strafe-duty") &&
-      !argFloat("return-strafe-duty", return_strafe_duty,
-                next.return_strafe_duty, true)) {
-    sendErrorJson(400, "malformed return-strafe-duty");
-    return;
-  }
-  next.return_strafe_duty = return_strafe_duty;
-  if (g_server.hasArg("return-line-timeout-ms")) {
-    if (!argUnsigned("return-line-timeout-ms", value,
-                     next.return_line_timeout_ms, true)) {
-      sendErrorJson(400, "malformed return-line-timeout-ms");
-      return;
-    }
-    next.return_line_timeout_ms = value;
-  }
 
   robot::LineFollowerConfig line_config = context.config;
   line_config.baseDuty = next.line_follow_duty;
-  if (g_runtime.stepper == nullptr ||
-      g_runtime.stepper->maximumPositionSteps() <= 0 ||
-      g_runtime.stepper->maximumPositionSteps() >
-          static_cast<std::int64_t>(UINT32_MAX) ||
-      !robot::habitatPiecesConfigValid(
-          next, activeMotionDutyCap(context), kMaxTimedTestDurationMs,
-          g_runtime.stepper->maximumSpeedStepsPerSecond(),
-          static_cast<std::uint32_t>(
-              g_runtime.stepper->maximumPositionSteps())) ||
+  if (!robot::habitatPiecesConfigValid(next,
+                                       activeMotionDutyCap(context),
+                                       kMaxTimedTestDurationMs) ||
       !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
            .accepted) {
     sendErrorJson(
         409,
-        "Habitat Pieces requires every duty, duration, timeout, distance, count, and slide setting; LEFT/RIGHT initial direction; duties within the active cap; time bounds no greater than 30000 ms; and slide values within hardware limits");
+        "Habitat Pieces requires safe line-follow, reverse, and distance-strafe settings; LEFT/RIGHT direction; nonzero threshold/count/timeouts; and a distance-strafe timeout no greater than 30000 ms");
     return;
   }
 
@@ -13308,40 +12640,6 @@ void handleConfigSave() {
   g_runtime.preferences->putUInt(
       "hpdstmo",
       context.habitat_pieces_config.distance_strafe_timeout_ms);
-  g_runtime.preferences->putFloat(
-      "hpcmpd",
-      context.habitat_pieces_config.compensation_strafe_duty);
-  g_runtime.preferences->putUInt(
-      "hpcmpms",
-      context.habitat_pieces_config.compensation_strafe_duration_ms);
-  g_runtime.preferences->putUInt(
-      "hpkdnspd",
-      context.habitat_pieces_config.slide_down_speed_steps_per_second);
-  g_runtime.preferences->putUInt(
-      "hpkdntmo", context.habitat_pieces_config.slide_down_timeout_ms);
-  g_runtime.preferences->putFloat(
-      "hpkfwdd", context.habitat_pieces_config.forward_to_distance_duty);
-  g_runtime.preferences->putUInt(
-      "hpkfwdmm", context.habitat_pieces_config.forward_stop_distance_mm);
-  g_runtime.preferences->putUInt(
-      "hpkfwdtmo",
-      context.habitat_pieces_config.forward_to_distance_timeout_ms);
-  g_runtime.preferences->putUInt(
-      "hpklftstp", context.habitat_pieces_config.slide_lift_steps);
-  g_runtime.preferences->putUInt(
-      "hpklftspd",
-      context.habitat_pieces_config.slide_lift_speed_steps_per_second);
-  g_runtime.preferences->putUInt(
-      "hpklfttmo", context.habitat_pieces_config.slide_lift_timeout_ms);
-  g_runtime.preferences->putFloat(
-      "hpkrevd", context.habitat_pieces_config.post_pickup_reverse_duty);
-  g_runtime.preferences->putUInt(
-      "hpkrevms",
-      context.habitat_pieces_config.post_pickup_reverse_duration_ms);
-  g_runtime.preferences->putFloat(
-      "hpkretd", context.habitat_pieces_config.return_strafe_duty);
-  g_runtime.preferences->putUInt(
-      "hpkrettmo", context.habitat_pieces_config.return_line_timeout_ms);
   const robot::HabitatPlacementConfig& placement =
       context.habitat_placement_config;
   g_runtime.preferences->putFloat("hprlduty", placement.reverse_line_follow_duty);
@@ -14328,9 +13626,7 @@ void processCommand(RuntimeContext& context, char* line,
         distance_strafe_direction =
             robot::HabitatPiecesStrafeDirection::Right;
       }
-      // The compact serial command retains the pickup-extension settings;
-      // use the web form/API to adjust the full route configuration.
-      robot::HabitatPiecesConfig next = context.habitat_pieces_config;
+      robot::HabitatPiecesConfig next{};
       next.line_follow_duty = duty;
       next.lss2_detection_delay_ms = lss2_detection_delay_ms;
       next.run_timeout_ms = run_timeout_ms;
@@ -14350,16 +13646,9 @@ void processCommand(RuntimeContext& context, char* line,
           distance_strafe_timeout_ms;
       robot::LineFollowerConfig line_config = context.config;
       line_config.baseDuty = duty;
-      if (g_runtime.stepper == nullptr ||
-          g_runtime.stepper->maximumPositionSteps() <= 0 ||
-          g_runtime.stepper->maximumPositionSteps() >
-              static_cast<std::int64_t>(UINT32_MAX) ||
-          !robot::habitatPiecesConfigValid(
+      if (!robot::habitatPiecesConfigValid(
               next, activeMotionDutyCap(context),
-              kMaxTimedTestDurationMs,
-              g_runtime.stepper->maximumSpeedStepsPerSecond(),
-              static_cast<std::uint32_t>(
-                  g_runtime.stepper->maximumPositionSteps())) ||
+              kMaxTimedTestDurationMs) ||
           distance_threshold_mm > UINT16_MAX ||
           distance_zone_count > UINT16_MAX ||
           !robot::validateLineFollowerConfig(line_config, hardwareDutyCap())
@@ -14367,12 +13656,14 @@ void processCommand(RuntimeContext& context, char* line,
         printRejected("Habitat Pieces config is outside safe limits");
         return;
       }
-      if (context.habitat_pieces.state !=
-              robot::HabitatPiecesState::WaitForStart &&
-          context.habitat_pieces.state !=
-              robot::HabitatPiecesState::Complete &&
-          context.habitat_pieces.state !=
-              robot::HabitatPiecesState::Fault) {
+      if (context.habitat_pieces.state ==
+              robot::HabitatPiecesState::LineFollowing ||
+          context.habitat_pieces.state ==
+              robot::HabitatPiecesState::SideLineAligning ||
+          context.habitat_pieces.state ==
+              robot::HabitatPiecesState::Reversing ||
+          context.habitat_pieces.state ==
+              robot::HabitatPiecesState::DistanceStrafing) {
         printRejected("stop Habitat Pieces before changing config");
         return;
       }
@@ -14968,65 +14259,6 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       preferences.getUInt(
           "hpdstmo",
           context.habitat_pieces_config.distance_strafe_timeout_ms);
-  context.habitat_pieces_config.compensation_strafe_duty =
-      preferences.getFloat(
-          "hpcmpd",
-          context.habitat_pieces_config.compensation_strafe_duty);
-  context.habitat_pieces_config.compensation_strafe_duration_ms =
-      preferences.getUInt(
-          "hpcmpms",
-          context.habitat_pieces_config.compensation_strafe_duration_ms);
-  context.habitat_pieces_config.slide_down_speed_steps_per_second =
-      preferences.getUInt(
-          "hpkdnspd",
-          context.habitat_pieces_config.slide_down_speed_steps_per_second);
-  context.habitat_pieces_config.slide_down_timeout_ms =
-      preferences.getUInt(
-          "hpkdntmo",
-          context.habitat_pieces_config.slide_down_timeout_ms);
-  context.habitat_pieces_config.forward_to_distance_duty =
-      preferences.getFloat(
-          "hpkfwdd",
-          context.habitat_pieces_config.forward_to_distance_duty);
-  const std::uint32_t habitat_forward_stop_distance_mm =
-      preferences.getUInt(
-          "hpkfwdmm",
-          context.habitat_pieces_config.forward_stop_distance_mm);
-  context.habitat_pieces_config.forward_stop_distance_mm =
-      habitat_forward_stop_distance_mm <= UINT16_MAX
-          ? static_cast<std::uint16_t>(
-                habitat_forward_stop_distance_mm)
-          : 0U;
-  context.habitat_pieces_config.forward_to_distance_timeout_ms =
-      preferences.getUInt(
-          "hpkfwdtmo",
-          context.habitat_pieces_config.forward_to_distance_timeout_ms);
-  context.habitat_pieces_config.slide_lift_steps =
-      preferences.getUInt(
-          "hpklftstp", context.habitat_pieces_config.slide_lift_steps);
-  context.habitat_pieces_config.slide_lift_speed_steps_per_second =
-      preferences.getUInt(
-          "hpklftspd",
-          context.habitat_pieces_config.slide_lift_speed_steps_per_second);
-  context.habitat_pieces_config.slide_lift_timeout_ms =
-      preferences.getUInt(
-          "hpklfttmo",
-          context.habitat_pieces_config.slide_lift_timeout_ms);
-  context.habitat_pieces_config.post_pickup_reverse_duty =
-      preferences.getFloat(
-          "hpkrevd",
-          context.habitat_pieces_config.post_pickup_reverse_duty);
-  context.habitat_pieces_config.post_pickup_reverse_duration_ms =
-      preferences.getUInt(
-          "hpkrevms",
-          context.habitat_pieces_config.post_pickup_reverse_duration_ms);
-  context.habitat_pieces_config.return_strafe_duty =
-      preferences.getFloat(
-          "hpkretd", context.habitat_pieces_config.return_strafe_duty);
-  context.habitat_pieces_config.return_line_timeout_ms =
-      preferences.getUInt(
-          "hpkrettmo",
-          context.habitat_pieces_config.return_line_timeout_ms);
   robot::HabitatPlacementConfig& placement =
       context.habitat_placement_config;
   placement.reverse_line_follow_duty = preferences.getFloat(
@@ -15834,7 +15066,7 @@ void motionControlTask(void* parameters) {
                             front_right_motor, rear_link, now_ms);
     } else if (mode == robot::RobotTestMode::HabitatPieces) {
       runHabitatPieces(context, line_sensor_reader, front_left_motor,
-                       front_right_motor, rear_link, stepper, now_ms);
+                       front_right_motor, rear_link, now_ms);
     } else if (mode == robot::RobotTestMode::HabitatPlacement) {
       runHabitatPlacement(context, line_sensor_reader, front_left_motor,
                           front_right_motor, rear_link, claws, stepper,

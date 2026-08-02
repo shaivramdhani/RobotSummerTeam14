@@ -32,10 +32,7 @@ Native tests cover pure, hardware-independent logic:
   detection arming, black-line transition, timed reverse duty/duration,
   adjustable search timeout, distinct above-threshold laser-zone counting,
   repeated/invalid measurement rejection, left/right strafe mixing, strafe
-  timeout, opposite compensation direction, bottom-limit slide transition,
-  forward threshold behavior with no/repeated readings, concurrent slide lift
-  with reverse/return motion, either rear sensor ending the return strafe,
-  lift-wait completion, and terminal timeout/fault stops.
+  timeout, and terminal stop behavior.
 - Mission transition logic after transitions are defined.
 
 Native tests must not include Arduino, GPIO, PWM, UART peripherals, or motor

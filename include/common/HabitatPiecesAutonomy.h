@@ -17,12 +17,6 @@ enum class HabitatPiecesState : std::uint8_t {
   Fault = 4,
   SideLineAligning = 5,
   DistanceStrafing = 6,
-  CompensationStrafing = 7,
-  LoweringSlide = 8,
-  ForwardToDistance = 9,
-  PostPickupReversing = 10,
-  ReturnLineStrafing = 11,
-  WaitForSlideLift = 12,
 };
 
 enum class HabitatPiecesStopReason : std::uint8_t {
@@ -36,15 +30,6 @@ enum class HabitatPiecesStopReason : std::uint8_t {
   RearCommandFailed = 7,
   DistanceZoneCountReached = 8,
   DistanceStrafeTimeout = 9,
-  SlideDownTimeout = 10,
-  SlideCommandFailed = 11,
-  ForwardDistanceTimeout = 12,
-  SlideLiftTimeout = 13,
-  RearLineDataStale = 14,
-  RearLineSensorsUnavailable = 15,
-  ReturnLineTimeout = 16,
-  ReturnLineDetected = 17,
-  ConflictingSlideLimits = 18,
 };
 
 enum class HabitatPiecesStrafeDirection : std::int8_t {
@@ -65,40 +50,12 @@ struct HabitatPiecesConfig {
   std::uint16_t distance_zone_target_count{0U};
   float distance_strafe_duty{0.0F};
   Milliseconds distance_strafe_timeout_ms{0U};
-  float compensation_strafe_duty{0.0F};
-  Milliseconds compensation_strafe_duration_ms{0U};
-  std::uint32_t slide_down_speed_steps_per_second{0U};
-  Milliseconds slide_down_timeout_ms{0U};
-  float forward_to_distance_duty{0.0F};
-  std::uint16_t forward_stop_distance_mm{0U};
-  Milliseconds forward_to_distance_timeout_ms{0U};
-  std::uint32_t slide_lift_steps{0U};
-  std::uint32_t slide_lift_speed_steps_per_second{0U};
-  Milliseconds slide_lift_timeout_ms{0U};
-  float post_pickup_reverse_duty{0.0F};
-  Milliseconds post_pickup_reverse_duration_ms{0U};
-  float return_strafe_duty{0.0F};
-  Milliseconds return_line_timeout_ms{0U};
 };
 
 struct HabitatPiecesDistanceSample {
   bool available{false};
   std::uint16_t distance_mm{0U};
   std::uint16_t measurement_sequence{0U};
-};
-
-struct HabitatPiecesInputs {
-  bool lss2_black{false};
-  bool lss3_black{false};
-  HabitatPiecesDistanceSample distance_sample{};
-  bool slide_bottom_limit_active{false};
-  bool slide_bottom_ready{false};
-  bool slide_top_limit_active{false};
-  bool slide_down_failed{false};
-  bool slide_lift_complete{false};
-  bool slide_lift_failed{false};
-  bool rear_left_black{false};
-  bool rear_right_black{false};
 };
 
 struct HabitatPiecesAutonomy {
@@ -110,13 +67,6 @@ struct HabitatPiecesAutonomy {
   Milliseconds run_elapsed_ms{0U};
   Milliseconds reverse_elapsed_ms{0U};
   Milliseconds distance_strafe_elapsed_ms{0U};
-  Milliseconds compensation_strafe_elapsed_ms{0U};
-  Milliseconds slide_down_elapsed_ms{0U};
-  Milliseconds forward_to_distance_elapsed_ms{0U};
-  Milliseconds slide_lift_started_at_ms{0U};
-  Milliseconds slide_lift_elapsed_ms{0U};
-  Milliseconds post_pickup_reverse_elapsed_ms{0U};
-  Milliseconds return_strafe_elapsed_ms{0U};
   // The existing delay now arms both LSS2 and LSS3 together.
   bool lss2_detection_armed{false};
   bool lss2_latched{false};
@@ -127,9 +77,6 @@ struct HabitatPiecesAutonomy {
   bool distance_sequence_initialized{false};
   bool distance_measurement_available{false};
   bool distance_zone_active{false};
-  bool slide_lift_started{false};
-  bool slide_lift_complete{false};
-  bool rear_line_detected{false};
   bool timed_out{false};
 };
 
@@ -144,14 +91,6 @@ struct HabitatPiecesUpdate {
   bool should_drive_right_side{false};
   bool should_reverse{false};
   bool should_distance_strafe{false};
-  bool should_compensation_strafe{false};
-  bool should_start_slide_down{false};
-  bool should_lower_slide{false};
-  bool should_drive_forward_to_distance{false};
-  bool should_start_slide_lift{false};
-  bool should_post_pickup_reverse{false};
-  bool should_return_line_strafe{false};
-  bool should_wait_for_slide_lift{false};
   bool lss2_detection_armed{false};
   bool lss2_black{false};
   bool lss3_black{false};
@@ -165,13 +104,6 @@ struct HabitatPiecesUpdate {
   bool distance_zone_entered{false};
   std::uint16_t distance_mm{0U};
   std::uint16_t distance_zone_count{0U};
-  bool forward_distance_reached{false};
-  bool slide_bottom_ready{false};
-  bool slide_lift_started{false};
-  bool slide_lift_complete{false};
-  bool rear_left_black{false};
-  bool rear_right_black{false};
-  bool rear_line_detected{false};
   bool target_reached{false};
   bool transitioned{false};
 };
@@ -182,9 +114,7 @@ const char* habitatPiecesStrafeDirectionName(
     HabitatPiecesStrafeDirection direction);
 bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
                               float maximum_duty,
-                              Milliseconds maximum_duration_ms,
-                              std::uint32_t maximum_stepper_speed_steps_per_second,
-                              std::uint32_t maximum_slide_position_steps);
+                              Milliseconds maximum_distance_strafe_timeout_ms);
 void resetHabitatPiecesAutonomy(HabitatPiecesAutonomy& autonomy,
                                 Milliseconds now_ms);
 void startHabitatPiecesAutonomy(HabitatPiecesAutonomy& autonomy,
@@ -192,9 +122,6 @@ void startHabitatPiecesAutonomy(HabitatPiecesAutonomy& autonomy,
 void failHabitatPiecesAutonomy(HabitatPiecesAutonomy& autonomy,
                                HabitatPiecesStopReason reason,
                                Milliseconds now_ms);
-HabitatPiecesUpdate updateHabitatPiecesAutonomy(
-    HabitatPiecesAutonomy& autonomy, const HabitatPiecesConfig& config,
-    const HabitatPiecesInputs& inputs, Milliseconds now_ms);
 HabitatPiecesUpdate updateHabitatPiecesAutonomy(
     HabitatPiecesAutonomy& autonomy, const HabitatPiecesConfig& config,
     bool lss2_black, bool lss3_black, Milliseconds now_ms,
@@ -206,7 +133,5 @@ FourWheelCommand makeHabitatPiecesSideAlignmentCommand(
 FourWheelCommand makeHabitatPiecesDistanceStrafeCommand(
     HabitatPiecesStrafeDirection direction, float duty,
     Milliseconds now_ms, Milliseconds command_timeout_ms);
-HabitatPiecesStrafeDirection oppositeHabitatPiecesStrafeDirection(
-    HabitatPiecesStrafeDirection direction);
 
 }  // namespace robot

@@ -68,20 +68,13 @@ at configured duty while consuming only valid, fresh, high-accuracy laser
 measurements with a new measurement sequence. A rising entry above
 `distance_threshold_mm` increments the gap count; consecutive above-threshold
 samples count once, and an at-or-below sample rearms the next entry. Reaching
-`distance_zone_target_count` starts a timed opposite-direction compensation
-strafe, while
+`distance_zone_target_count` latches stop, while
 `distance_strafe_timeout_ms` bounds the motion even if no valid reading arrives.
-The route then lowers the ESP2-owned slide to its bottom limit and drives
-forward until a new valid high-accuracy measurement reaches the pickup
-threshold. The nonblocking relative slide lift runs concurrently with the
-following timed reverse and opposite return strafe. Either ESP1-owned rear line
-sensor stops the return strafe; route completion waits for the lift if needed.
 `run_timeout_ms` bounds both line search and side alignment and must be longer
 than the detection delay. Both sensor configurations and snapshot freshness
-are required until both latch, and the rear-line packet must be fresh during
-the return strafe. Every added open-loop/search action has an explicit bound
-and uses the normal motor/link command-expiry gates. Mission-state integration
-and automatic placement handoff remain separate future work.
+are required until both latch. The reverse remains bounded by its own duration
+and the normal motor/link command-expiry gates. Mission-state integration is
+still separate future work.
 
 The VL53L0X continues operating in its globally selected high-accuracy profile.
 It is not a start gate and missing/invalid readings do not immediately block or
