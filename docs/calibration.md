@@ -14,10 +14,16 @@ calibration values.
 - `LSBL` threshold: TODO
 - `LSBR` threshold: TODO
 - Rear/side active levels or ADC ranges: TODO
-- Habitat Pieces shared LSS2/LSS3 detection delay, overall search/alignment
-  timeout, line-follow/alignment duty, reverse duty/duration, distance-strafe
-  left/right direction, distance threshold, target zone count, strafe duty, and
-  strafe timeout: TODO; set only after raised-wheel and field-path testing.
+- Habitat Pieces LSS2 detection delay, overall LSS2 search timeout,
+  line-follow duty, reverse duty/duration, distance-strafe left/right direction,
+  distance threshold, target zone count, strafe duty, and strafe timeout: TODO;
+  set only after raised-wheel and field-path testing. Distance strafing also
+  requires calibrated shared IMU heading-hold tuning.
+- Habitat Pieces slide-down speed/timeout, final approach distance threshold,
+  approach duty/timeout, lift steps/speed/timeout/start delay, post-pickup reverse
+  duty/duration, and opposite-direction rear-line strafe timeout: TODO. Verify
+  the bottom switch, step-counted lift distance, both rear sensors, and the
+  automatic Habitat Placement handoff with wheels raised first.
 
 ## IR Beacon
 

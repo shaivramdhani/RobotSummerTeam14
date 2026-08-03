@@ -604,11 +604,11 @@ void test_valid_rear_command_is_accepted() {
   TEST_ASSERT_EQUAL_INT16(-456,
                           receiver.backRightCommand(120U).duty_command_milli);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::LaserDistanceProfile::HighAccuracy),
+      static_cast<std::uint8_t>(robot::LaserDistanceProfile::Default),
       static_cast<std::uint8_t>(receiver.laserProfile(120U)));
 }
 
-void test_rear_command_keeps_high_accuracy_when_stale() {
+void test_rear_command_reverts_to_default_profile_when_stale() {
   robot::RearDriveCommandReceiver receiver{};
   robot::RearDriveCommand command{};
   command.sender_timestamp_ms = 100U;
@@ -622,7 +622,7 @@ void test_rear_command_keeps_high_accuracy_when_stale() {
       static_cast<std::uint8_t>(robot::LaserDistanceProfile::HighAccuracy),
       static_cast<std::uint8_t>(receiver.laserProfile(150U)));
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::LaserDistanceProfile::HighAccuracy),
+      static_cast<std::uint8_t>(robot::LaserDistanceProfile::Default),
       static_cast<std::uint8_t>(receiver.laserProfile(151U)));
 }
 
@@ -3107,7 +3107,7 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.solar_limit_front_right_hit = false;
   snapshot.solar_limit_all_hit = false;
   snapshot.habitat_pieces_state =
-      robot::HabitatPiecesState::SideLineAligning;
+      robot::HabitatPiecesState::DistanceStrafing;
   snapshot.habitat_pieces_stop_reason =
       robot::HabitatPiecesStopReason::None;
   snapshot.habitat_pieces_time_in_state_ms = 345U;
@@ -3129,8 +3129,26 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.habitat_pieces_distance_strafe_timeout_ms = 4000U;
   snapshot.habitat_pieces_distance_strafe_elapsed_ms = 900U;
   snapshot.habitat_pieces_distance_strafe_remaining_ms = 3100U;
-  snapshot.habitat_pieces_distance_mm = 425U;
+  snapshot.habitat_pieces_post_count_stop_delay_ms = 150U;
+  snapshot.habitat_pieces_post_count_stop_elapsed_ms = 50U;
+  snapshot.habitat_pieces_post_count_stop_remaining_ms = 100U;
+  snapshot.habitat_pieces_exit_strafe_pulse_ms = 100U;
+  snapshot.habitat_pieces_exit_strafe_pulse_elapsed_ms = 25U;
+  snapshot.habitat_pieces_exit_strafe_pulse_remaining_ms = 75U;
+  snapshot.habitat_pieces_slide_down_speed_steps_per_second = 200U;
+  snapshot.habitat_pieces_slide_down_timeout_ms = 1500U;
+  snapshot.habitat_pieces_approach_distance_threshold_mm = 120U;
+  snapshot.habitat_pieces_approach_forward_duty = 0.14F;
+  snapshot.habitat_pieces_lift_steps = 900U;
+  snapshot.habitat_pieces_lift_start_delay_ms = 250U;
+  snapshot.habitat_pieces_lift_start_delay_elapsed_ms = 175U;
+  snapshot.habitat_pieces_lift_start_waiting = true;
+  snapshot.habitat_pieces_lift_complete = true;
+  snapshot.habitat_pieces_rear_line_detected = true;
+  snapshot.habitat_pieces_distance_mm =
+      robot::kHabitatPiecesNoTargetDistanceMm;
   snapshot.habitat_pieces_distance_zone_count = 2U;
+  snapshot.habitat_pieces_distance_exit_pulse_count = 4U;
   snapshot.habitat_pieces_configuration_valid = true;
   snapshot.habitat_pieces_start_ready = true;
   snapshot.habitat_pieces_lss2_configured = true;
@@ -3145,15 +3163,20 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.habitat_pieces_should_stop = false;
   snapshot.habitat_pieces_target_reached = false;
   snapshot.habitat_pieces_line_following = false;
-  snapshot.habitat_pieces_side_line_aligning = true;
+  snapshot.habitat_pieces_side_line_aligning = false;
   snapshot.habitat_pieces_left_side_driving = false;
-  snapshot.habitat_pieces_right_side_driving = true;
+  snapshot.habitat_pieces_right_side_driving = false;
   snapshot.habitat_pieces_reversing = false;
   snapshot.habitat_pieces_distance_strafing = true;
+  snapshot.habitat_pieces_post_count_waiting = false;
+  snapshot.habitat_pieces_exit_strafe_pulsing = false;
+  snapshot.habitat_pieces_exit_distance_checking = false;
   snapshot.habitat_pieces_distance_measurement_available = true;
+  snapshot.habitat_pieces_distance_substituted_no_target = true;
   snapshot.habitat_pieces_distance_sample_new = true;
-  snapshot.habitat_pieces_distance_zone_active = true;
-  snapshot.habitat_pieces_distance_zone_entered = true;
+  snapshot.habitat_pieces_distance_zone_active = false;
+  snapshot.habitat_pieces_distance_zone_entered = false;
+  snapshot.habitat_pieces_distance_exit_above_threshold = false;
   snapshot.habitat_pieces_timed_out = false;
   snapshot.habitat_placement_initial_heading_captured = true;
   snapshot.habitat_placement_initial_heading_deg = 12.5F;
@@ -3290,9 +3313,10 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.solar_hook.commanded_angle_deg = 137;
   snapshot.solar_hook.commanded_open = true;
 
-  char output[20480]{};
+  char output[19456]{};
   TEST_ASSERT_TRUE(
       robot::writeTelemetryJson(snapshot, output, sizeof(output), false));
+  TEST_ASSERT_TRUE(std::strlen(output) + 512U < sizeof(output));
 
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"current_mode\":\"LINE_SENSOR_TEST\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"enabled\":false"));
@@ -3694,13 +3718,11 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"openAngleDeg\":137"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"closedAngleDeg\":42"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"commandedOpen\":true"));
-  TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"servo_winch_position\":145"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"habitat_pieces\""));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"profile\":\"HIGH_ACCURACY\""));
   TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"state\":\"SIDE_LINE_ALIGNING\""));
+      std::strstr(output, "\"state\":\"DISTANCE_STRAFING\""));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"line_follow_duty\":0.12000"));
   TEST_ASSERT_NOT_NULL(
@@ -3728,7 +3750,13 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"distance_strafe_timeout_ms\":4000"));
   TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"distance_mm\":425"));
+      std::strstr(output, "\"post_count_stop_delay_ms\":150"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"exit_strafe_pulse_ms\":100"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"distance_exit_pulse_count\":4"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"distance_mm\":65536"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"distance_zone_count\":2"));
   TEST_ASSERT_NOT_NULL(
@@ -3736,7 +3764,9 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"distance_measurement_available\":true"));
   TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"distance_zone_active\":true"));
+      std::strstr(output, "\"distance_substituted_no_target\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"distance_zone_active\":false"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"lss2_detection_armed\":true"));
   TEST_ASSERT_NOT_NULL(
@@ -3756,11 +3786,23 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"lss3_latched\":false"));
   TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"side_line_aligning\":true"));
+      std::strstr(output, "\"side_line_aligning\":false"));
   TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"right_side_driving\":true"));
+      std::strstr(output, "\"right_side_driving\":false"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"timed_out\":false"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"slide_down_speed_steps_per_second\":200"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"approach_distance_threshold_mm\":120"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"lift_steps\":900"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"lift_start_delay_ms\":250"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"lift_start_waiting\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"rear_line_detected\":true"));
 
   snapshot.lss_raw_level = 0;
   snapshot.lss_black = false;
@@ -4164,11 +4206,44 @@ void test_habitat_pieces_defaults_to_requested_duty_but_stays_locked() {
   config.distance_strafe_duty = 0.15F;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.distance_strafe_timeout_ms = 500U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.post_count_stop_delay_ms = 50U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.exit_strafe_pulse_ms = 100U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.slide_down_speed_steps_per_second = 200U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.slide_down_timeout_ms = 1000U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.approach_distance_threshold_mm = 120U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.approach_forward_duty = 0.15F;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.approach_timeout_ms = 1500U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.lift_steps = 1000U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.lift_speed_steps_per_second = 800U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.lift_timeout_ms = 3000U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.lift_start_delay_ms = 100U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.post_pickup_reverse_duty = 0.15F;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.post_pickup_reverse_duration_ms = 300U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.rear_line_reacquire_timeout_ms = 2000U;
   TEST_ASSERT_TRUE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.run_timeout_ms = config.lss2_detection_delay_ms;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.run_timeout_ms = 1000U;
   config.distance_strafe_timeout_ms = 30001U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.distance_strafe_timeout_ms = 500U;
+  config.exit_strafe_pulse_ms = 501U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.exit_strafe_pulse_ms = 450U;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
 
   robot::HabitatPiecesAutonomy autonomy{};
@@ -4181,7 +4256,7 @@ void test_habitat_pieces_defaults_to_requested_duty_but_stays_locked() {
       robot::habitatPiecesStateName(autonomy.state));
 }
 
-void test_habitat_pieces_ignores_both_side_sensors_until_detection_delay() {
+void test_habitat_pieces_ignores_lss2_until_detection_delay() {
   robot::HabitatPiecesConfig config{};
   config.lss2_detection_delay_ms = 100U;
   config.run_timeout_ms = 1000U;
@@ -4208,23 +4283,26 @@ void test_habitat_pieces_ignores_both_side_sensors_until_detection_delay() {
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, true, true, 200U);
   TEST_ASSERT_FALSE(update.should_line_follow);
-  TEST_ASSERT_FALSE(update.should_stop);
-  TEST_ASSERT_TRUE(update.should_reverse);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_FALSE(update.should_reverse);
   TEST_ASSERT_TRUE(update.lss2_detection_armed);
   TEST_ASSERT_TRUE(update.lss2_latched);
-  TEST_ASSERT_TRUE(update.lss3_latched);
+  TEST_ASSERT_FALSE(update.lss3_latched);
   TEST_ASSERT_FALSE(update.target_reached);
   TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
-          robot::HabitatPiecesStopReason::BothSideLinesDetected),
+          robot::HabitatPiecesStopReason::Lss2Detected),
       static_cast<std::uint8_t>(update.stop_reason));
+  TEST_ASSERT_EQUAL_STRING(
+      "LSS2_DETECTED",
+      robot::habitatPiecesStopReasonName(update.stop_reason));
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(robot::HabitatPiecesState::Reversing),
       static_cast<std::uint8_t>(update.state));
 }
 
-void test_habitat_pieces_latches_left_then_right_before_reversing() {
+void test_habitat_pieces_lss2_stops_without_waiting_for_lss3() {
   robot::HabitatPiecesConfig config{};
   config.lss2_detection_delay_ms = 100U;
   config.run_timeout_ms = 1000U;
@@ -4243,48 +4321,32 @@ void test_habitat_pieces_latches_left_then_right_before_reversing() {
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, true, false, 250U);
   TEST_ASSERT_FALSE(update.should_line_follow);
-  TEST_ASSERT_FALSE(update.should_stop);
-  TEST_ASSERT_TRUE(update.should_align_side_lines);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_FALSE(update.should_reverse);
+  TEST_ASSERT_FALSE(update.should_align_side_lines);
   TEST_ASSERT_FALSE(update.should_drive_left_side);
-  TEST_ASSERT_TRUE(update.should_drive_right_side);
+  TEST_ASSERT_FALSE(update.should_drive_right_side);
   TEST_ASSERT_TRUE(update.lss2_latched);
   TEST_ASSERT_FALSE(update.lss3_latched);
   TEST_ASSERT_FALSE(update.target_reached);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
-          robot::HabitatPiecesState::SideLineAligning),
+          robot::HabitatPiecesState::Reversing),
       static_cast<std::uint8_t>(update.state));
 
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 275U);
-  TEST_ASSERT_TRUE(update.should_align_side_lines);
-  TEST_ASSERT_FALSE(update.should_drive_left_side);
-  TEST_ASSERT_TRUE(update.should_drive_right_side);
-  TEST_ASSERT_TRUE(update.lss2_latched);
-
-  update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, true, 300U);
-  TEST_ASSERT_FALSE(update.should_align_side_lines);
+      autonomy, config, false, true, 349U);
   TEST_ASSERT_TRUE(update.should_reverse);
   TEST_ASSERT_TRUE(update.lss2_latched);
-  TEST_ASSERT_TRUE(update.lss3_latched);
+  TEST_ASSERT_FALSE(update.lss3_latched);
   TEST_ASSERT_FALSE(update.target_reached);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(robot::HabitatPiecesState::Reversing),
       static_cast<std::uint8_t>(update.state));
-
-  update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 399U);
-  TEST_ASSERT_FALSE(update.should_line_follow);
-  TEST_ASSERT_FALSE(update.should_stop);
-  TEST_ASSERT_TRUE(update.should_reverse);
   TEST_ASSERT_EQUAL_UINT32(99U, autonomy.reverse_elapsed_ms);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::Reversing),
-      static_cast<std::uint8_t>(update.state));
 
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 400U);
+      autonomy, config, false, true, 350U);
   TEST_ASSERT_FALSE(update.should_line_follow);
   TEST_ASSERT_FALSE(update.should_reverse);
   TEST_ASSERT_FALSE(update.should_stop);
@@ -4298,7 +4360,7 @@ void test_habitat_pieces_latches_left_then_right_before_reversing() {
       static_cast<std::uint8_t>(update.state));
 }
 
-void test_habitat_pieces_right_sensor_stops_right_wheels_first() {
+void test_habitat_pieces_lss3_is_telemetry_only() {
   robot::HabitatPiecesConfig config{};
   config.lss2_detection_delay_ms = 10U;
   config.run_timeout_ms = 1000U;
@@ -4310,37 +4372,16 @@ void test_habitat_pieces_right_sensor_stops_right_wheels_first() {
   const robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
           autonomy, config, false, true, 110U);
-  TEST_ASSERT_TRUE(update.should_align_side_lines);
-  TEST_ASSERT_TRUE(update.should_drive_left_side);
+  TEST_ASSERT_TRUE(update.should_line_follow);
+  TEST_ASSERT_FALSE(update.should_align_side_lines);
+  TEST_ASSERT_FALSE(update.should_reverse);
+  TEST_ASSERT_FALSE(update.should_drive_left_side);
   TEST_ASSERT_FALSE(update.should_drive_right_side);
   TEST_ASSERT_FALSE(update.lss2_latched);
-  TEST_ASSERT_TRUE(update.lss3_latched);
+  TEST_ASSERT_FALSE(update.lss3_latched);
 }
 
-void test_habitat_pieces_side_alignment_maps_sensors_to_wheel_sides() {
-  robot::FourWheelCommand command =
-      robot::makeHabitatPiecesSideAlignmentCommand(
-          0.2F, true, false, 100U, 250U);
-  TEST_ASSERT_FALSE(command.front_left.enabled);
-  TEST_ASSERT_FALSE(command.back_left.enabled);
-  TEST_ASSERT_TRUE(command.front_right.enabled);
-  TEST_ASSERT_TRUE(command.back_right.enabled);
-  TEST_ASSERT_EQUAL_INT16(200, command.front_right.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(200, command.back_right.duty_command_milli);
-  TEST_ASSERT_EQUAL_UINT32(350U, command.front_right.expires_at_ms);
-
-  command = robot::makeHabitatPiecesSideAlignmentCommand(
-      0.2F, false, true, 200U, 250U);
-  TEST_ASSERT_TRUE(command.front_left.enabled);
-  TEST_ASSERT_TRUE(command.back_left.enabled);
-  TEST_ASSERT_FALSE(command.front_right.enabled);
-  TEST_ASSERT_FALSE(command.back_right.enabled);
-  TEST_ASSERT_EQUAL_INT16(200, command.front_left.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(200, command.back_left.duty_command_milli);
-  TEST_ASSERT_EQUAL_UINT32(450U, command.front_left.expires_at_ms);
-}
-
-void test_habitat_pieces_times_out_while_waiting_for_second_side_line() {
+void test_habitat_pieces_times_out_while_waiting_for_lss2() {
   robot::HabitatPiecesConfig config{};
   config.lss2_detection_delay_ms = 10U;
   config.run_timeout_ms = 50U;
@@ -4351,10 +4392,9 @@ void test_habitat_pieces_times_out_while_waiting_for_second_side_line() {
 
   robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
-          autonomy, config, true, false, 149U);
-  TEST_ASSERT_TRUE(update.should_align_side_lines);
-  TEST_ASSERT_FALSE(update.should_drive_left_side);
-  TEST_ASSERT_TRUE(update.should_drive_right_side);
+          autonomy, config, false, true, 149U);
+  TEST_ASSERT_TRUE(update.should_line_follow);
+  TEST_ASSERT_FALSE(update.should_align_side_lines);
   TEST_ASSERT_TRUE(update.lss2_detection_armed);
   TEST_ASSERT_FALSE(autonomy.timed_out);
   TEST_ASSERT_EQUAL_UINT32(49U, autonomy.run_elapsed_ms);
@@ -4383,16 +4423,19 @@ void test_habitat_pieces_distance_strafe_counts_distinct_zone_entries() {
   config.distance_zone_target_count = 2U;
   config.distance_strafe_duty = 0.2F;
   config.distance_strafe_timeout_ms = 500U;
+  config.post_count_stop_delay_ms = 50U;
+  config.exit_strafe_pulse_ms = 100U;
 
   robot::HabitatPiecesAutonomy autonomy{};
   autonomy.state = robot::HabitatPiecesState::DistanceStrafing;
   autonomy.stop_reason =
-      robot::HabitatPiecesStopReason::BothSideLinesDetected;
+      robot::HabitatPiecesStopReason::Lss2Detected;
   autonomy.state_entered_at_ms = 100U;
+  autonomy.distance_strafe_started_at_ms = 100U;
 
   robot::HabitatPiecesDistanceSample sample{};
   sample.available = true;
-  sample.distance_mm = 350U;
+  sample.distance_mm = 250U;
   sample.measurement_sequence = 10U;
   robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
@@ -4420,31 +4463,33 @@ void test_habitat_pieces_distance_strafe_counts_distinct_zone_entries() {
 
   sample.available = true;
   sample.measurement_sequence = 11U;
-  sample.distance_mm = 400U;
+  sample.distance_mm = 200U;
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, false, false, 140U, sample);
   TEST_ASSERT_FALSE(update.distance_zone_entered);
   TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
 
   sample.measurement_sequence = 12U;
-  sample.distance_mm = 300U;
+  sample.distance_mm = 301U;
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, false, false, 150U, sample);
   TEST_ASSERT_FALSE(update.distance_zone_active);
   TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
 
   sample.measurement_sequence = 13U;
-  sample.distance_mm = 301U;
+  sample.distance_mm = 300U;
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, false, false, 160U, sample);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_FALSE(update.should_distance_strafe);
   TEST_ASSERT_TRUE(update.distance_zone_entered);
   TEST_ASSERT_EQUAL_UINT16(2U, update.distance_zone_count);
-  TEST_ASSERT_TRUE(update.target_reached);
+  TEST_ASSERT_FALSE(update.target_reached);
+  TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
   TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::Complete),
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::PostCountStopDelay),
       static_cast<std::uint8_t>(update.state));
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
@@ -4464,6 +4509,7 @@ void test_habitat_pieces_distance_strafe_times_out_without_readings() {
   robot::HabitatPiecesAutonomy autonomy{};
   autonomy.state = robot::HabitatPiecesState::DistanceStrafing;
   autonomy.state_entered_at_ms = 100U;
+  autonomy.distance_strafe_started_at_ms = 100U;
 
   robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
@@ -4487,6 +4533,77 @@ void test_habitat_pieces_distance_strafe_times_out_without_readings() {
       static_cast<std::uint8_t>(update.stop_reason));
 }
 
+void test_habitat_pieces_no_target_substitution_is_always_above_threshold() {
+  TEST_ASSERT_TRUE(
+      robot::kHabitatPiecesNoTargetDistanceMm > UINT16_MAX);
+
+  robot::HabitatPiecesConfig config{};
+  config.distance_threshold_mm = UINT16_MAX;
+  config.distance_zone_target_count = 2U;
+  config.distance_strafe_timeout_ms = 500U;
+  config.post_count_stop_delay_ms = 50U;
+  config.exit_strafe_pulse_ms = 100U;
+
+  robot::HabitatPiecesAutonomy autonomy{};
+  autonomy.state = robot::HabitatPiecesState::DistanceStrafing;
+  autonomy.state_entered_at_ms = 100U;
+  autonomy.distance_strafe_started_at_ms = 100U;
+
+  robot::HabitatPiecesDistanceSample sample{};
+  sample.available = true;
+  sample.distance_mm = robot::kHabitatPiecesNoTargetDistanceMm;
+  sample.measurement_sequence = 10U;
+  sample.substituted_no_target = true;
+  robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 110U, sample);
+  TEST_ASSERT_TRUE(update.distance_measurement_available);
+  TEST_ASSERT_TRUE(update.distance_substituted_no_target);
+  TEST_ASSERT_FALSE(update.distance_zone_entered);
+  TEST_ASSERT_FALSE(update.distance_zone_active);
+  TEST_ASSERT_EQUAL_UINT16(0U, update.distance_zone_count);
+  TEST_ASSERT_TRUE(update.should_distance_strafe);
+
+  sample.measurement_sequence = 11U;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 120U, sample);
+  TEST_ASSERT_FALSE(update.distance_zone_entered);
+  TEST_ASSERT_EQUAL_UINT16(0U, update.distance_zone_count);
+
+  sample.measurement_sequence = 12U;
+  sample.distance_mm = UINT16_MAX;
+  sample.substituted_no_target = false;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 130U, sample);
+  TEST_ASSERT_TRUE(update.distance_zone_entered);
+  TEST_ASSERT_TRUE(update.distance_zone_active);
+  TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
+
+  sample.measurement_sequence = 13U;
+  sample.distance_mm = robot::kHabitatPiecesNoTargetDistanceMm;
+  sample.substituted_no_target = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 140U, sample);
+  TEST_ASSERT_TRUE(update.distance_substituted_no_target);
+  TEST_ASSERT_FALSE(update.distance_zone_entered);
+  TEST_ASSERT_FALSE(update.distance_zone_active);
+  TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
+
+  sample.measurement_sequence = 14U;
+  sample.distance_mm = UINT16_MAX;
+  sample.substituted_no_target = false;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 150U, sample);
+  TEST_ASSERT_TRUE(update.distance_zone_entered);
+  TEST_ASSERT_EQUAL_UINT16(2U, update.distance_zone_count);
+  TEST_ASSERT_FALSE(update.target_reached);
+  TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::PostCountStopDelay),
+      static_cast<std::uint8_t>(update.state));
+}
+
 void test_habitat_pieces_distance_strafe_ignores_pre_step_sample() {
   robot::HabitatPiecesConfig config{};
   config.reverse_duration_ms = 100U;
@@ -4496,16 +4613,18 @@ void test_habitat_pieces_distance_strafe_ignores_pre_step_sample() {
   config.distance_zone_target_count = 1U;
   config.distance_strafe_duty = 0.2F;
   config.distance_strafe_timeout_ms = 500U;
+  config.post_count_stop_delay_ms = 50U;
+  config.exit_strafe_pulse_ms = 100U;
 
   robot::HabitatPiecesAutonomy autonomy{};
   autonomy.state = robot::HabitatPiecesState::Reversing;
   autonomy.stop_reason =
-      robot::HabitatPiecesStopReason::BothSideLinesDetected;
+      robot::HabitatPiecesStopReason::Lss2Detected;
   autonomy.state_entered_at_ms = 100U;
 
   robot::HabitatPiecesDistanceSample sample{};
   sample.available = true;
-  sample.distance_mm = 350U;
+  sample.distance_mm = 250U;
   sample.measurement_sequence = 20U;
   robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
@@ -4523,53 +4642,263 @@ void test_habitat_pieces_distance_strafe_ignores_pre_step_sample() {
   sample.measurement_sequence = 21U;
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, false, false, 400U, sample);
-  TEST_ASSERT_TRUE(update.target_reached);
+  TEST_ASSERT_FALSE(update.target_reached);
+  TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
   TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::Complete),
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::PostCountStopDelay),
       static_cast<std::uint8_t>(update.state));
 }
 
-void test_habitat_pieces_distance_strafe_maps_left_and_right() {
-  robot::FourWheelCommand command =
-      robot::makeHabitatPiecesDistanceStrafeCommand(
-          robot::HabitatPiecesStrafeDirection::Left, 0.2F, 100U,
-          250U);
-  TEST_ASSERT_EQUAL_INT16(-200, command.front_left.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(200, command.front_right.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(200, command.back_left.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(-200, command.back_right.duty_command_milli);
-  TEST_ASSERT_EQUAL_UINT32(350U, command.front_left.expires_at_ms);
+void test_habitat_pieces_repeats_stopped_exit_pulses_until_above_threshold() {
+  robot::HabitatPiecesConfig config{};
+  config.distance_threshold_mm = 300U;
+  config.distance_zone_target_count = 2U;
+  config.distance_strafe_timeout_ms = 1000U;
+  config.post_count_stop_delay_ms = 50U;
+  config.exit_strafe_pulse_ms = 100U;
 
-  command = robot::makeHabitatPiecesDistanceStrafeCommand(
-      robot::HabitatPiecesStrafeDirection::Right, 0.2F, 200U,
-      250U);
-  TEST_ASSERT_EQUAL_INT16(200, command.front_left.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(-200, command.front_right.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(-200, command.back_left.duty_command_milli);
-  TEST_ASSERT_EQUAL_INT16(200, command.back_right.duty_command_milli);
-  TEST_ASSERT_EQUAL_UINT32(450U, command.front_left.expires_at_ms);
+  robot::HabitatPiecesAutonomy autonomy{};
+  autonomy.state = robot::HabitatPiecesState::PostCountStopDelay;
+  autonomy.stop_reason =
+      robot::HabitatPiecesStopReason::DistanceZoneCountReached;
+  autonomy.state_entered_at_ms = 100U;
+  autonomy.distance_strafe_started_at_ms = 100U;
+  autonomy.distance_zone_count = 2U;
 
-  command = robot::makeHabitatPiecesDistanceStrafeCommand(
-      robot::HabitatPiecesStrafeDirection::None, 0.2F, 200U, 250U);
-  TEST_ASSERT_FALSE(command.front_left.enabled);
-  TEST_ASSERT_FALSE(command.front_right.enabled);
-  TEST_ASSERT_FALSE(command.back_left.enabled);
-  TEST_ASSERT_FALSE(command.back_right.enabled);
-  command = robot::makeHabitatPiecesDistanceStrafeCommand(
-      static_cast<robot::HabitatPiecesStrafeDirection>(2), 0.2F,
-      200U, 250U);
-  TEST_ASSERT_FALSE(command.front_left.enabled);
-  TEST_ASSERT_FALSE(command.front_right.enabled);
-  TEST_ASSERT_FALSE(command.back_left.enabled);
-  TEST_ASSERT_FALSE(command.back_right.enabled);
+  robot::HabitatPiecesDistanceSample sample{};
+  sample.available = true;
+  sample.distance_mm = 250U;
+  sample.measurement_sequence = 10U;
+
+  robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 149U, sample);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
+  TEST_ASSERT_EQUAL_UINT32(49U, autonomy.post_count_stop_elapsed_ms);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 150U, sample);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_exit_strafe_pulse);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT16(1U, update.distance_exit_pulse_count);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::ExitStrafePulse),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 249U, sample);
+  TEST_ASSERT_TRUE(update.should_exit_strafe_pulse);
+  TEST_ASSERT_EQUAL_UINT32(99U, autonomy.exit_strafe_pulse_elapsed_ms);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 250U, sample);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_check_exit_distance);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::ExitDistanceCheck),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 259U, sample);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_check_exit_distance);
+  TEST_ASSERT_FALSE(update.distance_sample_new);
+
+  sample.measurement_sequence = 11U;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 260U, sample);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_exit_strafe_pulse);
+  TEST_ASSERT_TRUE(update.distance_sample_new);
+  TEST_ASSERT_FALSE(update.distance_exit_above_threshold);
+  TEST_ASSERT_EQUAL_UINT16(2U, update.distance_exit_pulse_count);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 360U, sample);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_check_exit_distance);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::ExitDistanceCheck),
+      static_cast<std::uint8_t>(update.state));
+
+  sample.measurement_sequence = 12U;
+  sample.distance_mm = robot::kHabitatPiecesNoTargetDistanceMm;
+  sample.substituted_no_target = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 370U, sample);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_FALSE(update.target_reached);
+  TEST_ASSERT_TRUE(update.distance_exit_above_threshold);
+  TEST_ASSERT_FALSE(update.distance_zone_active);
+  TEST_ASSERT_TRUE(update.distance_substituted_no_target);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::LowerSlide),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesStopReason::DistanceExitReached),
+      static_cast<std::uint8_t>(update.stop_reason));
   TEST_ASSERT_EQUAL_STRING(
-      "DISTANCE_STRAFING",
-      robot::habitatPiecesStateName(
-          robot::HabitatPiecesState::DistanceStrafing));
-  TEST_ASSERT_EQUAL_STRING(
-      "LEFT", robot::habitatPiecesStrafeDirectionName(
-                  robot::HabitatPiecesStrafeDirection::Left));
+      "DISTANCE_EXIT_REACHED",
+      robot::habitatPiecesStopReasonName(update.stop_reason));
+}
+
+void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
+  robot::HabitatPiecesConfig config{};
+  config.slide_down_timeout_ms = 500U;
+  config.approach_distance_threshold_mm = 120U;
+  config.approach_timeout_ms = 500U;
+  config.lift_timeout_ms = 1000U;
+  config.lift_start_delay_ms = 100U;
+  config.post_pickup_reverse_duration_ms = 200U;
+  config.rear_line_reacquire_timeout_ms = 500U;
+
+  robot::HabitatPiecesAutonomy autonomy{};
+  autonomy.state = robot::HabitatPiecesState::LowerSlide;
+  autonomy.stop_reason = robot::HabitatPiecesStopReason::DistanceExitReached;
+  autonomy.state_entered_at_ms = 100U;
+
+  robot::HabitatPiecesMechanismInputs mechanisms{};
+  robot::HabitatPiecesDistanceSample sample{};
+  robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 109U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_lower_slide);
+
+  sample.available = true;
+  sample.distance_mm = 300U;
+  sample.measurement_sequence = 20U;
+  mechanisms.bottom_limit_active = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 110U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::ApproachPiece),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 120U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_drive_forward_to_piece);
+  TEST_ASSERT_FALSE(update.distance_sample_new);
+
+  sample.measurement_sequence = 21U;
+  sample.distance_mm = robot::kHabitatPiecesNoTargetDistanceMm;
+  sample.substituted_no_target = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 130U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_drive_forward_to_piece);
+  TEST_ASSERT_FALSE(update.approach_distance_reached);
+
+  sample.measurement_sequence = 22U;
+  sample.distance_mm = 120U;
+  sample.substituted_no_target = false;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 140U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_start_lift);
+  TEST_ASSERT_TRUE(update.approach_distance_reached);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::LiftStartDelay),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 239U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_wait_after_lift_start);
+  TEST_ASSERT_FALSE(update.should_drive_back_after_pickup);
+  TEST_ASSERT_FALSE(update.lift_complete);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 240U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::ReverseAfterPickup),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 439U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_drive_back_after_pickup);
+  TEST_ASSERT_FALSE(update.lift_complete);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 440U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::RearLineReacquire),
+      static_cast<std::uint8_t>(update.state));
+
+  mechanisms.rear_line_available = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 450U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_reacquire_rear_line);
+
+  mechanisms.rear_left_black = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 460U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_wait_for_lift);
+  TEST_ASSERT_TRUE(update.rear_line_detected);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::WaitForLiftCompletion),
+      static_cast<std::uint8_t>(update.state));
+
+  mechanisms.lift_complete = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 470U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.target_reached);
+  TEST_ASSERT_TRUE(update.should_start_habitat_placement);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::Complete),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesStopReason::RearLineReached),
+      static_cast<std::uint8_t>(update.stop_reason));
+}
+
+void test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout() {
+  robot::HabitatPiecesConfig config{};
+  config.distance_strafe_timeout_ms = 200U;
+  config.post_count_stop_delay_ms = 50U;
+  config.exit_strafe_pulse_ms = 100U;
+
+  robot::HabitatPiecesAutonomy autonomy{};
+  autonomy.state = robot::HabitatPiecesState::ExitDistanceCheck;
+  autonomy.stop_reason =
+      robot::HabitatPiecesStopReason::DistanceZoneCountReached;
+  autonomy.state_entered_at_ms = 250U;
+  autonomy.distance_strafe_started_at_ms = 100U;
+
+  const robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 300U);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_TRUE(autonomy.timed_out);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesStopReason::DistanceStrafeTimeout),
+      static_cast<std::uint8_t>(update.stop_reason));
 }
 
 robot::HabitatPlacementConfig validHabitatPlacementConfig() {
@@ -4814,7 +5143,7 @@ int main() {
   RUN_TEST(test_open_loop_forward_uses_equal_positive_mecanum_signs);
   RUN_TEST(test_open_loop_clockwise_rotation_uses_mecanum_signs);
   RUN_TEST(test_valid_rear_command_is_accepted);
-  RUN_TEST(test_rear_command_keeps_high_accuracy_when_stale);
+  RUN_TEST(test_rear_command_reverts_to_default_profile_when_stale);
   RUN_TEST(test_corrupt_rear_packet_is_rejected);
   RUN_TEST(test_stale_rear_command_stops_motors);
   RUN_TEST(test_explicit_stop_packet_stops_motors);
@@ -4934,22 +5263,26 @@ int main() {
   RUN_TEST(test_habitat_distance_stop_age_handles_millisecond_wrap);
   RUN_TEST(test_habitat_pieces_defaults_to_requested_duty_but_stays_locked);
   RUN_TEST(
-      test_habitat_pieces_ignores_both_side_sensors_until_detection_delay);
+      test_habitat_pieces_ignores_lss2_until_detection_delay);
   RUN_TEST(
-      test_habitat_pieces_latches_left_then_right_before_reversing);
+      test_habitat_pieces_lss2_stops_without_waiting_for_lss3);
+  RUN_TEST(test_habitat_pieces_lss3_is_telemetry_only);
   RUN_TEST(
-      test_habitat_pieces_right_sensor_stops_right_wheels_first);
-  RUN_TEST(
-      test_habitat_pieces_side_alignment_maps_sensors_to_wheel_sides);
-  RUN_TEST(
-      test_habitat_pieces_times_out_while_waiting_for_second_side_line);
+      test_habitat_pieces_times_out_while_waiting_for_lss2);
   RUN_TEST(
       test_habitat_pieces_distance_strafe_counts_distinct_zone_entries);
   RUN_TEST(
       test_habitat_pieces_distance_strafe_times_out_without_readings);
   RUN_TEST(
+      test_habitat_pieces_no_target_substitution_is_always_above_threshold);
+  RUN_TEST(
       test_habitat_pieces_distance_strafe_ignores_pre_step_sample);
-  RUN_TEST(test_habitat_pieces_distance_strafe_maps_left_and_right);
+  RUN_TEST(
+      test_habitat_pieces_repeats_stopped_exit_pulses_until_above_threshold);
+  RUN_TEST(
+      test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off);
+  RUN_TEST(
+      test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout);
   RUN_TEST(test_habitat_placement_mode_parses_and_allows_motion);
   RUN_TEST(test_habitat_placement_config_starts_locked);
   RUN_TEST(test_habitat_placement_runs_requested_sequence);

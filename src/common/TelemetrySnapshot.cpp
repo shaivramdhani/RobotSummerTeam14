@@ -159,6 +159,7 @@ const char* faultCodeName(const FaultCode fault_code) {
 
 bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                         const std::size_t output_size, const bool compact) {
+  (void)compact;
   JsonWriter writer{output, output_size};
   writer.append("{");
   writer.append("\"uptime_ms\":%u,",
@@ -760,7 +761,14 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"distance_strafe_timeout_ms\":%u,"
       "\"distance_strafe_elapsed_ms\":%u,"
       "\"distance_strafe_remaining_ms\":%u,"
+      "\"post_count_stop_delay_ms\":%u,"
+      "\"post_count_stop_elapsed_ms\":%u,"
+      "\"post_count_stop_remaining_ms\":%u,"
+      "\"exit_strafe_pulse_ms\":%u,"
+      "\"exit_strafe_pulse_elapsed_ms\":%u,"
+      "\"exit_strafe_pulse_remaining_ms\":%u,"
       "\"distance_mm\":%u,\"distance_zone_count\":%u,"
+      "\"distance_exit_pulse_count\":%u,"
       "\"configuration_valid\":%s,\"start_ready\":%s,"
       "\"lss2_configured\":%s,\"lss2_data_fresh\":%s,"
       "\"lss3_configured\":%s,\"lss3_data_fresh\":%s,"
@@ -772,10 +780,43 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"side_line_aligning\":%s,"
       "\"left_side_driving\":%s,\"right_side_driving\":%s,"
       "\"reversing\":%s,\"distance_strafing\":%s,"
+      "\"post_count_waiting\":%s,"
+      "\"exit_strafe_pulsing\":%s,"
+      "\"exit_distance_checking\":%s,"
       "\"distance_measurement_available\":%s,"
+      "\"distance_substituted_no_target\":%s,"
       "\"distance_sample_new\":%s,"
       "\"distance_zone_active\":%s,"
-      "\"distance_zone_entered\":%s,\"timed_out\":%s}",
+      "\"distance_zone_entered\":%s,"
+      "\"distance_exit_above_threshold\":%s,"
+      "\"timed_out\":%s,"
+      "\"slide_down_speed_steps_per_second\":%u,"
+      "\"slide_down_timeout_ms\":%u,"
+      "\"slide_down_elapsed_ms\":%u,"
+      "\"approach_distance_threshold_mm\":%u,"
+      "\"approach_forward_duty\":%.5f,"
+      "\"approach_timeout_ms\":%u,"
+      "\"approach_elapsed_ms\":%u,"
+      "\"lift_steps\":%u,"
+      "\"lift_speed_steps_per_second\":%u,"
+      "\"lift_timeout_ms\":%u,"
+      "\"lift_elapsed_ms\":%u,"
+      "\"lift_start_delay_ms\":%u,"
+      "\"lift_start_delay_elapsed_ms\":%u,"
+      "\"post_pickup_reverse_duty\":%.5f,"
+      "\"post_pickup_reverse_duration_ms\":%u,"
+      "\"post_pickup_reverse_elapsed_ms\":%u,"
+      "\"rear_line_reacquire_timeout_ms\":%u,"
+      "\"rear_line_reacquire_elapsed_ms\":%u,"
+      "\"lowering_slide\":%s,\"approaching_piece\":%s,"
+      "\"lifting_slide\":%s,"
+      "\"lift_start_waiting\":%s,"
+      "\"post_pickup_reversing\":%s,"
+      "\"reacquiring_rear_line\":%s,"
+      "\"waiting_for_lift\":%s,"
+      "\"approach_distance_reached\":%s,"
+      "\"lift_complete\":%s,"
+      "\"rear_line_detected\":%s}",
       habitatPiecesStateName(snapshot.habitat_pieces_state),
       habitatPiecesStopReasonName(snapshot.habitat_pieces_stop_reason),
       static_cast<unsigned>(snapshot.habitat_pieces_time_in_state_ms),
@@ -804,9 +845,23 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
           snapshot.habitat_pieces_distance_strafe_elapsed_ms),
       static_cast<unsigned>(
           snapshot.habitat_pieces_distance_strafe_remaining_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_post_count_stop_delay_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_post_count_stop_elapsed_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_post_count_stop_remaining_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_exit_strafe_pulse_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_exit_strafe_pulse_elapsed_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_exit_strafe_pulse_remaining_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_distance_mm),
       static_cast<unsigned>(
           snapshot.habitat_pieces_distance_zone_count),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_distance_exit_pulse_count),
       jsonBool(snapshot.habitat_pieces_configuration_valid),
       jsonBool(snapshot.habitat_pieces_start_ready),
       jsonBool(snapshot.habitat_pieces_lss2_configured),
@@ -826,12 +881,55 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.habitat_pieces_right_side_driving),
       jsonBool(snapshot.habitat_pieces_reversing),
       jsonBool(snapshot.habitat_pieces_distance_strafing),
+      jsonBool(snapshot.habitat_pieces_post_count_waiting),
+      jsonBool(snapshot.habitat_pieces_exit_strafe_pulsing),
+      jsonBool(snapshot.habitat_pieces_exit_distance_checking),
       jsonBool(
           snapshot.habitat_pieces_distance_measurement_available),
+      jsonBool(
+          snapshot.habitat_pieces_distance_substituted_no_target),
       jsonBool(snapshot.habitat_pieces_distance_sample_new),
       jsonBool(snapshot.habitat_pieces_distance_zone_active),
       jsonBool(snapshot.habitat_pieces_distance_zone_entered),
-      jsonBool(snapshot.habitat_pieces_timed_out));
+      jsonBool(
+          snapshot.habitat_pieces_distance_exit_above_threshold),
+      jsonBool(snapshot.habitat_pieces_timed_out),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_slide_down_speed_steps_per_second),
+      static_cast<unsigned>(snapshot.habitat_pieces_slide_down_timeout_ms),
+      static_cast<unsigned>(snapshot.habitat_pieces_slide_down_elapsed_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_approach_distance_threshold_mm),
+      snapshot.habitat_pieces_approach_forward_duty,
+      static_cast<unsigned>(snapshot.habitat_pieces_approach_timeout_ms),
+      static_cast<unsigned>(snapshot.habitat_pieces_approach_elapsed_ms),
+      static_cast<unsigned>(snapshot.habitat_pieces_lift_steps),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_lift_speed_steps_per_second),
+      static_cast<unsigned>(snapshot.habitat_pieces_lift_timeout_ms),
+      static_cast<unsigned>(snapshot.habitat_pieces_lift_elapsed_ms),
+      static_cast<unsigned>(snapshot.habitat_pieces_lift_start_delay_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_lift_start_delay_elapsed_ms),
+      snapshot.habitat_pieces_post_pickup_reverse_duty,
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_post_pickup_reverse_duration_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_post_pickup_reverse_elapsed_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_rear_line_reacquire_timeout_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_rear_line_reacquire_elapsed_ms),
+      jsonBool(snapshot.habitat_pieces_lowering_slide),
+      jsonBool(snapshot.habitat_pieces_approaching_piece),
+      jsonBool(snapshot.habitat_pieces_lifting_slide),
+      jsonBool(snapshot.habitat_pieces_lift_start_waiting),
+      jsonBool(snapshot.habitat_pieces_post_pickup_reversing),
+      jsonBool(snapshot.habitat_pieces_reacquiring_rear_line),
+      jsonBool(snapshot.habitat_pieces_waiting_for_lift),
+      jsonBool(snapshot.habitat_pieces_approach_distance_reached),
+      jsonBool(snapshot.habitat_pieces_lift_complete),
+      jsonBool(snapshot.habitat_pieces_rear_line_detected));
 
   const HabitatPlacementConfig& habitat_placement =
       snapshot.habitat_placement_config;
@@ -1282,37 +1380,6 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 static_cast<unsigned>(snapshot.ir_adc_sample_rate_hz),
                 static_cast<unsigned>(
                     snapshot.motor_command_magnitude_milli));
-
-  if (!compact) {
-    writer.append(",\"future\":{\"ir_left_strength\":%d,"
-                  "\"ir_right_strength\":%d,"
-                  "\"ultrasonic_1_distance_mm\":%d,"
-                  "\"ultrasonic_2_distance_mm\":%d,"
-                  "\"stepper_position\":%d,"
-                  "\"servo_claw_1_position\":%d,"
-                  "\"servo_claw_2_position\":%d,"
-                  "\"servo_claw_3_position\":%d,"
-                  "\"servo_pusher_position\":%d,"
-                  "\"servo_winch_position\":%d,"
-                  "\"limit_switch_stepper_bottom\":%s,"
-                  "\"limit_switch_stepper_middle\":%s,"
-                  "\"limit_switch_stepper_top\":%s,"
-                  "\"limit_switch_funnel_left\":%s,"
-                  "\"limit_switch_funnel_right\":%s}",
-                  snapshot.ir_left_strength, snapshot.ir_right_strength,
-                  snapshot.ultrasonic_1_distance_mm,
-                  snapshot.ultrasonic_2_distance_mm,
-                  snapshot.stepper_position, snapshot.servo_claw_1_position,
-                  snapshot.servo_claw_2_position,
-                  snapshot.servo_claw_3_position,
-                  snapshot.servo_pusher_position,
-                  snapshot.servo_winch_position,
-                  jsonBool(snapshot.limit_switch_stepper_bottom),
-                  jsonBool(snapshot.limit_switch_stepper_middle),
-                  jsonBool(snapshot.limit_switch_stepper_top),
-                  jsonBool(snapshot.limit_switch_funnel_left),
-                  jsonBool(snapshot.limit_switch_funnel_right));
-  }
 
   writer.append("}");
   return writer.ok();

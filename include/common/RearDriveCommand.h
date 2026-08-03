@@ -20,7 +20,7 @@ struct RearDriveCommand {
   std::int16_t back_right_command_milli{0};
   Milliseconds sender_timestamp_ms{0};
   Milliseconds timeout_ms{kDefaultCommunicationTimeoutMs};
-  LaserDistanceProfile laser_profile{LaserDistanceProfile::HighAccuracy};
+  LaserDistanceProfile laser_profile{LaserDistanceProfile::Default};
 };
 
 struct RearDriveStatus {

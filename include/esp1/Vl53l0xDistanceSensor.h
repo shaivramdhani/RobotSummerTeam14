@@ -32,7 +32,7 @@ class Vl53l0xDistanceSensor {
   LaserDistanceSnapshot snapshot_{};
   bool initialized_{false};
   bool ranging_{false};
-  LaserDistanceProfile profile_{LaserDistanceProfile::HighAccuracy};
+  LaserDistanceProfile profile_{LaserDistanceProfile::Default};
   std::uint32_t default_timing_budget_us_{0U};
   std::uint32_t default_signal_rate_limit_{0U};
   std::uint32_t default_sigma_limit_{0U};

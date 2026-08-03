@@ -77,8 +77,8 @@ ESP1 publishes `SensorSnapshot` every `10 ms` using a 6-byte payload:
 
 The shared snapshot keeps rear following and current/future autonomous
 side-line inputs on one coherent ESP1 acquisition path. HIGH means black tape.
-Habitat Pieces consumes LSS2 on ESP1 GPIO11 as its left stop sensor and LSS3 on
-ESP1 GPIO12 as its right stop sensor.
+Habitat Pieces consumes LSS2 on ESP1 GPIO11 as its all-wheel stop sensor. LSS3
+on ESP1 GPIO12 remains available as telemetry but does not control this route.
 ESP2 also accepts the prior 5-byte snapshot as a migration aid and reports LSS3
 unconfigured for that packet. Flash ESP2 before ESP1 when updating processors
 separately; the older ESP2 firmware does not understand the new 6-byte packet.
@@ -113,12 +113,16 @@ freshness from receipt of a changed measurement sequence; receipt of an
 unchanged heartbeat does not refresh sensor data.
 
 The rear-wheel command's laser-profile request expires with the command. ESP1
-retains the high-accuracy profile when the command becomes stale. ESP1 also
-publishes immediately when the active profile changes. Habitat Pieces no longer
-uses laser profile acknowledgement as a Start gate. Its final pickup strafe
-consumes only new, valid, fresh, high-accuracy measurement sequences to count
-distinct entries above the configured distance threshold; invalid or repeated
-snapshots do not affect the count, and the strafe timeout remains authoritative.
+returns to the normal/default profile when the command becomes stale. ESP1 also
+publishes immediately when the active profile changes. Habitat Pieces does not
+use laser profile acknowledgement as a Start gate. Its IMU-held pickup strafe
+consumes only new, fresh normal-profile measurement attempts to count distinct
+entries at or below the configured distance threshold. After the target count,
+the same sequence gate ensures every stopped post-pulse check uses a newly
+acquired result. A fresh N/A/no-target attempt is represented locally on ESP2
+as 65536 mm, so it is outside the counted zone and satisfies the exit check;
+stale or repeated snapshots do neither, and the strafe timeout remains
+authoritative.
 
 ## Funnel Mechanism Command Payload
 

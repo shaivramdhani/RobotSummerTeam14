@@ -37,26 +37,40 @@ disabled and line following refuses to start.
   for a ranging cycle to complete.
 - Laser UART heartbeats do not make old measurements fresh. ESP2 freshness is
   based on arrival of a changed measurement sequence.
-- `HABITAT_PIECES` line-follows immediately and ignores both LSS2-left and
-  LSS3-right only for an explicitly configured nonzero detection delay. Each
-  black detection latches its wheel side stopped; the other side continues
-  until its sensor latches, then the bounded straight-backward move begins.
+- `HABITAT_PIECES` line-follows immediately and ignores LSS2 only for an
+  explicitly configured nonzero detection delay. A fresh black LSS2 input
+  stops all four wheels for one control update, then the bounded
+  straight-backward move begins. LSS3 remains telemetry-only in this route.
   Reverse duty and duration are locked at zero until configured; completion
   begins the separately bounded distance-zone strafe. Direction, threshold,
-  target count, duty, and timeout are locked until explicitly configured. The
-  overall search/alignment timeout must be longer than the detection delay.
-- Habitat Pieces requires configured LSS2 and LSS3 inputs and a fresh shared
-  ESP1 sensor snapshot at start and until both detections latch. Missing
-  configuration, stale side-sensor data, front line loss before alignment,
+  target count, duty, post-count stop delay, exit-pulse duration, and timeout
+  are locked until explicitly configured. The
+  overall LSS2 search timeout must be longer than the detection delay.
+- Habitat Pieces requires a configured LSS2 input, fresh shared ESP1 sensor
+  snapshot, valid shared IMU heading-hold tuning, and a healthy IMU at Start.
+  Missing configuration, stale LSS2 data, front line loss before detection,
   rear-command failure, or timeout stops all four wheels. No detection delay,
-  search/alignment timeout, reverse duty/duration, distance direction,
-  threshold, count, duty, or distance timeout is compiled in; all must be
-  explicitly configured. During the timed reverse, continued side-
+  search timeout, reverse duty/duration, distance direction,
+  threshold, count, duty, post-count delay, exit-pulse duration, or distance
+  timeout is compiled in; all must be explicitly configured. During the timed reverse, continued side-
   sensor data is not required, but motor and communication safety gates remain
-  active. During distance strafing, only new valid high-accuracy measurement
-  sequences can affect the counter. Repeated, invalid, stale, or no-signal
-  readings never increment it; the configured timeout stops the motion if the
-  target count is not reached.
+  active. Distance strafing uses the shared IMU heading-hold controller. During
+  that step, only new, fresh normal-profile measurement sequences affect the
+  counter. Only entries at or below threshold count, and an above-threshold
+  sample rearms the counter. After the count, each timed exit pulse ends with
+  an all-wheel stop before a new measurement is evaluated. A fresh N/A/no-target
+  result is substituted with 65536 mm and satisfies the exit check, while an
+  unavailable or stale stream supplies no sample. Repeated sequences cannot
+  increment the count or satisfy a post-pulse check, and the configured timeout
+  bounds the full count/delay/pulse/check sequence. Clearing the final zone begins a bounded
+  bottom-limit search and a separately bounded valid-distance approach. The
+  step-counted lift begins while every wheel remains stopped for the configured
+  lift-start delay, then runs concurrently with the bounded reverse and
+  opposite-direction IMU rear-line strafe. Either rear sensor stops chassis
+  motion; the route waits stopped for an unfinished lift before handing off to
+  Habitat Placement. Stepper-command failure, conflicting limits, stale rear
+  line data, or any slide/approach/lift/reacquisition timeout stops both the
+  chassis and slide.
 - Runtime MPU-6050 I2C transactions execute only in ESP2's sensor-acquisition
   task. The core-1 motion task consumes a copied snapshot and treats data older
   than the IMU freshness limit as unavailable.

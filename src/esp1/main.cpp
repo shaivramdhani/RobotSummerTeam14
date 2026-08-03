@@ -916,7 +916,7 @@ void publishLaserDistance(RearCommandLink& link,
   static std::uint16_t packet_sequence = 0U;
   static std::uint16_t last_measurement_sequence = 0U;
   static robot::LaserDistanceProfile last_profile =
-      robot::LaserDistanceProfile::HighAccuracy;
+      robot::LaserDistanceProfile::Default;
   static bool published_once = false;
 
   robot::LaserDistanceSnapshot snapshot{};
@@ -1119,7 +1119,7 @@ void rearDriveTask(void* parameters) {
 
   TickType_t last_wake_tick = xTaskGetTickCount();
   robot::LaserDistanceProfile last_requested_laser_profile =
-      robot::LaserDistanceProfile::HighAccuracy;
+      robot::LaserDistanceProfile::Default;
   robot::Milliseconds last_laser_profile_request_ms = 0U;
 
   for (;;) {

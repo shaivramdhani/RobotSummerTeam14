@@ -476,8 +476,33 @@ struct TelemetrySnapshot {
   Milliseconds habitat_pieces_distance_strafe_timeout_ms{0U};
   Milliseconds habitat_pieces_distance_strafe_elapsed_ms{0U};
   Milliseconds habitat_pieces_distance_strafe_remaining_ms{0U};
-  std::uint16_t habitat_pieces_distance_mm{0U};
+  Milliseconds habitat_pieces_post_count_stop_delay_ms{0U};
+  Milliseconds habitat_pieces_post_count_stop_elapsed_ms{0U};
+  Milliseconds habitat_pieces_post_count_stop_remaining_ms{0U};
+  Milliseconds habitat_pieces_exit_strafe_pulse_ms{0U};
+  Milliseconds habitat_pieces_exit_strafe_pulse_elapsed_ms{0U};
+  Milliseconds habitat_pieces_exit_strafe_pulse_remaining_ms{0U};
+  std::uint32_t habitat_pieces_slide_down_speed_steps_per_second{0U};
+  Milliseconds habitat_pieces_slide_down_timeout_ms{0U};
+  Milliseconds habitat_pieces_slide_down_elapsed_ms{0U};
+  std::uint16_t habitat_pieces_approach_distance_threshold_mm{0U};
+  float habitat_pieces_approach_forward_duty{0.0F};
+  Milliseconds habitat_pieces_approach_timeout_ms{0U};
+  Milliseconds habitat_pieces_approach_elapsed_ms{0U};
+  std::uint32_t habitat_pieces_lift_steps{0U};
+  std::uint32_t habitat_pieces_lift_speed_steps_per_second{0U};
+  Milliseconds habitat_pieces_lift_timeout_ms{0U};
+  Milliseconds habitat_pieces_lift_elapsed_ms{0U};
+  Milliseconds habitat_pieces_lift_start_delay_ms{0U};
+  Milliseconds habitat_pieces_lift_start_delay_elapsed_ms{0U};
+  float habitat_pieces_post_pickup_reverse_duty{0.0F};
+  Milliseconds habitat_pieces_post_pickup_reverse_duration_ms{0U};
+  Milliseconds habitat_pieces_post_pickup_reverse_elapsed_ms{0U};
+  Milliseconds habitat_pieces_rear_line_reacquire_timeout_ms{0U};
+  Milliseconds habitat_pieces_rear_line_reacquire_elapsed_ms{0U};
+  std::uint32_t habitat_pieces_distance_mm{0U};
   std::uint16_t habitat_pieces_distance_zone_count{0U};
+  std::uint16_t habitat_pieces_distance_exit_pulse_count{0U};
   bool habitat_pieces_configuration_valid{false};
   bool habitat_pieces_start_ready{false};
   bool habitat_pieces_lss2_configured{false};
@@ -497,10 +522,25 @@ struct TelemetrySnapshot {
   bool habitat_pieces_right_side_driving{false};
   bool habitat_pieces_reversing{false};
   bool habitat_pieces_distance_strafing{false};
+  bool habitat_pieces_post_count_waiting{false};
+  bool habitat_pieces_exit_strafe_pulsing{false};
+  bool habitat_pieces_exit_distance_checking{false};
+  bool habitat_pieces_lowering_slide{false};
+  bool habitat_pieces_approaching_piece{false};
+  bool habitat_pieces_lifting_slide{false};
+  bool habitat_pieces_lift_start_waiting{false};
+  bool habitat_pieces_post_pickup_reversing{false};
+  bool habitat_pieces_reacquiring_rear_line{false};
+  bool habitat_pieces_waiting_for_lift{false};
+  bool habitat_pieces_approach_distance_reached{false};
+  bool habitat_pieces_lift_complete{false};
+  bool habitat_pieces_rear_line_detected{false};
   bool habitat_pieces_distance_measurement_available{false};
+  bool habitat_pieces_distance_substituted_no_target{false};
   bool habitat_pieces_distance_sample_new{false};
   bool habitat_pieces_distance_zone_active{false};
   bool habitat_pieces_distance_zone_entered{false};
+  bool habitat_pieces_distance_exit_above_threshold{false};
   bool habitat_pieces_timed_out{false};
 
   HabitatPlacementState habitat_placement_state{
@@ -635,6 +675,8 @@ struct TelemetrySnapshot {
   std::uint32_t ir_adc_sample_rate_hz{0};
   std::uint16_t motor_command_magnitude_milli{0};
 
+  // Legacy flat values remain available to the smaller dedicated API
+  // handlers, but are no longer duplicated in the full telemetry document.
   int ir_left_strength{-1};
   int ir_right_strength{-1};
   int ultrasonic_1_distance_mm{-1};

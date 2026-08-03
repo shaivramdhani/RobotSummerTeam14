@@ -52,15 +52,24 @@ while required hardware settings are TODO. See `docs/telemetry.md`.
 The dashboard also reports the ESP1-owned VL53L0X V2 distance sensor on SDA
 GPIO10/SCL GPIO9. The `HABITAT_PIECES` mode follows the front line at an
 independently adjustable duty (default `0.12`), ignores the ESP1-owned LSS2 for
-an adjustable detection delay shared with LSS3, and then independently stops
-the left wheel side on LSS2 black and the right wheel side on LSS3 black. Once
-both detections latch, it drives straight backward at an adjustable duty for an
-adjustable duration. It then strafes in an adjustable left/right direction and
-counts distinct entries into the valid laser-distance zone above an adjustable
-threshold. Consecutive above-threshold samples count once; the route stops at
-the adjustable target count or faults on the independently adjustable strafe
-timeout. All added strafe settings default to unconfigured. The laser remains
-in its high-accuracy profile through idle, motion, and stopped states.
+an adjustable detection delay, then stops all four wheels when LSS2 detects
+black. LSS3 remains available as telemetry but does not control this route.
+The robot next drives straight backward at an adjustable duty and duration,
+then strafes in an adjustable left/right direction through IMU heading hold
+while counting distinct entries at or below an adjustable laser-distance
+threshold. Consecutive in-zone samples count once, and an above-threshold
+sample rearms the next count. At the target count, the robot stops for an
+adjustable delay, then repeats adjustable-duration IMU-strafe pulses with an
+all-wheel stop and fresh laser check between pulses. An above-threshold check
+clears the final piece and begins the pickup tail. The slide seeks its bottom
+limit, the robot approaches a second laser threshold, and a step-counted lift
+starts during an adjustable stopped delay before continuing concurrently with
+a timed reverse and opposite-direction IMU strafe.
+Either rear line sensor stops the strafe; lift completion then automatically
+starts Habitat Placement. Fresh N/A/no-target results are treated as 65536 mm
+and therefore clear the exit check but cannot satisfy the close approach. One adjustable timeout bounds the initial
+strafe, stop delay, pulses, and checks. All added strafe settings default to
+unconfigured. The laser remains in its normal/default profile throughout.
 
 For the current two-ESP wiring, flash both ESPs and use the ESP2 dashboard to
 test individual wheels, distributed drive, front line sensors, and the

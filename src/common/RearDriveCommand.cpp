@@ -150,7 +150,7 @@ MotorCommand RearDriveCommandReceiver::backRightCommand(
 LaserDistanceProfile RearDriveCommandReceiver::laserProfile(
     const Milliseconds now_ms) const {
   return commandIsFresh(now_ms) ? last_command_.laser_profile
-                                : LaserDistanceProfile::HighAccuracy;
+                                : LaserDistanceProfile::Default;
 }
 
 RearDriveStatus RearDriveCommandReceiver::status(

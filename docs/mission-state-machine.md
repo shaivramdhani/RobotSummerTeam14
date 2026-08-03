@@ -29,26 +29,41 @@ The scaffold remains in `SafeStopped` and emits disabled chassis commands. Fault
 force `SafeStopped`.
 
 ESP2's explicit `HABITAT_PIECES` mode line-follows with the front sensors,
-ignores LSS2-left and LSS3-right for an explicitly configured detection delay,
-then latches either fresh black detection. A detected sensor stops both wheels
-on its side while the other side continues forward until its own sensor also
-latches black. It then drives straight backward at an explicitly configured
+ignores LSS2 for an explicitly configured detection delay, then stops all four
+wheels when fresh LSS2 black is detected. LSS3 remains telemetry-only. On the
+next control update it drives straight backward at an explicitly configured
 duty for an explicitly configured duration, then enters `DISTANCE_STRAFING`.
-That final pickup step moves in the configured left/right direction and counts
-distinct valid laser-measurement entries above the configured threshold.
-Consecutive above-threshold values count once; a value at or below the
-threshold rearms the next count. Reaching the configured count latches stop,
-and a separate distance-strafe timeout faults and stops if the count is never
-reached. A separate overall timeout stops the mode if both lines are not
-acquired. Both sensors
-must be configured and their shared snapshot must remain fresh until both
-latch. The VL53L0X is not a start gate; invalid/no-signal readings do not count
-and do not stop the strafe before its timeout. The separate ESP1
+That pickup step moves in the configured left/right direction through IMU
+heading hold and counts distinct fresh laser-measurement entries at or below
+the configured threshold. Consecutive in-zone values count once; an
+above-threshold value rearms the next count. Reaching the configured count
+enters `POST_COUNT_STOP_DELAY`. It then alternates `EXIT_STRAFE_PULSE` and
+`EXIT_DISTANCE_CHECK`: each pulse is timed, every check occurs stopped and
+requires a new measurement sequence, above threshold advances to
+`LOWER_SLIDE`, and at-or-below repeats the pulse. The distance-strafe timeout
+bounds the complete count/delay/pulse/check sequence. The slide then seeks its
+bottom limit, `APPROACH_PIECE` drives forward until a new valid laser result is
+at or below a second threshold, and the stopped transition starts a
+step-counted lift. `LIFT_START_DELAY` holds every wheel stopped for its
+adjustable duration while the lift continues. `REVERSE_AFTER_PICKUP` and
+`REAR_LINE_REACQUIRE` then run while that lift continues. Rear-line
+reacquisition uses IMU heading hold in the
+opposite direction from the original distance strafe and stops when either
+rear sensor sees black. If necessary, the chassis waits stopped for the lift;
+once both conditions are complete, the route automatically requests
+`HABITAT_PLACEMENT`. Every search and mechanism motion has an independent
+timeout. A separate overall timeout stops the mode if LSS2 is not acquired.
+LSS2 must be configured and its shared snapshot must remain fresh until it
+latches. The VL53L0X is not a start gate; a fresh N/A/no-target result is
+represented as 65536 mm, so it remains outside a counted near zone and
+satisfies an exit check.
+A stale/frozen stream supplies no new sample and does not stop the strafe
+before its timeout. The separate ESP1
 mission-state transition into
 `NavigateToHabitatPieces` remains unimplemented.
 
-ESP2 also exposes a standalone `HABITAT_PLACEMENT` route intended for the later
-handoff from the unfinished pickup sequence. It captures the fresh continuous
+ESP2 also exposes a standalone `HABITAT_PLACEMENT` route and automatically
+hands off to it after the pickup lift and rear-line reacquisition. It captures the fresh continuous
 IMU heading at route start, reverse-line-follows on the rear sensors until LSS1
 is black, pauses, turns back to the captured initial heading, and performs a
 timed right strafe. It then turns CCW to the captured heading plus or minus the
@@ -58,8 +73,7 @@ drives backward, strafes left, pauses, drives forward, pauses again, and
 strafes right until either front line sensor is black before closing the
 pusher. Each motion/search has an adjustable bound; configuration, stale
 communication, sensor, turn, stepper, servo, and timeout failures stop the
-chassis. Automatic pickup-to-placement chaining remains TODO until the pickup
-route is complete.
+chassis.
 
 ## Transition TODOs
 
@@ -69,6 +83,7 @@ route is complete.
 - Define recovery behavior after stale communication or conflicting limit
   switches.
 - Define when mechanisms may be commanded and how commands are acknowledged.
-- Calibrate the shared LSS2/LSS3 detection delay, search/alignment timeout, and
-  reverse duty/duration in the dedicated ESP2 mode, then define how the ESP1
-  mission state requests and observes that approach.
+- Calibrate the LSS2 detection delay, LSS2 search timeout, reverse
+  duty/duration, distance-zone strafe settings, and shared IMU heading-hold
+  tuning in the dedicated ESP2 mode, then define how the ESP1 mission state
+  requests and observes that approach.

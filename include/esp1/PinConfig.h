@@ -14,7 +14,7 @@ constexpr std::uint8_t kDriveTestPwmResolutionBits = 10U;
 constexpr std::uint32_t kDriveTestUartBaudRate = 115200U;
 constexpr std::uint32_t kLaserI2cFrequencyHz = 100000U;
 constexpr std::uint16_t kLaserI2cTransactionTimeoutMs = 5U;
-constexpr std::uint16_t kLaserIntermeasurementPeriodMs = 200U;
+constexpr std::uint16_t kLaserIntermeasurementPeriodMs = 50U;
 
 enum class DualPwmHBridgeMode : std::uint8_t {
   Unconfigured = 0,

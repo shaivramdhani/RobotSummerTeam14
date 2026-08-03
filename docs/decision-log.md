@@ -187,3 +187,59 @@ to unconfigured. Laser availability does not block route Start, and invalid,
 stale, wrong-profile, or no-signal samples neither count nor rearm. The strafe
 uses the normal expiring four-wheel command path and faults stopped when its
 configured timeout expires before the target count is reached.
+
+## 2026-08-01: Habitat Pieces Returns to LSS2 Stop and IMU Strafe
+
+Decision: Supersede the independent LSS2/LSS3 alignment behavior above. After
+the configured delay, LSS2 alone stops all four wheels before the bounded
+reverse begins; LSS3 remains telemetry-only. Run the distance-zone strafe
+through the shared IMU heading-hold controller. Keep the VL53L0X in its
+normal/default profile. Represent a fresh N/A/no-target attempt as 65536 mm,
+one above the maximum configurable uint16 threshold.
+
+Reason: The pickup route now uses LSS2 as its single stopping reference and
+needs yaw correction during lateral motion. Treating a fresh no-target result
+as far distance lets the existing zone counter detect open gaps.
+
+Safety note: Start now requires valid shared IMU heading-hold tuning and a
+healthy IMU as well as LSS2. LSS2 detection produces a full stopped control
+update before reverse. Stale or frozen laser data is not substituted and does
+not create new counts; measurement-sequence gating and the adjustable strafe
+timeout remain active. IMU loss uses the shared bounded pause/recovery path and
+faults stopped if recovery fails.
+
+## 2026-08-02: Habitat Pieces Counts Near Zones and Pulses to the Exit
+
+Decision: Supersede the earlier far-zone counter. `DISTANCE_STRAFING` now
+counts distinct entries at or below the configured threshold. On reaching the
+target, stop for an adjustable delay, then repeat adjustable-duration strafing
+pulses in the same direction and at the same duty. Stop all wheels after every
+pulse and wait for a new measurement sequence. Complete only when that fresh
+check is above threshold; otherwise repeat the pulse.
+
+Reason: The near-distance zones identify the habitat pieces, while short
+post-count pulses let the chassis move beyond the final detected piece without
+making a distance decision while the robot is still moving.
+
+Safety note: Both added timings default to unconfigured. The existing distance
+strafe timeout bounds counting, stop delay, pulses, and sensor waits. A fresh
+N/A result remains the 65536 mm sentinel and therefore satisfies the exit
+check. Stale or repeated samples cannot satisfy a check, and each check occurs
+with all four wheels commanded stopped.
+
+## 2026-08-02: Habitat Pieces Pickup Tail and Placement Handoff
+
+Decision: After the final above-threshold exit check, lower the linear slide to
+its bottom switch, drive forward to a separately configured valid-distance
+threshold, stop, and begin a configured step-counted lift. Run that lift
+through a configurable all-wheel-stop delay, then concurrently with a timed
+reverse and an IMU-held strafe opposite the original distance-strafe
+direction. Stop the chassis when either rear line sensor sees
+black, wait stopped if the lift is unfinished, and then automatically request
+the existing Habitat Placement route.
+
+Safety note: Slide-down, distance approach, lift, reverse, and rear-line
+reacquisition settings default to unconfigured. Each search has an independent
+timeout. N/A laser results cannot satisfy the close approach; stepper command
+failure, conflicting limits, stale rear-line data, IMU failure, or timeout
+stops the chassis and stepper.
