@@ -128,7 +128,23 @@ struct IrAdcWindowResult {
   bool switch_debounced_high{true};
   bool beacon_detected{false};
   bool configured{false};
+  bool acquisition_enabled{false};
 };
+
+struct SensorAcquisitionRequest {
+  bool laser_enabled{false};
+  bool ir_enabled{false};
+  robot::LaserDistanceProfile laser_profile{
+      robot::kOperationalLaserDistanceProfile};
+};
+
+bool sameSensorAcquisitionRequest(
+    const SensorAcquisitionRequest& left,
+    const SensorAcquisitionRequest& right) {
+  return left.laser_enabled == right.laser_enabled &&
+         left.ir_enabled == right.ir_enabled &&
+         left.laser_profile == right.laser_profile;
+}
 
 struct DebouncedSwitchState {
   bool raw_high{true};
@@ -159,10 +175,10 @@ StaticQueue_t g_laser_snapshot_queue_buffer{};
 std::uint8_t g_laser_snapshot_queue_storage[
     sizeof(robot::LaserDistanceSnapshot)]{};
 QueueHandle_t g_laser_snapshot_queue{nullptr};
-StaticQueue_t g_laser_profile_request_queue_buffer{};
-std::uint8_t g_laser_profile_request_queue_storage[
-    sizeof(robot::LaserDistanceProfile)]{};
-QueueHandle_t g_laser_profile_request_queue{nullptr};
+StaticQueue_t g_sensor_acquisition_request_queue_buffer{};
+std::uint8_t g_sensor_acquisition_request_queue_storage[
+    sizeof(SensorAcquisitionRequest)]{};
+QueueHandle_t g_sensor_acquisition_request_queue{nullptr};
 
 bool gpioAssigned(const int gpio) {
   return gpio >= 0;
@@ -271,28 +287,28 @@ bool initializeLaserSnapshotMailbox() {
   return g_laser_snapshot_queue != nullptr;
 }
 
-bool initializeLaserProfileRequestMailbox() {
-  if (g_laser_profile_request_queue != nullptr) {
+bool initializeSensorAcquisitionRequestMailbox() {
+  if (g_sensor_acquisition_request_queue != nullptr) {
     return false;
   }
-  g_laser_profile_request_queue = xQueueCreateStatic(
-      1U, sizeof(robot::LaserDistanceProfile),
-      g_laser_profile_request_queue_storage,
-      &g_laser_profile_request_queue_buffer);
-  return g_laser_profile_request_queue != nullptr;
+  g_sensor_acquisition_request_queue = xQueueCreateStatic(
+      1U, sizeof(SensorAcquisitionRequest),
+      g_sensor_acquisition_request_queue_storage,
+      &g_sensor_acquisition_request_queue_buffer);
+  return g_sensor_acquisition_request_queue != nullptr;
 }
 
-void requestLaserDistanceProfile(
-    const robot::LaserDistanceProfile profile) {
-  if (g_laser_profile_request_queue != nullptr) {
-    (void)xQueueOverwrite(g_laser_profile_request_queue, &profile);
+void requestSensorAcquisition(
+    const SensorAcquisitionRequest& request) {
+  if (g_sensor_acquisition_request_queue != nullptr) {
+    (void)xQueueOverwrite(g_sensor_acquisition_request_queue, &request);
   }
 }
 
-bool takeLaserDistanceProfileRequest(
-    robot::LaserDistanceProfile& profile) {
-  return g_laser_profile_request_queue != nullptr &&
-         xQueueReceive(g_laser_profile_request_queue, &profile, 0U) ==
+bool takeSensorAcquisitionRequest(
+    SensorAcquisitionRequest& request) {
+  return g_sensor_acquisition_request_queue != nullptr &&
+         xQueueReceive(g_sensor_acquisition_request_queue, &request, 0U) ==
              pdPASS;
 }
 
@@ -608,6 +624,7 @@ IrAdcWindowResult sampleIrAdcWindow(const DebouncedSwitchState& switch_state,
   result.sampled_at_ms = static_cast<robot::Milliseconds>(millis());
   result.beacon_detected = detected;
   result.configured = true;
+  result.acquisition_enabled = true;
   return result;
 }
 
@@ -900,6 +917,7 @@ void publishEsp1Status(RearCommandLink& link,
   report.ir_active_threshold = ir.active_threshold;
   report.ir_consecutive_detection_count = ir.consecutive_detection_count;
   report.ir_adc_sample_rate_hz = ir.achieved_sample_rate_hz;
+  report.ir_acquisition_enabled = ir.acquisition_enabled;
   link.send(robot::makeEsp1StatusPacket(report, sequence++));
 }
 
@@ -1042,6 +1060,7 @@ void sensorAcquisitionTask(void* parameters) {
   (void)laser_distance_sensor.initialize(
       Wire, robot::esp1::kHardwareConfig.laser_distance_sensor);
   storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
+  SensorAcquisitionRequest acquisition_request{};
 
   TickType_t last_wake_tick = xTaskGetTickCount();
   robot::Milliseconds last_slow_acquisition_ms =
@@ -1051,12 +1070,26 @@ void sensorAcquisitionTask(void* parameters) {
   for (;;) {
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
-    robot::LaserDistanceProfile requested_profile{};
-    if (takeLaserDistanceProfileRequest(requested_profile)) {
-      (void)laser_distance_sensor.setProfile(
+    SensorAcquisitionRequest requested_acquisition{};
+    if (takeSensorAcquisitionRequest(requested_acquisition)) {
+      (void)laser_distance_sensor.setAcquisitionEnabled(
           robot::esp1::kHardwareConfig.laser_distance_sensor,
-          requested_profile);
+          requested_acquisition.laser_enabled,
+          requested_acquisition.laser_profile);
       storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
+      if (requested_acquisition.ir_enabled !=
+          acquisition_request.ir_enabled) {
+        detected = false;
+        detect_count = 0U;
+        clear_count = 0U;
+        IrAdcWindowResult ir_state{};
+        ir_state.configured = irAdcConfigComplete();
+        ir_state.acquisition_enabled =
+            requested_acquisition.ir_enabled &&
+            ir_state.configured;
+        storeIrAdcResult(ir_state);
+      }
+      acquisition_request = requested_acquisition;
     }
     if (laser_distance_sensor.service(now_ms)) {
       storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
@@ -1064,17 +1097,16 @@ void sensorAcquisitionTask(void* parameters) {
 
     if (now_ms - last_slow_acquisition_ms >= kEsp1StatusPeriodMs) {
       last_slow_acquisition_ms = now_ms;
-      switch_state = updateIrSwitch(switch_state, now_ms);
-      const std::uint32_t selected_frequency_hz =
-          selectedFrequencyHzForSwitch(switch_state.debounced_high);
-      if (selected_frequency_hz != last_selected_frequency_hz) {
-        detected = false;
-        detect_count = 0U;
-        clear_count = 0U;
-        last_selected_frequency_hz = selected_frequency_hz;
-      }
-
-      if (irAdcConfigComplete()) {
+      if (acquisition_request.ir_enabled && irAdcConfigComplete()) {
+        switch_state = updateIrSwitch(switch_state, now_ms);
+        const std::uint32_t selected_frequency_hz =
+            selectedFrequencyHzForSwitch(switch_state.debounced_high);
+        if (selected_frequency_hz != last_selected_frequency_hz) {
+          detected = false;
+          detect_count = 0U;
+          clear_count = 0U;
+          last_selected_frequency_hz = selected_frequency_hz;
+        }
         const IrAdcWindowResult result =
             sampleIrAdcWindow(switch_state, detected, detect_count,
                               clear_count);
@@ -1118,9 +1150,8 @@ void rearDriveTask(void* parameters) {
   initializeRearLineSensors();
 
   TickType_t last_wake_tick = xTaskGetTickCount();
-  robot::LaserDistanceProfile last_requested_laser_profile =
-      robot::kOperationalLaserDistanceProfile;
-  robot::Milliseconds last_laser_profile_request_ms = 0U;
+  SensorAcquisitionRequest last_sensor_request{};
+  robot::Milliseconds last_sensor_request_ms = 0U;
 
   for (;;) {
     const robot::Milliseconds now_ms =
@@ -1158,23 +1189,33 @@ void rearDriveTask(void* parameters) {
 
     back_left_motor.apply(receiver.backLeftCommand(now_ms));
     back_right_motor.apply(receiver.backRightCommand(now_ms));
-    const robot::LaserDistanceProfile requested_laser_profile =
-        receiver.laserProfile(now_ms);
+    SensorAcquisitionRequest requested_sensors{};
+    requested_sensors.laser_enabled =
+        receiver.laserAcquisitionEnabled(now_ms);
+    requested_sensors.ir_enabled =
+        receiver.irAcquisitionEnabled(now_ms);
+    requested_sensors.laser_profile = receiver.laserProfile(now_ms);
     robot::LaserDistanceSnapshot laser_snapshot{};
-    const bool laser_profile_ready =
-        latestLaserDistanceSnapshot(laser_snapshot) &&
-        laser_snapshot.initialized && laser_snapshot.ranging &&
-        laser_snapshot.driver_status == 0 &&
-        laser_snapshot.profile == requested_laser_profile;
-    const bool profile_changed =
-        requested_laser_profile != last_requested_laser_profile;
+    const bool laser_snapshot_available =
+        latestLaserDistanceSnapshot(laser_snapshot);
+    const bool laser_state_ready = requested_sensors.laser_enabled
+        ? laser_snapshot_available && laser_snapshot.initialized &&
+              laser_snapshot.ranging && laser_snapshot.driver_status == 0 &&
+              laser_snapshot.profile == requested_sensors.laser_profile
+        : laser_snapshot_available && !laser_snapshot.ranging;
+    const bool ir_state_ready =
+        latestIrAdcResult().acquisition_enabled ==
+        requested_sensors.ir_enabled;
+    const bool request_changed =
+        !sameSensorAcquisitionRequest(requested_sensors,
+                                      last_sensor_request);
     const bool retry_due =
-        !laser_profile_ready &&
-        now_ms - last_laser_profile_request_ms >= kEsp1StatusPeriodMs;
-    if (profile_changed || retry_due) {
-      requestLaserDistanceProfile(requested_laser_profile);
-      last_requested_laser_profile = requested_laser_profile;
-      last_laser_profile_request_ms = now_ms;
+        (!laser_state_ready || !ir_state_ready) &&
+        now_ms - last_sensor_request_ms >= kEsp1StatusPeriodMs;
+    if (request_changed || retry_due) {
+      requestSensorAcquisition(requested_sensors);
+      last_sensor_request = requested_sensors;
+      last_sensor_request_ms = now_ms;
     }
     funnel_motor.apply(funnel_receiver.motorCommand(now_ms));
 
@@ -1200,7 +1241,7 @@ void rearDriveTask(void* parameters) {
 void setup() {
   Serial.begin(115200);
   (void)initializeLaserSnapshotMailbox();
-  (void)initializeLaserProfileRequestMailbox();
+  (void)initializeSensorAcquisitionRequestMailbox();
   xTaskCreatePinnedToCore(sensorAcquisitionTask, "esp1_sensors",
                           kSensorTaskStackBytes, nullptr,
                           kSensorTaskPriority, nullptr, kSensorTaskCore);

@@ -50,6 +50,12 @@ UartPacket makeRearDriveCommandPacket(const RearDriveCommand& command,
       command.laser_profile == LaserDistanceProfile::HighAccuracy
           ? kRearDriveLaserHighAccuracyFlag
           : 0U;
+  packet.payload[0] |= command.laser_acquisition_enabled
+                           ? kRearDriveLaserAcquisitionEnabledFlag
+                           : 0U;
+  packet.payload[0] |= command.ir_acquisition_enabled
+                           ? kRearDriveIrAcquisitionEnabledFlag
+                           : 0U;
   putI16(&packet.payload[1], clampCommandMilli(command.back_left_command_milli));
   putI16(&packet.payload[3],
          clampCommandMilli(command.back_right_command_milli));
@@ -73,6 +79,10 @@ bool decodeRearDriveCommandPacket(const UartPacket& packet,
       (packet.payload[0] & kRearDriveLaserHighAccuracyFlag) != 0U
           ? LaserDistanceProfile::HighAccuracy
           : LaserDistanceProfile::Default;
+  command.laser_acquisition_enabled =
+      (packet.payload[0] & kRearDriveLaserAcquisitionEnabledFlag) != 0U;
+  command.ir_acquisition_enabled =
+      (packet.payload[0] & kRearDriveIrAcquisitionEnabledFlag) != 0U;
   command.back_left_command_milli =
       clampCommandMilli(getI16(&packet.payload[1]));
   command.back_right_command_milli =
@@ -145,6 +155,17 @@ MotorCommand RearDriveCommandReceiver::backLeftCommand(
 MotorCommand RearDriveCommandReceiver::backRightCommand(
     const Milliseconds now_ms) const {
   return motorCommand(last_command_.back_right_command_milli, now_ms);
+}
+
+bool RearDriveCommandReceiver::laserAcquisitionEnabled(
+    const Milliseconds now_ms) const {
+  return commandIsFresh(now_ms) &&
+         last_command_.laser_acquisition_enabled;
+}
+
+bool RearDriveCommandReceiver::irAcquisitionEnabled(
+    const Milliseconds now_ms) const {
+  return commandIsFresh(now_ms) && last_command_.ir_acquisition_enabled;
 }
 
 LaserDistanceProfile RearDriveCommandReceiver::laserProfile(

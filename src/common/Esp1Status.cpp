@@ -67,6 +67,7 @@ RobotTestMode byteToMode(const std::uint8_t value) {
     case RobotTestMode::ImuStrafeTest:
     case RobotTestMode::HabitatPieces:
     case RobotTestMode::HabitatPlacement:
+    case RobotTestMode::FinalCompetition:
       return static_cast<RobotTestMode>(value);
   }
   return RobotTestMode::Disabled;
@@ -111,6 +112,9 @@ UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
                ? kEsp1StatusIrSwitchDebouncedHighFlag
                : 0U;
   flags |= report.funnel_configured ? kEsp1StatusFunnelConfiguredFlag : 0U;
+  flags |= report.ir_acquisition_enabled
+               ? kEsp1StatusIrAcquisitionEnabledFlag
+               : 0U;
   packet.payload[10] = flags;
   putU16(&packet.payload[11], report.ir_adc_average);
   putU16(&packet.payload[13], report.ir_adc_min);
@@ -196,6 +200,8 @@ bool decodeEsp1StatusPacket(const UartPacket& packet,
       (flags & kEsp1StatusIrSwitchRawHighFlag) != 0U;
   report.ir_switch_debounced_high =
       (flags & kEsp1StatusIrSwitchDebouncedHighFlag) != 0U;
+  report.ir_acquisition_enabled =
+      (flags & kEsp1StatusIrAcquisitionEnabledFlag) != 0U;
   report.funnel_configured =
       (flags & kEsp1StatusFunnelConfiguredFlag) != 0U;
   report.ir_adc_average = getU16(&packet.payload[11]);

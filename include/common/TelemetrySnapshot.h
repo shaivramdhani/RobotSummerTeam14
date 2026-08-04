@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "common/EventLog.h"
+#include "common/FinalCompetitionAutonomy.h"
 #include "common/FaultHealth.h"
 #include "common/HabitatCycleAutonomy.h"
 #include "common/HabitatPiecesAutonomy.h"
@@ -26,6 +27,10 @@ constexpr std::size_t kTelemetryResetReasonSize = 32U;
 constexpr std::size_t kTelemetryFaultMessageSize = 64U;
 constexpr std::size_t kTelemetryImuInitializationErrorSize = 32U;
 constexpr std::size_t kTelemetryImuDiagnosticReasonSize = 40U;
+// ESP2 serializes the complete snapshot into one reusable static buffer. Keep
+// this capacity shared with the native regression test so the dashboard cannot
+// silently drift beyond the firmware's HTTP response buffer.
+constexpr std::size_t kTelemetryJsonBufferSize = 24576U;
 
 struct MotorTelemetry {
   std::int16_t desired_command_milli{0};
@@ -70,6 +75,7 @@ struct Esp1RemoteStatusTelemetry {
   bool solar_hook_configured{false};
   bool solar_hook_output_enabled{false};
   int solar_hook_commanded_angle_deg{-1};
+  bool ir_acquisition_enabled{false};
 };
 
 struct UltrasonicTelemetry {
@@ -444,7 +450,8 @@ struct TelemetrySnapshot {
   Milliseconds solar_post_contact_forward_start_delay_ms{0};
   Milliseconds solar_line_reacquire_strafe_start_delay_ms{0};
   float solar_post_contact_forward_duty{0.0F};
-  Milliseconds solar_rear_line_follow_duration_ms{0U};
+  Milliseconds solar_front_line_follow_duration_ms{0U};
+  float solar_front_line_follow_duty{0.0F};
   bool solar_panel_limit_switches_configured{false};
   bool solar_limit_back_right_high{false};
   bool solar_limit_front_right_high{false};
@@ -459,7 +466,7 @@ struct TelemetrySnapshot {
   Milliseconds habitat_pieces_time_in_state_ms{0U};
   float habitat_pieces_line_follow_duty{
       kDefaultHabitatPiecesLineFollowDuty};
-  Milliseconds habitat_pieces_lss2_detection_delay_ms{0U};
+  Milliseconds habitat_pieces_side_line_ignore_after_start_ms{0U};
   Milliseconds habitat_pieces_lss2_detection_remaining_ms{0U};
   Milliseconds habitat_pieces_run_timeout_ms{0U};
   Milliseconds habitat_pieces_run_elapsed_ms{0U};
@@ -474,6 +481,8 @@ struct TelemetrySnapshot {
   std::uint16_t habitat_pieces_distance_threshold_mm{0U};
   std::uint16_t habitat_pieces_distance_zone_target_count{0U};
   float habitat_pieces_distance_strafe_duty{0.0F};
+  Milliseconds habitat_pieces_distance_count_ignore_ms{0U};
+  Milliseconds habitat_pieces_distance_count_ignore_remaining_ms{0U};
   Milliseconds habitat_pieces_distance_strafe_timeout_ms{0U};
   Milliseconds habitat_pieces_distance_strafe_elapsed_ms{0U};
   Milliseconds habitat_pieces_distance_strafe_remaining_ms{0U};
@@ -531,8 +540,8 @@ struct TelemetrySnapshot {
   bool habitat_pieces_target_reached{false};
   bool habitat_pieces_line_following{false};
   bool habitat_pieces_side_line_aligning{false};
-  bool habitat_pieces_left_side_driving{false};
-  bool habitat_pieces_right_side_driving{false};
+  bool habitat_pieces_rotating_clockwise{false};
+  bool habitat_pieces_rotating_counter_clockwise{false};
   bool habitat_pieces_reversing{false};
   bool habitat_pieces_distance_strafing{false};
   bool habitat_pieces_post_count_waiting{false};
@@ -552,6 +561,7 @@ struct TelemetrySnapshot {
   bool habitat_pieces_distance_measurement_available{false};
   bool habitat_pieces_distance_substituted_no_target{false};
   bool habitat_pieces_distance_sample_new{false};
+  bool habitat_pieces_distance_count_ignore_active{false};
   bool habitat_pieces_distance_zone_active{false};
   bool habitat_pieces_distance_zone_entered{false};
   bool habitat_pieces_distance_exit_above_threshold{false};
@@ -580,6 +590,7 @@ struct TelemetrySnapshot {
       TowerPiecesFaultReason::None};
   Milliseconds tower_pieces_time_in_state_ms{0};
   float tower_pieces_reverse_line_duty{0.0F};
+  Milliseconds tower_pieces_side_line_ignore_after_start_ms{0};
   Milliseconds tower_pieces_side_line_timeout_ms{0};
   Milliseconds tower_pieces_side_line_cooldown_ms{0};
   Milliseconds tower_pieces_side_line_rearm_ms{0};
@@ -592,10 +603,15 @@ struct TelemetrySnapshot {
   Milliseconds tower_pieces_post_rotation_pause_ms{0};
   float tower_pieces_reverse_duty{0.0F};
   Milliseconds tower_pieces_reverse_duration_ms{0};
+  TowerPiecesShimmyInitialDirection
+      tower_pieces_shimmy_initial_direction{
+          TowerPiecesShimmyInitialDirection::Right};
+  Milliseconds tower_pieces_pre_shimmy_delay_ms{0};
   float tower_pieces_shimmy_duty{0.0F};
   Milliseconds tower_pieces_shimmy_right_duration_ms{0};
   Milliseconds tower_pieces_shimmy_left_duration_ms{0};
   Milliseconds tower_pieces_shimmy_timeout_ms{0};
+  Milliseconds tower_pieces_post_shimmy_delay_ms{0};
   float tower_pieces_final_reverse_duty{0.0F};
   Milliseconds tower_pieces_final_reverse_duration_ms{0};
   Milliseconds tower_pieces_post_final_reverse_delay_ms{0};
@@ -613,6 +629,7 @@ struct TelemetrySnapshot {
   bool tower_pieces_side_line_sensor_configured{false};
   bool tower_pieces_side_line_sensor_high{false};
   bool tower_pieces_side_line_armed{false};
+  bool tower_pieces_side_line_ignore_active{false};
   bool tower_pieces_side_line_detection_accepted{false};
   bool tower_pieces_side_line_detection_rejected{false};
   bool tower_pieces_line_following{false};
@@ -642,6 +659,10 @@ struct TelemetrySnapshot {
   Milliseconds peg_finder_funnel_forward_timeout_ms{0};
   Milliseconds peg_finder_post_funnel_limit_delay_ms{0};
   Milliseconds peg_finder_claw_open_interval_ms{0};
+  float peg_finder_shake_duty{0.0F};
+  Milliseconds peg_finder_shake_left_duration_ms{0};
+  Milliseconds peg_finder_shake_right_duration_ms{0};
+  Milliseconds peg_finder_post_shake_delay_ms{0};
   std::uint8_t peg_finder_claw_open_order_1{1U};
   std::uint8_t peg_finder_claw_open_order_2{2U};
   std::uint8_t peg_finder_claw_open_order_3{3U};
@@ -655,6 +676,8 @@ struct TelemetrySnapshot {
   bool peg_finder_driving_forward{false};
   bool peg_finder_funnel_forward{false};
   bool peg_finder_funnel_reverse{false};
+  bool peg_finder_shaking_left{false};
+  bool peg_finder_shaking_right{false};
   bool peg_finder_opening_claw_1{false};
   bool peg_finder_opening_claw_2{false};
   bool peg_finder_opening_claw_3{false};
@@ -666,6 +689,10 @@ struct TelemetrySnapshot {
   Milliseconds time_trial_strafe_right_duration_ms{0};
   Milliseconds time_trial_post_tower_delay_ms{0};
   bool time_trial_strafing_right{false};
+
+  FinalCompetitionState final_competition_state{
+      FinalCompetitionState::WaitForStart};
+  Milliseconds final_competition_time_in_state_ms{0};
 
   MotorTelemetry front_left{};
   MotorTelemetry front_right{};
@@ -693,6 +720,7 @@ struct TelemetrySnapshot {
   std::uint16_t ir_active_threshold{0};
   std::uint8_t ir_consecutive_detection_count{0};
   std::uint32_t ir_adc_sample_rate_hz{0};
+  bool ir_acquisition_enabled{false};
   std::uint16_t motor_command_magnitude_milli{0};
 
   // Legacy flat values remain available to the smaller dedicated API

@@ -34,6 +34,13 @@ enum class TowerPiecesState : std::uint8_t {
   MoveStepperTop = 22,
   WinchClosed = 23,
   PreStepperBottomDelay = 24,
+  PreShimmyDelay = 25,
+  PostShimmyDelay = 26,
+};
+
+enum class TowerPiecesShimmyInitialDirection : std::int8_t {
+  Left = -1,
+  Right = 1,
 };
 
 enum class TowerPiecesFaultReason : std::uint8_t {
@@ -57,6 +64,7 @@ enum class TowerPiecesFaultReason : std::uint8_t {
 struct TowerPiecesConfig {
   // TODO(team): set all values from the telemetry panel after hardware tests.
   float reverse_line_duty{0.0F};
+  Milliseconds side_line_ignore_after_start_ms{0U};
   Milliseconds side_line_timeout_ms{0U};
   Milliseconds side_line_cooldown_ms{0U};
   Milliseconds side_line_rearm_ms{0U};
@@ -68,10 +76,14 @@ struct TowerPiecesConfig {
   Milliseconds post_rotation_pause_ms{1000U};
   float reverse_duty{0.0F};
   Milliseconds reverse_duration_ms{0U};
+  TowerPiecesShimmyInitialDirection shimmy_initial_direction{
+      TowerPiecesShimmyInitialDirection::Right};
+  Milliseconds pre_shimmy_delay_ms{0U};
   Milliseconds shimmy_right_duration_ms{0U};
   Milliseconds shimmy_left_duration_ms{0U};
   Milliseconds shimmy_timeout_ms{0U};
   float shimmy_duty{0.0F};
+  Milliseconds post_shimmy_delay_ms{0U};
   float final_reverse_duty{0.0F};
   Milliseconds final_reverse_duration_ms{0U};
   Milliseconds post_final_reverse_delay_ms{1000U};
@@ -103,11 +115,14 @@ struct TowerPiecesAutonomy {
   std::uint16_t side_line_rejected_count{0U};
   bool previous_side_line_high{false};
   bool side_line_armed{false};
+  bool side_line_ignore_active{false};
   bool side_line_off_timing{false};
   bool last_side_line_detection_accepted{false};
   bool last_side_line_detection_rejected{false};
   Milliseconds side_line_off_started_at_ms{0U};
   Milliseconds side_line_last_accepted_at_ms{0U};
+  bool first_shimmy_pulse{false};
+  bool back_line_detected{false};
 };
 
 struct TowerPiecesUpdate {
@@ -119,6 +134,7 @@ struct TowerPiecesUpdate {
   bool side_line_detection_accepted{false};
   bool side_line_detection_rejected{false};
   bool side_line_armed{false};
+  bool side_line_ignore_active{false};
   bool should_line_follow{false};
   bool should_initial_strafe_right{false};
   bool should_rotate_clockwise{false};
@@ -132,6 +148,8 @@ struct TowerPiecesUpdate {
 };
 
 const char* towerPiecesStateName(TowerPiecesState state);
+const char* towerPiecesShimmyInitialDirectionName(
+    TowerPiecesShimmyInitialDirection direction);
 const char* towerPiecesFaultReasonName(TowerPiecesFaultReason reason);
 bool towerPiecesConfigValid(const TowerPiecesConfig& config,
                             float maximum_allowed_duty,

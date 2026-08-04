@@ -24,6 +24,12 @@ enum class PegFinderState : std::uint8_t {
   OpenClaw3 = 14,
   PostClawsOpenDelay = 15,
   FunnelReverse = 16,
+  ShakeLeftAfterClaw1 = 17,
+  ShakeRightAfterClaw1 = 18,
+  ShakeLeftAfterClaw2 = 19,
+  ShakeRightAfterClaw2 = 20,
+  PostShakeAfterClaw1Delay = 21,
+  PostShakeAfterClaw2Delay = 22,
 };
 
 enum class PegFinderFaultReason : std::uint8_t {
@@ -51,6 +57,11 @@ struct PegFinderConfig {
   Milliseconds funnel_forward_timeout_ms{0U};
   Milliseconds post_funnel_limit_delay_ms{0U};
   Milliseconds claw_open_interval_ms{0U};
+  // Zero for all three fields keeps shaking disabled until the team tunes it.
+  float shake_duty{0.0F};
+  Milliseconds shake_left_duration_ms{0U};
+  Milliseconds shake_right_duration_ms{0U};
+  Milliseconds post_shake_delay_ms{0U};
   std::uint8_t claw_open_order_1{1U};
   std::uint8_t claw_open_order_2{2U};
   std::uint8_t claw_open_order_3{3U};
@@ -78,6 +89,8 @@ struct PegFinderUpdate {
   bool should_drive_forward{false};
   bool should_run_funnel_forward{false};
   bool should_run_funnel_reverse{false};
+  bool should_shake_left{false};
+  bool should_shake_right{false};
   bool funnel_limit_detected{false};
   bool should_open_claw_1{false};
   bool should_open_claw_2{false};

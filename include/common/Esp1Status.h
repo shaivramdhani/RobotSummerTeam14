@@ -18,6 +18,7 @@ constexpr std::uint8_t kEsp1StatusIrBeaconDetectedFlag = 0x08U;
 constexpr std::uint8_t kEsp1StatusIrSwitchRawHighFlag = 0x10U;
 constexpr std::uint8_t kEsp1StatusIrSwitchDebouncedHighFlag = 0x20U;
 constexpr std::uint8_t kEsp1StatusFunnelConfiguredFlag = 0x40U;
+constexpr std::uint8_t kEsp1StatusIrAcquisitionEnabledFlag = 0x80U;
 constexpr std::uint8_t kEsp1StatusSolarLimitConfiguredFlag = 0x01U;
 constexpr std::uint8_t kEsp1StatusSolarLimitBackRightHighFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusSolarLimitFrontRightHighFlag = 0x04U;
@@ -67,6 +68,7 @@ struct Esp1StatusReport {
   std::uint16_t ir_active_threshold{0};
   std::uint8_t ir_consecutive_detection_count{0};
   std::uint32_t ir_adc_sample_rate_hz{0};
+  bool ir_acquisition_enabled{false};
 };
 
 UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,

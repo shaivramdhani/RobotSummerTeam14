@@ -55,6 +55,7 @@ enum class HabitatPiecesStopReason : std::uint8_t {
   RearLineTimeout = 17,
   StepperCommandFailed = 18,
   RearLineReached = 19,
+  Lss3Detected = 20,
 };
 
 enum class HabitatPiecesStrafeDirection : std::int8_t {
@@ -65,7 +66,7 @@ enum class HabitatPiecesStrafeDirection : std::int8_t {
 
 struct HabitatPiecesConfig {
   float line_follow_duty{kDefaultHabitatPiecesLineFollowDuty};
-  Milliseconds lss2_detection_delay_ms{0U};
+  Milliseconds side_line_ignore_after_start_ms{0U};
   Milliseconds run_timeout_ms{0U};
   float reverse_duty{0.0F};
   Milliseconds reverse_duration_ms{0U};
@@ -74,6 +75,7 @@ struct HabitatPiecesConfig {
   std::uint16_t distance_threshold_mm{0U};
   std::uint16_t distance_zone_target_count{0U};
   float distance_strafe_duty{0.0F};
+  Milliseconds distance_count_ignore_ms{0U};
   Milliseconds distance_strafe_timeout_ms{0U};
   Milliseconds post_count_stop_delay_ms{0U};
   float exit_strafe_duty{0.0F};
@@ -129,7 +131,9 @@ struct HabitatPiecesAutonomy {
   Milliseconds lift_start_delay_elapsed_ms{0U};
   Milliseconds post_pickup_reverse_elapsed_ms{0U};
   Milliseconds rear_line_reacquire_elapsed_ms{0U};
-  // The existing delay arms the LSS2 stop gate. LSS3 remains telemetry-only.
+  // Both side sensors ignore HIGH readings until this gate is armed. The first
+  // sensor to latch selects the rotation direction; the opposite sensor then
+  // terminates alignment.
   bool lss2_detection_armed{false};
   bool lss2_latched{false};
   bool lss3_latched{false};
@@ -155,8 +159,8 @@ struct HabitatPiecesUpdate {
   bool should_stop{true};
   bool should_line_follow{false};
   bool should_align_side_lines{false};
-  bool should_drive_left_side{false};
-  bool should_drive_right_side{false};
+  bool should_rotate_clockwise{false};
+  bool should_rotate_counter_clockwise{false};
   bool should_reverse{false};
   bool should_distance_strafe{false};
   bool should_wait_after_distance_count{false};
@@ -180,6 +184,7 @@ struct HabitatPiecesUpdate {
   bool lss3_newly_latched{false};
   bool distance_measurement_available{false};
   bool distance_sample_new{false};
+  bool distance_count_ignore_active{false};
   bool distance_zone_active{false};
   bool distance_zone_entered{false};
   std::uint32_t distance_mm{0U};

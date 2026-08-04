@@ -15,12 +15,14 @@ calibration values.
 - `LSBR` threshold: TODO
 - Rear/side active levels or ADC ranges: TODO
 - Calibrate Habitat Pieces pickup profiles 1, 2, and 3 independently: LSS2
-  detection delay, overall LSS2 search timeout,
+  and LSS3 HIGH-ignore window, overall side-line search/alignment timeout,
   line-follow duty, reverse duty/duration, distance-strafe left/right direction,
   distance threshold, target zone count, strafe duty, and strafe timeout: TODO;
   set only after raised-wheel and field-path testing. Distance strafing also
   requires calibrated shared IMU heading-hold tuning. Calibrate the short
   exit-pulse strafe duty independently from the long counting-strafe duty.
+  Verify that an LSS2-first alignment is physically clockwise and an LSS3-first
+  alignment is counter-clockwise under the configured wheel inversions.
 - For each Habitat Pieces pickup profile, calibrate slide-down speed/timeout,
   GPIO48 habitat-piece limit-switch
   operation, approach duty/timeout, pre-lift reverse duration, lift
@@ -29,12 +31,21 @@ calibration values.
   the bottom switch, active-high approach switch, step-counted lift distance,
   both rear sensors, and the
   automatic Habitat Placement handoff with wheels raised first.
+- Calibrate the Solar exit front-line reacquisition strafe duty, forward PID
+  duty, and forward PID duration independently. Verify that either front sensor
+  finding tape produces a stopped handoff before the PID begins.
+- Calibrate the Tower Pieces side-line HIGH-ignore window so it spans the
+  Habitat-to-Tower handoff but remains shorter than the side-line timeout.
+  Verify that a sensor held HIGH through the window must go LOW before the next
+  HIGH counts.
 
 ## IR Beacon
 
 - `LeftIRFiltered` active level: TODO
 - `RightIRFiltered` active level: TODO
 - `FREQ` GPIO2 selects 1 kHz when HIGH and 10 kHz when LOW.
+- Confirm IR acquisition reports active only during Solar and stops after Solar
+  completion, fault, Stop, or stale ESP2 commands.
 
 ## Ultrasonic Sensors
 
@@ -64,8 +75,9 @@ calibration values.
 - 7-bit I2C address: `0x29`.
 - Bus clock: 100 kHz.
 - High-accuracy sensor profile with a 200 ms continuous intermeasurement
-  period. ESP1 selects this profile before ranging starts, and idle, active,
-  stopped, fault, and stale-command states retain it.
+  period while Habitat Pickup or Placement is active. ESP1 selects this profile
+  before ranging starts; idle, stopped, fault, and stale-command states retain
+  the profile but disable acquisition.
 - The Adafruit high-accuracy preset disables the range-ignore threshold. If a
   distant or absent target repeatedly appears as a short valid range, inspect
   protective film, dust, nearby chassis edges, cover-window air gap/tilt, and
@@ -85,7 +97,8 @@ calibration values.
 - Maximum safe test duty: TODO
 - Servo safe pulse ranges: TODO
 - Solar Hook servo uses the team-confirmed claw servo settings:
-  50 Hz, 12-bit, 1000–2000 µs. Open/Closed angles remain unset until calibrated.
+  50 Hz, 12-bit, 1000–2000 µs. Its adjustable Open/Closed angles default to
+  `0/148` degrees.
 - Habitat Pusher uses GPIO5/LEDC 7 at 50 Hz, 12-bit, and 1000–2000 µs. Its
   open/closed angles remain TODO.
   Calibrate the two targets so the physical arm rotates clockwise from Closed
@@ -105,5 +118,14 @@ calibration values.
   the shared adjustable IMU maximum rotation duty. Every placement strafe uses
   the shared IMU heading-hold gains, yaw-correction limit, and measured yaw
   command polarity.
+- PegFinder shake duty, left-pulse duration, and right-pulse duration: TODO.
+  All three default to zero, which disables shaking. Tune with the robot raised
+  and confirm each left/right pulse is small enough to preserve funnel and line
+  alignment before enabling it in Final Competition.
+- PegFinder stopped delay after each completed shake and before the next claw:
+  TODO. Tune it independently from the claw-open interval.
+- Tower shimmy initial direction, full left/right durations, and stopped delays
+  before/after shimmy: TODO. Remember that firmware automatically applies 50%
+  of the selected direction's duration to the first pulse.
 - Stepper step timing and direction polarity: TODO
 - Limit switch active levels: TODO

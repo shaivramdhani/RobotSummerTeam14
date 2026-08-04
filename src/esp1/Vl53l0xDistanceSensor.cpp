@@ -111,21 +111,34 @@ bool Vl53l0xDistanceSensor::initialize(
     return false;
   }
 
-  ranging_ =
-      sensor_.startRangeContinuous(config.intermeasurement_period_ms);
+  ranging_ = false;
+  snapshot_.ranging = false;
+  snapshot_.data_valid = false;
   snapshot_.driver_status = driverStatus(sensor_.Status);
-  snapshot_.ranging = ranging_;
   snapshot_.profile = kOperationalLaserDistanceProfile;
   profile_ = kOperationalLaserDistanceProfile;
-  return ranging_;
+  return true;
 }
 
 bool Vl53l0xDistanceSensor::setProfile(
     const I2cDistanceSensorConfig& config,
     const LaserDistanceProfile profile) {
+  return setAcquisitionEnabled(config, true, profile);
+}
+
+bool Vl53l0xDistanceSensor::setAcquisitionEnabled(
+    const I2cDistanceSensorConfig& config, const bool enabled,
+    const LaserDistanceProfile profile) {
   if (!snapshot_.configured || !configValid(config) || !initialized_ ||
       !default_profile_captured_) {
     return false;
+  }
+  if (!enabled && !ranging_) {
+    snapshot_.ranging = false;
+    snapshot_.data_valid = false;
+    snapshot_.distance_mm = 0U;
+    snapshot_.sensor_range_status = 0xFFU;
+    return true;
   }
   if (initialized_ && ranging_ && profile_ == profile) {
     return true;
@@ -148,6 +161,10 @@ bool Vl53l0xDistanceSensor::setProfile(
   snapshot_.data_valid = false;
   snapshot_.distance_mm = 0U;
   snapshot_.sensor_range_status = 0xFFU;
+
+  if (!enabled) {
+    return true;
+  }
 
   bool profile_configured = false;
   if (profile == LaserDistanceProfile::HighAccuracy) {

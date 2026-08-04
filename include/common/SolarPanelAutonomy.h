@@ -17,10 +17,10 @@ enum class SolarPanelAutonomyState : std::uint8_t {
   MoveForwardForSolarRetry = 7,
   RetryStrafeRightToSolarPanel = 8,
   MoveForwardAfterSolarContact = 9,
-  StrafeLeftToRearLine = 10,
-  RearLineReacquired = 11,
-  WaitBeforeStrafeLeftToRearLine = 12,
-  BackwardLineFollowAfterRearDetection = 13,
+  StrafeLeftToFrontLine = 10,
+  FrontLineFollowComplete = 11,
+  WaitBeforeStrafeLeftToFrontLine = 12,
+  ForwardLineFollowAfterFrontDetection = 13,
 };
 
 enum class SolarPanelFaultReason : std::uint8_t {
@@ -58,7 +58,8 @@ struct SolarPanelContactConfig {
   Milliseconds line_reacquire_strafe_start_delay_ms{0};
   float post_contact_forward_duty{0.0F};
   float line_reacquire_strafe_duty{0.0F};
-  Milliseconds rear_line_follow_duration_ms{0U};
+  Milliseconds front_line_follow_duration_ms{0U};
+  float front_line_follow_duty{0.0F};
 };
 
 struct SolarPanelContactSequenceUpdate {

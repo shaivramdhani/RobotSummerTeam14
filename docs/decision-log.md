@@ -316,3 +316,19 @@ Safety note: The slide timeout begins with the earlier concurrent command; an
 unexpected stop or timeout before the bottom limit faults both mechanisms. The
 new pulse duty is validated against the motor cap and IMU correction reserve,
 and every pulse still ends with an all-wheel stop before checking distance.
+
+## 2026-08-04: Habitat Pieces Sensor-Directed Side-Line Rotation
+
+Decision: Supersede the LSS2-only Habitat Pieces stop behavior and the earlier
+single-wheel side alignment. During pickup line following, either LSS2 or LSS3
+stops all four wheels. LSS2-first selects clockwise chassis rotation until LSS3
+sees black; LSS3-first selects counter-clockwise rotation until LSS2 sees
+black. If both sensors see black together, skip rotation. Stop all wheels again
+before continuing through the existing reverse, distance-strafe, and exit-pulse
+steps.
+
+Safety note: Rotation reuses the pickup profile's adjustable line-follow duty,
+uses the chassis mixer's physical yaw convention, and remains bounded by the
+pickup run timeout. Both side-sensor snapshots must remain configured and fresh until
+alignment completes, and the transition into and out of rotation emits an
+all-wheel stopped update.

@@ -18,6 +18,9 @@ class Vl53l0xDistanceSensor {
                   const I2cDistanceSensorConfig& config);
   bool setProfile(const I2cDistanceSensorConfig& config,
                   LaserDistanceProfile profile);
+  bool setAcquisitionEnabled(const I2cDistanceSensorConfig& config,
+                             bool enabled,
+                             LaserDistanceProfile profile);
   bool service(Milliseconds now_ms);
 
   const LaserDistanceSnapshot& snapshot() const;

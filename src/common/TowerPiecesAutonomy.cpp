@@ -52,12 +52,27 @@ const char* towerPiecesStateName(const TowerPiecesState state) {
       return "WINCH_CLOSED";
     case TowerPiecesState::PreStepperBottomDelay:
       return "PRE_STEPPER_BOTTOM_DELAY";
+    case TowerPiecesState::PreShimmyDelay:
+      return "PRE_SHIMMY_DELAY";
+    case TowerPiecesState::PostShimmyDelay:
+      return "POST_SHIMMY_DELAY";
     case TowerPiecesState::Complete:
       return "COMPLETE";
     case TowerPiecesState::Fault:
       return "FAULT";
   }
   return "WAIT_FOR_START";
+}
+
+const char* towerPiecesShimmyInitialDirectionName(
+    const TowerPiecesShimmyInitialDirection direction) {
+  switch (direction) {
+    case TowerPiecesShimmyInitialDirection::Left:
+      return "LEFT";
+    case TowerPiecesShimmyInitialDirection::Right:
+      return "RIGHT";
+  }
+  return "INVALID";
 }
 
 const char* towerPiecesFaultReasonName(
@@ -107,6 +122,16 @@ bool towerPiecesConfigValid(const TowerPiecesConfig& config,
       config.final_reverse_duty <= maximum_allowed_duty &&
       (config.final_reverse_duration_ms == 0U ||
        config.final_reverse_duty > 0.0F);
+  const bool shimmy_direction_valid =
+      config.shimmy_initial_direction ==
+          TowerPiecesShimmyInitialDirection::Left ||
+      config.shimmy_initial_direction ==
+          TowerPiecesShimmyInitialDirection::Right;
+  const Milliseconds initial_shimmy_duration_ms =
+      config.shimmy_initial_direction ==
+              TowerPiecesShimmyInitialDirection::Left
+          ? config.shimmy_left_duration_ms
+          : config.shimmy_right_duration_ms;
 
   return std::isfinite(config.reverse_line_duty) &&
          std::isfinite(config.clockwise_rotation_angle_deg) &&
@@ -117,7 +142,8 @@ bool towerPiecesConfigValid(const TowerPiecesConfig& config,
          config.clockwise_rotation_angle_deg > 0.0F &&
          config.reverse_duty > 0.0F &&
          config.reverse_duty <= maximum_allowed_duty &&
-         config.side_line_timeout_ms > 0U &&
+         config.side_line_timeout_ms >
+             config.side_line_ignore_after_start_ms &&
          config.post_line_delay_ms > 0U &&
          std::isfinite(config.strafe_right_duty) &&
          config.strafe_right_duty > 0.0F &&
@@ -126,8 +152,10 @@ bool towerPiecesConfigValid(const TowerPiecesConfig& config,
          config.post_strafe_pause_ms > 0U &&
          config.post_rotation_pause_ms > 0U &&
          config.reverse_duration_ms > 0U &&
+         shimmy_direction_valid &&
          config.shimmy_right_duration_ms > 0U &&
          config.shimmy_left_duration_ms > 0U &&
+         initial_shimmy_duration_ms >= 2U &&
          config.shimmy_timeout_ms > 0U &&
          std::isfinite(config.shimmy_duty) &&
          config.shimmy_duty > 0.0F &&
@@ -183,6 +211,15 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
 
   switch (autonomy.state) {
     case TowerPiecesState::ReverseLineFollow:
+      autonomy.side_line_ignore_active =
+          now_ms - autonomy.started_at_ms <
+          config.side_line_ignore_after_start_ms;
+      if (autonomy.side_line_ignore_active) {
+        autonomy.previous_side_line_high = inputs.side_line_high;
+        autonomy.side_line_armed = false;
+        autonomy.side_line_off_timing = false;
+        break;
+      }
       update.side_line_rising_edge =
           !autonomy.previous_side_line_high && inputs.side_line_high;
       if (!inputs.side_line_high) {
@@ -285,24 +322,53 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
     case TowerPiecesState::ReverseTimed:
       if (now_ms - autonomy.state_entered_at_ms >=
           config.reverse_duration_ms) {
-        autonomy.state = TowerPiecesState::ShimmyRight;
+        autonomy.state = TowerPiecesState::PreShimmyDelay;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+
+    case TowerPiecesState::PreShimmyDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.pre_shimmy_delay_ms) {
+        autonomy.state =
+            config.shimmy_initial_direction ==
+                    TowerPiecesShimmyInitialDirection::Left
+                ? TowerPiecesState::ShimmyLeft
+                : TowerPiecesState::ShimmyRight;
         autonomy.state_entered_at_ms = now_ms;
         autonomy.shimmy_started_at_ms = now_ms;
+        autonomy.first_shimmy_pulse = true;
       }
       break;
 
     case TowerPiecesState::ShimmyLeft:
       if (now_ms - autonomy.state_entered_at_ms >=
-          config.shimmy_left_duration_ms) {
+          (autonomy.first_shimmy_pulse
+               ? config.shimmy_left_duration_ms / 2U
+               : config.shimmy_left_duration_ms)) {
         autonomy.state = TowerPiecesState::ShimmyRight;
         autonomy.state_entered_at_ms = now_ms;
+        autonomy.first_shimmy_pulse = false;
       }
       break;
 
     case TowerPiecesState::ShimmyRight:
       if (now_ms - autonomy.state_entered_at_ms >=
-          config.shimmy_right_duration_ms) {
+          (autonomy.first_shimmy_pulse
+               ? config.shimmy_right_duration_ms / 2U
+               : config.shimmy_right_duration_ms)) {
         autonomy.state = TowerPiecesState::ShimmyLeft;
+        autonomy.state_entered_at_ms = now_ms;
+        autonomy.first_shimmy_pulse = false;
+      }
+      break;
+
+    case TowerPiecesState::PostShimmyDelay:
+      if (now_ms - autonomy.state_entered_at_ms >=
+          config.post_shimmy_delay_ms) {
+        autonomy.state = config.final_reverse_duration_ms == 0U
+                             ? TowerPiecesState::PostFinalReverseDelay
+                             : TowerPiecesState::FinalReverse;
         autonomy.state_entered_at_ms = now_ms;
       }
       break;
@@ -406,12 +472,10 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
 
   if (autonomy.state == TowerPiecesState::ShimmyLeft ||
       autonomy.state == TowerPiecesState::ShimmyRight) {
-    update.back_line_detected =
+    autonomy.back_line_detected =
         inputs.back_left_line_high || inputs.back_right_line_high;
-    if (update.back_line_detected) {
-      autonomy.state = config.final_reverse_duration_ms == 0U
-                           ? TowerPiecesState::PostFinalReverseDelay
-                           : TowerPiecesState::FinalReverse;
+    if (autonomy.back_line_detected) {
+      autonomy.state = TowerPiecesState::PostShimmyDelay;
       autonomy.fault_reason = TowerPiecesFaultReason::None;
       autonomy.state_entered_at_ms = now_ms;
     } else if (config.shimmy_timeout_ms == 0U ||
@@ -422,6 +486,7 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
                               now_ms);
     }
   }
+  update.back_line_detected = autonomy.back_line_detected;
 
   update.state = autonomy.state;
   update.fault_reason = autonomy.fault_reason;
@@ -429,6 +494,7 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
   update.side_line_rejected_count =
       autonomy.side_line_rejected_count;
   update.side_line_armed = autonomy.side_line_armed;
+  update.side_line_ignore_active = autonomy.side_line_ignore_active;
   update.side_line_detection_accepted =
       autonomy.last_side_line_detection_accepted;
   update.side_line_detection_rejected =

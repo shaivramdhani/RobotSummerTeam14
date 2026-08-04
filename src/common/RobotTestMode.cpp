@@ -78,6 +78,8 @@ const char* robotTestModeName(const RobotTestMode mode) {
       return "HABITAT_PIECES";
     case RobotTestMode::HabitatPlacement:
       return "HABITAT_PLACEMENT";
+    case RobotTestMode::FinalCompetition:
+      return "FINAL_COMPETITION";
   }
 
   return "DISABLED";
@@ -179,6 +181,12 @@ bool parseRobotTestMode(const char* text, RobotTestMode& mode) {
     mode = RobotTestMode::HabitatPlacement;
     return true;
   }
+  if (sameModeToken(text, "final-competition") ||
+      sameModeToken(text, "finalcompetition") ||
+      sameModeToken(text, "competition")) {
+    mode = RobotTestMode::FinalCompetition;
+    return true;
+  }
 
   return false;
 }
@@ -196,6 +204,7 @@ bool robotTestModeAllowsMotion(const RobotTestMode mode) {
          mode == RobotTestMode::ImuStrafeTest ||
          mode == RobotTestMode::HabitatPieces ||
          mode == RobotTestMode::HabitatPlacement ||
+         mode == RobotTestMode::FinalCompetition ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 
@@ -210,6 +219,7 @@ bool robotTestModeRequiresRearLink(const RobotTestMode mode) {
          mode == RobotTestMode::ImuStrafeTest ||
          mode == RobotTestMode::HabitatPieces ||
          mode == RobotTestMode::HabitatPlacement ||
+         mode == RobotTestMode::FinalCompetition ||
          mode == RobotTestMode::AutonomousSolarPanel;
 }
 

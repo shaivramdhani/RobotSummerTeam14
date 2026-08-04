@@ -30,7 +30,8 @@ Use a small number of periodic or event-driven FreeRTOS tasks:
   monitoring.
 - ESP1 sensor-acquisition task on core 0: sole owner of the ESP1 `Wire` bus and
   VL53L0X on SDA GPIO10/SCL GPIO9. It polls measurement readiness without
-  waiting for a range to complete, shares the existing sensor task, and
+  waiting for a range to complete only when Habitat requests acquisition,
+  samples the IR inputs only when Solar requests acquisition, and
   publishes the newest complete `LaserDistanceSnapshot` through a static
   one-element queue.
 - ESP2 motion task on core 1: line sensor acquisition, pure line observation,
@@ -48,22 +49,32 @@ shared acquisition path for work that must be isolated from control; add future
 bounded sensor work to that service instead of adding a task for each device.
 Sensor acquisition produces immutable snapshots that downstream logic consumes.
 
-ESP1 starts the VL53L0X in continuous timed ranging with the library's
-high-accuracy sensor profile, a 200 ms intermeasurement period, a 10 ms nonblocking service
-period, a 100 kHz bus, and a 5 ms I2C transaction timeout. A new result is sent
+ESP1 initializes the VL53L0X with the library's high-accuracy sensor profile
+but leaves ranging stopped. Habitat Pickup and Placement request continuous
+timed ranging with a 200 ms intermeasurement period, a 10 ms nonblocking service
+period, a 100 kHz bus, and a 5 ms I2C transaction timeout. Solar similarly
+requests IR acquisition only for its active route. Both acquisition requests
+expire with a stale ESP2 command. A new laser result is sent
 to ESP2 in a dedicated CRC-protected UART frame; an unchanged startup or fault
 snapshot is resent every 100 ms as a heartbeat. ESP2 measures freshness from
 arrival of a new measurement sequence, not from receipt of that heartbeat.
 
 The current ESP1 mission state machine still emits only disabled chassis
 commands. ESP2's explicit `HABITAT_PIECES` mode line-follows with the front
-sensors at a separately adjustable duty. It ignores the ESP1-owned LSS2 input
-for a locked-by-default `lss2_detection_delay_ms`. A fresh black LSS2 input
-after that delay stops all four wheels before the route transitions to the
+sensors at a separately adjustable duty. It ignores HIGH readings from the
+ESP1-owned LSS2 and LSS3 inputs for a locked-by-default
+`side_line_ignore_after_start_ms`. Either input may latch after the gate and
+immediately stops all four wheels. LSS2 selects clockwise rotation until LSS3
+sees black; LSS3 selects counter-clockwise rotation until LSS2 sees black. The
+rotation uses the profile's line-follow duty and the chassis mixer's physical
+clockwise/counter-clockwise yaw convention. A second all-wheel stop separates alignment from the
 straight-backward open-loop mecanum command at configured
 `reverse_duty` for `reverse_duration_ms`. The next state strafes left or right
 at configured duty through the shared IMU heading-hold controller while
 consuming fresh high-accuracy laser attempts with a new measurement sequence.
+A per-profile `distance_count_ignore_ms` gate holds the count at zero after
+distance strafing begins. Readings still update the zone latch during the gate,
+so a target held near must leave and re-enter after the gate to count.
 A fresh N/A/no-target result is represented as 65536 mm, one above every
 configurable threshold. A new reading at or below `distance_threshold_mm`
 increments the zone count when the preceding reading was above; consecutive
@@ -81,9 +92,9 @@ opposite the original direction until either rear sensor detects tape. Once
 the lift is also complete, ESP2 requests the
 existing Habitat Placement route. `distance_strafe_timeout_ms` bounds all of these
 distance-strafe phases even if the stream becomes unavailable.
-`run_timeout_ms` bounds the LSS2 search and must be longer
-than the detection delay. LSS2 configuration and snapshot freshness are
-required until it latches; LSS3 is telemetry-only. The reverse remains bounded
+`run_timeout_ms` bounds both the first side-line search and the opposite-sensor
+alignment, and must be longer than the detection delay. LSS2/LSS3 configuration
+and snapshot freshness are required until both latch. The reverse remains bounded
 by its own duration and the normal motor/link command-expiry gates.
 The Habitat cycle coordinator stores three pickup profiles and three matching
 placement profiles. One Habitat Pieces Start alternates Pickup 1, Placement 1,
@@ -92,7 +103,8 @@ fresh initial heading when that placement begins. Its return line source is a
 per-profile Front/Rear setting; migrated defaults are Front, Front, Rear. The
 slide lower-limit search begins with, and runs concurrently through, each
 forward-to-slide drive; its timeout is measured from that earlier start. The
-third placement ends stopped, ready for a later route selection.
+third placement ends stopped on the rear line. `FINAL_COMPETITION` then starts
+Tower Pieces in reverse line-following without changing the parent mode.
 
 The VL53L0X operates in its high-accuracy profile. It is not a start gate.
 Fresh N/A/no-target results participate as the large-distance sentinel; an
@@ -133,6 +145,8 @@ existing mecanum mixer, then passes the resulting `FourWheelCommand` through
 `applyWheelCommand()` unchanged. Solar lateral stages, the Tower initial
 strafe and shimmy, and the optional Time Trial transition use the same live
 Stage 3 configuration while retaining their mode-specific durations/timeouts.
+A Tower shimmy has stopped pre/post delays, starts in its configured direction,
+and shortens only its first directional pulse to half the normal duration.
 A dedicated browser heartbeat expires manual held tests after the existing
 command timeout. Autonomous uses state-machine durations and the normal
 communication expiry path.

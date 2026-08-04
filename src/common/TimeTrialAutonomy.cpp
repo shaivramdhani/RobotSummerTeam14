@@ -82,10 +82,6 @@ TimeTrialUpdate updateTimeTrialAutonomy(
     case TimeTrialState::AutonomousSolar:
       if (inputs.solar_fault) {
         failTimeTrialAutonomy(autonomy, now_ms);
-      } else if (inputs.solar_line_follow_ready) {
-        enterState(autonomy, TimeTrialState::TowerPieces, now_ms);
-        update.should_start_tower_pieces = true;
-        update.should_handoff_solar_line_follow = true;
       } else if (inputs.solar_complete) {
         enterState(autonomy, TimeTrialState::PostSolarDelay, now_ms);
       }

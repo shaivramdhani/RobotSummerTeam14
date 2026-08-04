@@ -650,6 +650,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"retry_strafe_timeout_ms\":%u,"
                 "\"post_contact_forward_duration_ms\":%u,"
                 "\"line_reacquire_strafe_duty\":%.5f,"
+                "\"front_line_follow_duration_ms\":%u,"
+                "\"front_line_follow_duty\":%.5f,"
                 "\"post_contact_forward_start_delay_ms\":%u,"
                 "\"line_reacquire_strafe_start_delay_ms\":%u,"
                 "\"post_contact_forward_duty\":%.5f,"
@@ -709,6 +711,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                     snapshot.solar_post_contact_forward_duration_ms),
                 snapshot.solar_line_reacquire_strafe_duty,
                 static_cast<unsigned>(
+                    snapshot.solar_front_line_follow_duration_ms),
+                snapshot.solar_front_line_follow_duty,
+                static_cast<unsigned>(
                     snapshot.solar_post_contact_forward_start_delay_ms),
                 static_cast<unsigned>(
                     snapshot.solar_line_reacquire_strafe_start_delay_ms),
@@ -736,19 +741,21 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
   writer.append(
       ",\"solar_strafe_speeds\":{\"initial_right_duty\":%.5f,"
       "\"retry_left_duty\":%.5f,\"retry_right_duty\":%.5f,"
-      "\"rear_line_strafe_duty\":%.5f,"
-      "\"backward_pid_duration_ms\":%u}",
+      "\"front_line_strafe_duty\":%.5f,"
+      "\"forward_pid_duration_ms\":%u,"
+      "\"forward_pid_duty\":%.5f}",
       snapshot.solar_contact_strafe_duty,
       snapshot.solar_retry_left_strafe_duty,
       snapshot.solar_retry_right_strafe_duty,
       snapshot.solar_line_reacquire_strafe_duty,
       static_cast<unsigned>(
-          snapshot.solar_rear_line_follow_duration_ms));
+          snapshot.solar_front_line_follow_duration_ms),
+      snapshot.solar_front_line_follow_duty);
 
   writer.append(
       ",\"habitat_pieces\":{\"state\":\"%s\","
       "\"stop_reason\":\"%s\",\"time_in_state_ms\":%u,"
-      "\"line_follow_duty\":%.5f,\"lss2_detection_delay_ms\":%u,"
+      "\"line_follow_duty\":%.5f,\"side_line_ignore_after_start_ms\":%u,"
       "\"lss2_detection_remaining_ms\":%u,"
       "\"run_timeout_ms\":%u,\"run_elapsed_ms\":%u,"
       "\"timeout_remaining_ms\":%u,"
@@ -758,6 +765,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"distance_threshold_mm\":%u,"
       "\"distance_zone_target_count\":%u,"
       "\"distance_strafe_duty\":%.5f,"
+      "\"distance_count_ignore_ms\":%u,"
+      "\"distance_count_ignore_remaining_ms\":%u,"
       "\"distance_strafe_timeout_ms\":%u,"
       "\"distance_strafe_elapsed_ms\":%u,"
       "\"distance_strafe_remaining_ms\":%u,"
@@ -786,7 +795,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"should_stop\":%s,"
       "\"target_reached\":%s,\"line_following\":%s,"
       "\"side_line_aligning\":%s,"
-      "\"left_side_driving\":%s,\"right_side_driving\":%s,"
+      "\"rotating_clockwise\":%s,"
+      "\"rotating_counter_clockwise\":%s,"
       "\"reversing\":%s,\"distance_strafing\":%s,"
       "\"post_count_waiting\":%s,"
       "\"exit_strafe_pulsing\":%s,"
@@ -794,6 +804,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"distance_measurement_available\":%s,"
       "\"distance_substituted_no_target\":%s,"
       "\"distance_sample_new\":%s,"
+      "\"distance_count_ignore_active\":%s,"
       "\"distance_zone_active\":%s,"
       "\"distance_zone_entered\":%s,"
       "\"distance_exit_above_threshold\":%s,"
@@ -833,7 +844,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(snapshot.habitat_pieces_time_in_state_ms),
       snapshot.habitat_pieces_line_follow_duty,
       static_cast<unsigned>(
-          snapshot.habitat_pieces_lss2_detection_delay_ms),
+          snapshot.habitat_pieces_side_line_ignore_after_start_ms),
       static_cast<unsigned>(
           snapshot.habitat_pieces_lss2_detection_remaining_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_run_timeout_ms),
@@ -850,6 +861,10 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(
           snapshot.habitat_pieces_distance_zone_target_count),
       snapshot.habitat_pieces_distance_strafe_duty,
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_distance_count_ignore_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_distance_count_ignore_remaining_ms),
       static_cast<unsigned>(
           snapshot.habitat_pieces_distance_strafe_timeout_ms),
       static_cast<unsigned>(
@@ -902,8 +917,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.habitat_pieces_target_reached),
       jsonBool(snapshot.habitat_pieces_line_following),
       jsonBool(snapshot.habitat_pieces_side_line_aligning),
-      jsonBool(snapshot.habitat_pieces_left_side_driving),
-      jsonBool(snapshot.habitat_pieces_right_side_driving),
+      jsonBool(snapshot.habitat_pieces_rotating_clockwise),
+      jsonBool(snapshot.habitat_pieces_rotating_counter_clockwise),
       jsonBool(snapshot.habitat_pieces_reversing),
       jsonBool(snapshot.habitat_pieces_distance_strafing),
       jsonBool(snapshot.habitat_pieces_post_count_waiting),
@@ -914,6 +929,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(
           snapshot.habitat_pieces_distance_substituted_no_target),
       jsonBool(snapshot.habitat_pieces_distance_sample_new),
+      jsonBool(snapshot.habitat_pieces_distance_count_ignore_active),
       jsonBool(snapshot.habitat_pieces_distance_zone_active),
       jsonBool(snapshot.habitat_pieces_distance_zone_entered),
       jsonBool(
@@ -1069,7 +1085,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
   writer.append(
       ",\"tower_pieces\":{\"state\":\"%s\","
       "\"fault_reason\":\"%s\",\"time_in_state_ms\":%u,"
-      "\"reverse_line_duty\":%.5f,\"side_line_timeout_ms\":%u,"
+      "\"reverse_line_duty\":%.5f,"
+      "\"side_line_ignore_after_start_ms\":%u,"
+      "\"side_line_timeout_ms\":%u,"
       "\"post_line_delay_ms\":%u,\"strafe_right_duty\":%.5f,"
       "\"strafe_right_duration_ms\":%u,"
       "\"post_strafe_pause_ms\":%u,"
@@ -1077,10 +1095,13 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"clockwise_rotation_angle_deg\":%.5f,"
       "\"post_rotation_pause_ms\":%u,"
       "\"reverse_duty\":%.5f,\"reverse_duration_ms\":%u,"
+      "\"shimmy_initial_direction\":\"%s\","
+      "\"pre_shimmy_delay_ms\":%u,"
       "\"shimmy_duty\":%.5f,"
       "\"shimmy_right_duration_ms\":%u,"
       "\"shimmy_left_duration_ms\":%u,"
       "\"shimmy_timeout_ms\":%u,"
+      "\"post_shimmy_delay_ms\":%u,"
       "\"final_reverse_duty\":%.5f,"
       "\"final_reverse_duration_ms\":%u,"
       "\"post_final_reverse_delay_ms\":%u,"
@@ -1102,6 +1123,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       towerPiecesFaultReasonName(snapshot.tower_pieces_fault_reason),
       static_cast<unsigned>(snapshot.tower_pieces_time_in_state_ms),
       snapshot.tower_pieces_reverse_line_duty,
+      static_cast<unsigned>(
+          snapshot.tower_pieces_side_line_ignore_after_start_ms),
       static_cast<unsigned>(snapshot.tower_pieces_side_line_timeout_ms),
       static_cast<unsigned>(snapshot.tower_pieces_post_line_delay_ms),
       snapshot.tower_pieces_strafe_right_duty,
@@ -1112,12 +1135,16 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(snapshot.tower_pieces_post_rotation_pause_ms),
       snapshot.tower_pieces_reverse_duty,
       static_cast<unsigned>(snapshot.tower_pieces_reverse_duration_ms),
+      towerPiecesShimmyInitialDirectionName(
+          snapshot.tower_pieces_shimmy_initial_direction),
+      static_cast<unsigned>(snapshot.tower_pieces_pre_shimmy_delay_ms),
       snapshot.tower_pieces_shimmy_duty,
       static_cast<unsigned>(
           snapshot.tower_pieces_shimmy_right_duration_ms),
       static_cast<unsigned>(
           snapshot.tower_pieces_shimmy_left_duration_ms),
       static_cast<unsigned>(snapshot.tower_pieces_shimmy_timeout_ms),
+      static_cast<unsigned>(snapshot.tower_pieces_post_shimmy_delay_ms),
       snapshot.tower_pieces_final_reverse_duty,
       static_cast<unsigned>(snapshot.tower_pieces_final_reverse_duration_ms),
       static_cast<unsigned>(
@@ -1150,6 +1177,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       ",\"tower_line_control\":{\"initial_strafe_duty\":%.5f,"
       "\"shimmy_duty\":%.5f,\"side_line_cooldown_ms\":%u,"
       "\"side_line_rearm_ms\":%u,\"side_line_armed\":%s,"
+      "\"side_line_ignore_active\":%s,"
       "\"crossing_count\":%u,\"rejected_detection_count\":%u,"
       "\"detection_accepted\":%s,"
       "\"detection_rejected\":%s,"
@@ -1160,6 +1188,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
           snapshot.tower_pieces_side_line_cooldown_ms),
       static_cast<unsigned>(snapshot.tower_pieces_side_line_rearm_ms),
       jsonBool(snapshot.tower_pieces_side_line_armed),
+      jsonBool(snapshot.tower_pieces_side_line_ignore_active),
       static_cast<unsigned>(snapshot.tower_pieces_side_line_count),
       static_cast<unsigned>(
           snapshot.tower_pieces_side_line_rejected_count),
@@ -1181,6 +1210,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"funnel_forward_duration_ms\":%u,"
       "\"post_funnel_limit_delay_ms\":%u,"
       "\"claw_open_interval_ms\":%u,"
+      "\"shake_duty\":%.5f,\"shake_left_duration_ms\":%u,"
+      "\"shake_right_duration_ms\":%u,"
+      "\"post_shake_delay_ms\":%u,"
       "\"claw_open_order\":[%u,%u,%u],"
       "\"post_claws_open_delay_ms\":%u,"
       "\"funnel_reverse_duty\":%.5f,"
@@ -1189,6 +1221,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"rotating_clockwise\":%s,\"driving_backward\":%s,"
       "\"driving_forward\":%s,\"funnel_forward\":%s,"
       "\"funnel_reverse\":%s,"
+      "\"shaking_left\":%s,\"shaking_right\":%s,"
       "\"opening_claw_1\":%s,\"opening_claw_2\":%s,"
       "\"opening_claw_3\":%s}",
       pegFinderStateName(snapshot.peg_finder_state),
@@ -1208,6 +1241,10 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(
           snapshot.peg_finder_post_funnel_limit_delay_ms),
       static_cast<unsigned>(snapshot.peg_finder_claw_open_interval_ms),
+      snapshot.peg_finder_shake_duty,
+      static_cast<unsigned>(snapshot.peg_finder_shake_left_duration_ms),
+      static_cast<unsigned>(snapshot.peg_finder_shake_right_duration_ms),
+      static_cast<unsigned>(snapshot.peg_finder_post_shake_delay_ms),
       static_cast<unsigned>(snapshot.peg_finder_claw_open_order_1),
       static_cast<unsigned>(snapshot.peg_finder_claw_open_order_2),
       static_cast<unsigned>(snapshot.peg_finder_claw_open_order_3),
@@ -1221,6 +1258,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.peg_finder_driving_forward),
       jsonBool(snapshot.peg_finder_funnel_forward),
       jsonBool(snapshot.peg_finder_funnel_reverse),
+      jsonBool(snapshot.peg_finder_shaking_left),
+      jsonBool(snapshot.peg_finder_shaking_right),
       jsonBool(snapshot.peg_finder_opening_claw_1),
       jsonBool(snapshot.peg_finder_opening_claw_2),
       jsonBool(snapshot.peg_finder_opening_claw_3));
@@ -1237,6 +1276,13 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(snapshot.time_trial_strafe_right_duration_ms),
       static_cast<unsigned>(snapshot.time_trial_post_tower_delay_ms),
       jsonBool(snapshot.time_trial_strafing_right));
+
+  writer.append(
+      ",\"final_competition\":{\"state\":\"%s\","
+      "\"time_in_state_ms\":%u}",
+      finalCompetitionStateName(snapshot.final_competition_state),
+      static_cast<unsigned>(
+          snapshot.final_competition_time_in_state_ms));
 
   writer.append(",\"motors\":{");
   appendMotor(writer, "front_left", snapshot.front_left, true);
@@ -1278,7 +1324,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"ultrasonic_1_echo_duration_us\":%u,"
                 "\"solar_hook_configured\":%s,"
                 "\"solar_hook_output_enabled\":%s,"
-                "\"solar_hook_commanded_angle_deg\":%d}",
+                "\"solar_hook_commanded_angle_deg\":%d,"
+                "\"ir_acquisition_enabled\":%s}",
                 jsonBool(snapshot.esp1.available),
                 static_cast<unsigned>(snapshot.esp1.uptime_ms),
                 robotTestModeName(snapshot.esp1.mode),
@@ -1304,7 +1351,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                     snapshot.esp1.ultrasonic_1_echo_duration_us),
                 jsonBool(snapshot.esp1.solar_hook_configured),
                 jsonBool(snapshot.esp1.solar_hook_output_enabled),
-                snapshot.esp1.solar_hook_commanded_angle_deg);
+                snapshot.esp1.solar_hook_commanded_angle_deg,
+                jsonBool(snapshot.esp1.ir_acquisition_enabled));
 
   writer.append(
       ",\"ultrasonic_1\":{\"configured\":%s,\"data_fresh\":%s,"
@@ -1403,6 +1451,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"ir_beacon_detected\":%s,"
                 "\"ir_consecutive_detection_count\":%u,"
                 "\"ir_adc_sample_rate_hz\":%u,"
+                "\"ir_acquisition_enabled\":%s,"
                 "\"motor_command_magnitude_milli\":%u",
                 static_cast<unsigned>(
                     snapshot.selected_beacon_frequency_hz),
@@ -1426,6 +1475,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 static_cast<unsigned>(
                     snapshot.ir_consecutive_detection_count),
                 static_cast<unsigned>(snapshot.ir_adc_sample_rate_hz),
+                jsonBool(snapshot.ir_acquisition_enabled),
                 static_cast<unsigned>(
                     snapshot.motor_command_magnitude_milli));
 

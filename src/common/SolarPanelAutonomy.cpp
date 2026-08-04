@@ -50,14 +50,14 @@ const char* solarPanelAutonomyStateName(
       return "RETRY_STRAFE_RIGHT_TO_SOLAR_PANEL";
     case SolarPanelAutonomyState::MoveForwardAfterSolarContact:
       return "MOVE_FORWARD_AFTER_SOLAR_CONTACT";
-    case SolarPanelAutonomyState::StrafeLeftToRearLine:
-      return "STRAFE_LEFT_TO_REAR_LINE";
-    case SolarPanelAutonomyState::RearLineReacquired:
-      return "REAR_LINE_REACQUIRED";
-    case SolarPanelAutonomyState::WaitBeforeStrafeLeftToRearLine:
-      return "WAIT_BEFORE_STRAFE_LEFT_TO_REAR_LINE";
-    case SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection:
-      return "BACKWARD_LINE_FOLLOW_AFTER_REAR_DETECTION";
+    case SolarPanelAutonomyState::StrafeLeftToFrontLine:
+      return "STRAFE_LEFT_TO_FRONT_LINE";
+    case SolarPanelAutonomyState::FrontLineFollowComplete:
+      return "FRONT_LINE_FOLLOW_COMPLETE";
+    case SolarPanelAutonomyState::WaitBeforeStrafeLeftToFrontLine:
+      return "WAIT_BEFORE_STRAFE_LEFT_TO_FRONT_LINE";
+    case SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection:
+      return "FORWARD_LINE_FOLLOW_AFTER_FRONT_DETECTION";
   }
   return "WAIT_FOR_START";
 }
@@ -114,7 +114,10 @@ bool solarPanelContactConfigValid(
          std::isfinite(config.line_reacquire_strafe_duty) &&
          config.line_reacquire_strafe_duty > 0.0F &&
          config.line_reacquire_strafe_duty <= 1.0F &&
-         config.rear_line_follow_duration_ms > 0U;
+         config.front_line_follow_duration_ms > 0U &&
+         std::isfinite(config.front_line_follow_duty) &&
+         config.front_line_follow_duty > 0.0F &&
+         config.front_line_follow_duty <= 1.0F;
 }
 
 SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
@@ -183,48 +186,48 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
       }
       if (reacquisition_line_detected) {
         return {
-            SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection,
+            SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection,
             true};
       }
       return config.line_reacquire_strafe_start_delay_ms > 0U
                  ? SolarPanelContactSequenceUpdate{
                        SolarPanelAutonomyState::
-                           WaitBeforeStrafeLeftToRearLine,
+                           WaitBeforeStrafeLeftToFrontLine,
                        true}
                  : SolarPanelContactSequenceUpdate{
-                       SolarPanelAutonomyState::StrafeLeftToRearLine, true};
+                       SolarPanelAutonomyState::StrafeLeftToFrontLine, true};
 
-    case SolarPanelAutonomyState::WaitBeforeStrafeLeftToRearLine:
+    case SolarPanelAutonomyState::WaitBeforeStrafeLeftToFrontLine:
       if (reacquisition_line_detected) {
         return {
-            SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection,
+            SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection,
             true};
       }
       return time_in_state_ms >=
                      config.line_reacquire_strafe_start_delay_ms
                  ? SolarPanelContactSequenceUpdate{
-                       SolarPanelAutonomyState::StrafeLeftToRearLine, true}
+                       SolarPanelAutonomyState::StrafeLeftToFrontLine, true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
-    case SolarPanelAutonomyState::StrafeLeftToRearLine:
+    case SolarPanelAutonomyState::StrafeLeftToFrontLine:
       return reacquisition_line_detected
                  ? SolarPanelContactSequenceUpdate{
                        SolarPanelAutonomyState::
-                           BackwardLineFollowAfterRearDetection,
+                           ForwardLineFollowAfterFrontDetection,
                        true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
-    case SolarPanelAutonomyState::BackwardLineFollowAfterRearDetection:
-      return time_in_state_ms >= config.rear_line_follow_duration_ms
+    case SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection:
+      return time_in_state_ms >= config.front_line_follow_duration_ms
                  ? SolarPanelContactSequenceUpdate{
-                       SolarPanelAutonomyState::RearLineReacquired, true}
+                       SolarPanelAutonomyState::FrontLineFollowComplete, true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
     case SolarPanelAutonomyState::WaitForStart:
     case SolarPanelAutonomyState::LineFollowToSolar:
     case SolarPanelAutonomyState::SolarBeaconAligned:
     case SolarPanelAutonomyState::SolarSearchFault:
-    case SolarPanelAutonomyState::RearLineReacquired:
+    case SolarPanelAutonomyState::FrontLineFollowComplete:
       return {current_state, false};
   }
 

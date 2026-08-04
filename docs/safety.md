@@ -8,8 +8,8 @@ disabled and line following refuses to start.
 
 - Initialize all actuator outputs disabled.
 - The ESP1 Solar Hook servo initializes detached on GPIO3. Its Open/Closed
-  angles default to unset, and the dashboard rejects movement until an angle is
-  configured and fresh ESP1 hardware status is available.
+  angles default to `0/148` degrees, and the dashboard still requires fresh
+  ESP1 hardware status before accepting movement.
 - Do not attach PWM to motors until GPIOs, PWM resources, frequencies,
   H-bridge mode, direction sign, and disabled states are confirmed.
 - High-level mission code must not directly access GPIO or PWM.
@@ -35,20 +35,29 @@ disabled and line following refuses to start.
 - Runtime VL53L0X I2C transactions execute only in ESP1's shared
   sensor-acquisition task. Readiness is polled; operational code never waits
   for a ranging cycle to complete.
+- VL53L0X ranging is enabled only for active Habitat Pickup/Placement, and IR
+  sampling is enabled only for active Solar. Both acquisition requests expire
+  with the rear command timeout, so ESP1 stops them if ESP2 communication goes
+  stale.
 - Laser UART heartbeats do not make old measurements fresh. ESP2 freshness is
   based on arrival of a changed measurement sequence.
-- `HABITAT_PIECES` line-follows immediately and ignores LSS2 only for an
-  explicitly configured nonzero detection delay. A fresh black LSS2 input
-  stops all four wheels for one control update, then the bounded
-  straight-backward move begins. LSS3 remains telemetry-only in this route.
+- `HABITAT_PIECES` line-follows immediately and ignores LSS2/LSS3 HIGH readings
+  for an explicitly configured nonzero start window. A fresh black reading from
+  either sensor stops all four wheels for one control update. LSS2 then selects
+  clockwise rotation until LSS3 reads black; LSS3 selects counter-clockwise
+  rotation until LSS2 reads black. A second all-wheel stop separates alignment
+  from the bounded straight-backward move. Rotation uses the profile's existing
+  adjustable line-follow duty and the chassis mixer's physical yaw convention.
   Reverse duty and duration are locked at zero until configured; completion
   begins the separately bounded distance-zone strafe. Direction, threshold,
   target count, duty, post-count stop delay, independent exit-pulse duty,
   exit-pulse duration, and timeout are locked until explicitly configured. The
-  overall LSS2 search timeout must be longer than the detection delay.
-- Habitat Pieces requires a configured LSS2 input, fresh shared ESP1 sensor
+  per-profile distance-count ignore duration may be zero, but it must fit
+  inside the bounded distance-strafe timeout. The
+  overall side-line search/alignment timeout must be longer than the detection delay.
+- Habitat Pieces requires configured LSS2 and LSS3 inputs, fresh shared ESP1 sensor
   snapshot, valid shared IMU heading-hold tuning, and a healthy IMU at Start.
-  Missing configuration, stale LSS2 data, front line loss before detection,
+  Missing configuration, stale side-sensor data before alignment completes,
   rear-command failure, or timeout stops all four wheels. No detection delay,
   search timeout, reverse duty/duration, distance direction,
   threshold, count, duty, post-count delay, exit-pulse duty/duration, or
@@ -56,7 +65,9 @@ disabled and line following refuses to start.
   independent exit duty inherits a legacy saved counting-strafe duty until it
   is explicitly saved. During the timed reverse, continued side-
   sensor data is not required, but motor and communication safety gates remain
-  active. Distance strafing uses the shared IMU heading-hold controller. During
+  active. The existing overall timeout bounds both initial side-line search and
+  rotation toward the opposite sensor. Distance strafing uses the shared IMU
+  heading-hold controller. During
   that step, only new, fresh high-accuracy measurement sequences affect the
   counter. Only entries at or below threshold count, and an above-threshold
   sample rearms the counter. After the count, each timed exit pulse ends with
@@ -84,6 +95,15 @@ disabled and line following refuses to start.
   the configured stepper timeout is measured from that command. A stopped
   stepper before the bottom limit, timeout, conflicting limits, stale required
   line data, or an IMU/link failure stops both chassis and slide.
+- `FINAL_COMPETITION` validates all included modes before Solar moves and
+  requires Placement 3 to use the rear return-line source. Each ownership
+  handoff commands stopped outputs. Tower ignores side-line HIGH only for its
+  bounded configured window, which must be shorter than its search timeout.
+  Tower's pre/post-shimmy delays command every chassis output stopped and are
+  capped at 30000 ms; the shimmy search retains its independent timeout.
+  PegFinder shake remains disabled while any shake field is only partially
+  configured; when enabled, both directional pulses and the stopped post-shake
+  delay are duration-bounded.
 - Runtime MPU-6050 I2C transactions execute only in ESP2's sensor-acquisition
   task. The core-1 motion task consumes a copied snapshot and treats data older
   than the IMU freshness limit as unavailable.

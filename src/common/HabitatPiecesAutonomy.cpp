@@ -87,6 +87,8 @@ const char* habitatPiecesStopReasonName(
       return "STEPPER_COMMAND_FAILED";
     case HabitatPiecesStopReason::RearLineReached:
       return "REAR_LINE_REACHED";
+    case HabitatPiecesStopReason::Lss3Detected:
+      return "LSS3_DETECTED";
   }
   return "CONFIGURATION_INCOMPLETE";
 }
@@ -111,8 +113,8 @@ bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
   return std::isfinite(config.line_follow_duty) &&
          std::isfinite(maximum_duty) && config.line_follow_duty > 0.0F &&
          maximum_duty > 0.0F && config.line_follow_duty <= maximum_duty &&
-         config.lss2_detection_delay_ms > 0U &&
-         config.run_timeout_ms > config.lss2_detection_delay_ms &&
+         config.side_line_ignore_after_start_ms > 0U &&
+         config.run_timeout_ms > config.side_line_ignore_after_start_ms &&
          std::isfinite(config.reverse_duty) && config.reverse_duty > 0.0F &&
          config.reverse_duty <= maximum_duty &&
          config.reverse_duration_ms > 0U &&
@@ -129,6 +131,8 @@ bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
          config.distance_strafe_timeout_ms > 0U &&
          config.distance_strafe_timeout_ms <=
              maximum_distance_strafe_timeout_ms &&
+         config.distance_count_ignore_ms <
+             config.distance_strafe_timeout_ms &&
          config.post_count_stop_delay_ms > 0U &&
          config.post_count_stop_delay_ms <=
              config.distance_strafe_timeout_ms &&
@@ -138,7 +142,9 @@ bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
          config.exit_strafe_pulse_ms > 0U &&
          config.exit_strafe_pulse_ms <=
              config.distance_strafe_timeout_ms &&
-         static_cast<std::uint64_t>(config.post_count_stop_delay_ms) +
+         static_cast<std::uint64_t>(config.distance_count_ignore_ms) +
+                 static_cast<std::uint64_t>(
+                     config.post_count_stop_delay_ms) +
                  static_cast<std::uint64_t>(config.exit_strafe_pulse_ms) <
              static_cast<std::uint64_t>(
                  config.distance_strafe_timeout_ms) &&
@@ -260,6 +266,9 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
   if (autonomy.state == HabitatPiecesState::DistanceStrafing) {
     autonomy.distance_strafe_elapsed_ms =
         now_ms - autonomy.distance_strafe_started_at_ms;
+    update.distance_count_ignore_active =
+        autonomy.distance_strafe_elapsed_ms <
+        config.distance_count_ignore_ms;
     autonomy.distance_measurement_available = distance_sample.available;
     update.distance_measurement_available = distance_sample.available;
 
@@ -281,7 +290,8 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
         update.distance_sample_new = true;
         const bool in_zone =
             distance_sample.distance_mm <= config.distance_threshold_mm;
-        if (in_zone && !autonomy.distance_zone_active) {
+        if (!update.distance_count_ignore_active && in_zone &&
+            !autonomy.distance_zone_active) {
           if (autonomy.distance_zone_count < UINT16_MAX) {
             ++autonomy.distance_zone_count;
           }
@@ -643,13 +653,77 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
     return update;
   }
 
+  if (autonomy.state == HabitatPiecesState::SideLineAligning) {
+    autonomy.run_elapsed_ms = now_ms - autonomy.run_started_at_ms;
+    const bool rotating_clockwise =
+        autonomy.stop_reason == HabitatPiecesStopReason::Lss2Detected;
+    const bool rotating_counter_clockwise =
+        autonomy.stop_reason == HabitatPiecesStopReason::Lss3Detected;
+
+    update.lss2_newly_latched =
+        lss2_black && !autonomy.lss2_latched;
+    update.lss3_newly_latched =
+        lss3_black && !autonomy.lss3_latched;
+    autonomy.lss2_latched = autonomy.lss2_latched || lss2_black;
+    autonomy.lss3_latched = autonomy.lss3_latched || lss3_black;
+    update.lss2_latched = autonomy.lss2_latched;
+    update.lss3_latched = autonomy.lss3_latched;
+
+    const bool opposite_sensor_found =
+        (rotating_clockwise && autonomy.lss3_latched) ||
+        (rotating_counter_clockwise && autonomy.lss2_latched);
+    if (opposite_sensor_found) {
+      autonomy.state = HabitatPiecesState::Reversing;
+      autonomy.stop_reason =
+          HabitatPiecesStopReason::BothSideLinesDetected;
+      autonomy.state_entered_at_ms = now_ms;
+      autonomy.reverse_elapsed_ms = 0U;
+      update.state = autonomy.state;
+      update.stop_reason = autonomy.stop_reason;
+      // Stop for one complete update between sensor alignment and reverse.
+      update.should_stop = true;
+      update.transitioned = true;
+      return update;
+    }
+
+    if (!rotating_clockwise && !rotating_counter_clockwise) {
+      autonomy.state = HabitatPiecesState::Fault;
+      autonomy.stop_reason =
+          HabitatPiecesStopReason::ConfigurationIncomplete;
+      autonomy.state_entered_at_ms = now_ms;
+      update.state = autonomy.state;
+      update.stop_reason = autonomy.stop_reason;
+      update.transitioned = true;
+      return update;
+    }
+
+    if (config.run_timeout_ms == 0U ||
+        autonomy.run_elapsed_ms >= config.run_timeout_ms) {
+      autonomy.state = HabitatPiecesState::Fault;
+      autonomy.stop_reason = HabitatPiecesStopReason::RunTimeout;
+      autonomy.state_entered_at_ms = now_ms;
+      autonomy.timed_out = true;
+      update.state = autonomy.state;
+      update.stop_reason = autonomy.stop_reason;
+      update.transitioned = true;
+      return update;
+    }
+
+    update.should_stop = false;
+    update.should_align_side_lines = true;
+    update.should_rotate_clockwise = rotating_clockwise;
+    update.should_rotate_counter_clockwise =
+        rotating_counter_clockwise;
+    return update;
+  }
+
   if (autonomy.state != HabitatPiecesState::LineFollowing) {
     return update;
   }
 
   autonomy.run_elapsed_ms = now_ms - autonomy.run_started_at_ms;
   autonomy.lss2_detection_armed =
-      autonomy.run_elapsed_ms >= config.lss2_detection_delay_ms;
+      autonomy.run_elapsed_ms >= config.side_line_ignore_after_start_ms;
   update.lss2_detection_armed = autonomy.lss2_detection_armed;
 
   if (autonomy.lss2_detection_armed) {
@@ -657,20 +731,41 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
         lss2_black && !autonomy.lss2_latched;
     autonomy.lss2_latched = autonomy.lss2_latched || lss2_black;
     update.lss2_latched = autonomy.lss2_latched;
+    update.lss3_newly_latched =
+        lss3_black && !autonomy.lss3_latched;
+    autonomy.lss3_latched = autonomy.lss3_latched || lss3_black;
+    update.lss3_latched = autonomy.lss3_latched;
   }
 
-  if (autonomy.lss2_latched) {
+  if (autonomy.lss2_latched && autonomy.lss3_latched) {
     autonomy.state = HabitatPiecesState::Reversing;
-    autonomy.stop_reason = HabitatPiecesStopReason::Lss2Detected;
+    autonomy.stop_reason =
+        HabitatPiecesStopReason::BothSideLinesDetected;
     autonomy.state_entered_at_ms = now_ms;
     autonomy.reverse_elapsed_ms = 0U;
     update.state = autonomy.state;
     update.stop_reason = autonomy.stop_reason;
     update.target_reached = false;
-    // Stop all four wheels for this control update. Reversing begins on the
-    // next update, so no line-follow command survives the LSS2 detection.
+    // Both sensors already see the line, so alignment is complete. Stop all
+    // four wheels for this update and begin reversing on the next one.
     update.should_stop = true;
     update.should_reverse = false;
+    update.transitioned = true;
+    return update;
+  }
+
+  if (autonomy.lss2_latched || autonomy.lss3_latched) {
+    autonomy.state = HabitatPiecesState::SideLineAligning;
+    autonomy.stop_reason = autonomy.lss2_latched
+                               ? HabitatPiecesStopReason::Lss2Detected
+                               : HabitatPiecesStopReason::Lss3Detected;
+    autonomy.state_entered_at_ms = now_ms;
+    update.state = autonomy.state;
+    update.stop_reason = autonomy.stop_reason;
+    // Stop all four wheels for this control update. Sensor-directed rotation
+    // starts on the next update, so no line-follow command survives detection.
+    update.should_stop = true;
+    update.should_align_side_lines = false;
     update.transitioned = true;
     return update;
   }

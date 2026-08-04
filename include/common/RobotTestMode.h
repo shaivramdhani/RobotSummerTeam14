@@ -24,6 +24,7 @@ enum class RobotTestMode : std::uint8_t {
   ImuStrafeTest = 16,
   HabitatPieces = 17,
   HabitatPlacement = 18,
+  FinalCompetition = 19,
 };
 
 const char* robotTestModeName(RobotTestMode mode);

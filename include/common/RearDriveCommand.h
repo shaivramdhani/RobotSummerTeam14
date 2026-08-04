@@ -12,6 +12,8 @@ namespace robot {
 constexpr std::uint16_t kRearDrivePayloadSize = 13U;
 constexpr std::uint8_t kRearDriveEnabledFlag = 0x01U;
 constexpr std::uint8_t kRearDriveLaserHighAccuracyFlag = 0x02U;
+constexpr std::uint8_t kRearDriveLaserAcquisitionEnabledFlag = 0x04U;
+constexpr std::uint8_t kRearDriveIrAcquisitionEnabledFlag = 0x08U;
 constexpr std::uint32_t kMaxInvalidRearPacketsBeforeStop = 3U;
 
 struct RearDriveCommand {
@@ -20,6 +22,8 @@ struct RearDriveCommand {
   std::int16_t back_right_command_milli{0};
   Milliseconds sender_timestamp_ms{0};
   Milliseconds timeout_ms{kDefaultCommunicationTimeoutMs};
+  bool laser_acquisition_enabled{false};
+  bool ir_acquisition_enabled{false};
   LaserDistanceProfile laser_profile{kOperationalLaserDistanceProfile};
 };
 
@@ -42,6 +46,8 @@ class RearDriveCommandReceiver {
   bool acceptPacket(const UartPacket& packet, Milliseconds received_at_ms);
   MotorCommand backLeftCommand(Milliseconds now_ms) const;
   MotorCommand backRightCommand(Milliseconds now_ms) const;
+  bool laserAcquisitionEnabled(Milliseconds now_ms) const;
+  bool irAcquisitionEnabled(Milliseconds now_ms) const;
   LaserDistanceProfile laserProfile(Milliseconds now_ms) const;
   RearDriveStatus status(Milliseconds now_ms) const;
 

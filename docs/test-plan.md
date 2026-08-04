@@ -23,15 +23,18 @@ Native tests cover pure, hardware-independent logic:
   and clamp behavior, yaw-rate damping, dual angle/rate settling conditions,
   settling reset, timeout, explicit stop, mode policy, and telemetry JSON.
 - Rear-drive command packet validation and stale/explicit-stop behavior.
-- Rear/side line-sensor packet round-trip for LSBL, LSBR, LSS, LSS2, and the
-  telemetry-only LSS3 path.
+- Rear-drive laser/IR acquisition request round-trip and stale-command disable
+  behavior, with the selected laser profile retained independently.
+- Rear/side line-sensor packet round-trip for LSBL, LSBR, LSS, LSS2, and LSS3.
 - VL53L0X snapshot packet round-trip, corruption rejection, and the
   standalone habitat-distance gate's locked configuration, invalid/stale-data,
   threshold latching, reset, and millisecond-wrap behavior.
-- `HABITAT_PIECES` default-duty/configuration lockout, LSS2 ignore interval,
-  detection arming, black-line transition, timed reverse duty/duration,
-  adjustable search timeout, distinct at-or-below-threshold laser-zone
-  counting, repeated/invalid measurement rejection, left/right strafe mixing,
+- `HABITAT_PIECES` default-duty/configuration lockout, LSS2/LSS3 ignore interval,
+  detection arming, LSS2-clockwise/LSS3-counter-clockwise alignment and
+  opposite-sensor stop, timed reverse duty/duration, adjustable search/alignment
+  timeout, distinct at-or-below-threshold laser-zone
+  counting, per-profile initial count-ignore behavior, repeated/invalid
+  measurement rejection, left/right strafe mixing,
   post-count stop delay, stopped exit-pulse checks, overall strafe timeout, and
   bottom-limit lowering, GPIO48 limit-switch approach, concurrent step-counted
   lift/reverse, opposite IMU strafe, rear-line stop, and placement handoff.
@@ -56,57 +59,82 @@ For the read-only VL53L0X bring-up, keep the robot disabled:
 1. Verify ESP1 SDA is GPIO10, SCL is GPIO9, grounds are common, and the exact
    carrier's power and pull-up voltages are safe.
 2. Boot both processors and confirm the ESP2 dashboard reports address `0x29`,
-   configured/initialized/ranging `yes`, and increasing measurement and packet
-   sequences.
-3. Move a flat target through the intended working range. Confirm millimetre
+   configured/initialized `yes`, ranging `no`, and no increasing measurement
+   sequence before a Habitat Pickup or Placement step starts.
+3. Start a Habitat step and confirm ranging becomes `yes` and measurement and
+   packet sequences increase. Stop or complete Habitat and confirm ranging
+   returns to `no`. Let the ESP2 command become stale and confirm acquisition
+   also stops.
+4. Move a flat target through the intended working range. Confirm millimetre
    readings change monotonically and compare them with a physical measurement.
-4. Test the actual habitat piece at the final sensor height and angle, including
+5. Test the actual habitat piece at the final sensor height and angle, including
    its edges, color/reflectance variation, and the robot's expected ambient
    lighting.
-5. Disconnect the sensor with actuators disabled. Confirm `data_valid` becomes
+6. Disconnect the sensor with actuators disabled. Confirm `data_valid` becomes
    false or `sample_age_ms` grows past freshness while UART snapshot heartbeats
    alone do not restore freshness.
-6. Record range performance for any future mission that consumes the laser.
+7. Record range performance for any future mission that consumes the laser.
+
+For the read-only IR acquisition gate, keep the robot disabled or its wheels
+raised:
+
+1. Confirm IR acquisition is stopped at boot and in all standalone modes other
+   than Solar.
+2. Start standalone Solar and confirm acquisition becomes active. Repeat for
+   the Solar stages of Time Trial and Final Competition.
+3. Finish, fault, or stop Solar and confirm acquisition stops and detection is
+   cleared. Let the rear command become stale and confirm ESP1 also disables
+   acquisition locally.
 
 Keep the wheels raised for the first `HABITAT_PIECES` gate test:
 
 1. Verify ESP1 LSS2 GPIO11 and LSS3 GPIO12. Confirm telemetry shows both
-   configured and fresh with correct white/black polarity. Confirm LSS2 is the
-   route's stop input and LSS3 is telemetry-only.
+   configured and fresh with correct white/black polarity. Confirm either can
+   stop line following and select the alignment direction.
 2. Prove a zero detection delay, zero timeout, timeout not longer than the
    delay, zero reverse duty/duration, missing distance-strafe direction, zero
    distance threshold/count/duty/timeout, or distance timeout above 30000 ms
    prevents an approach command.
 3. With the wheels raised, Start and confirm line following begins immediately
    while `lss2_detection_armed=false`.
-4. Present black to LSS2 during the ignore interval and confirm the wheels keep
-   following. At the configured delay, confirm the LSS2 input arms.
-5. Present black to LSS3 only after the delay and confirm line following
-   continues without a wheel-side command or latch.
-6. Present black to LSS2 only. Confirm `LSS2_DETECTED`, an immediate all-wheel
-   stop, then `REVERSING` on the next control update. Confirm LSS3 is not
-   required for this transition.
-7. Confirm the reverse continues for the full configured duration, then enters
+4. Present black to both LSS2 and LSS3 during the ignore interval and confirm
+   the wheels keep following and neither input latches. At the configured
+   delay, confirm the side-sensor gate arms.
+5. Present black to LSS2 only. Confirm `LSS2_DETECTED`, an immediate all-wheel
+   stop, then clockwise `SIDE_LINE_ALIGNING` at the profile's line-follow duty.
+   Keep LSS3 white and confirm rotation continues; present LSS3 black and confirm
+   another all-wheel stop before `REVERSING`.
+6. Repeat with LSS3 first. Confirm `LSS3_DETECTED`, the immediate stop, then
+   counter-clockwise rotation until LSS2 sees black. Verify both physical
+   directions with wheels raised before field testing.
+7. Present both sensors black in the same armed update. Confirm the robot stops,
+   skips rotation because alignment is already complete, and then reverses.
+8. Confirm the reverse continues for the full configured duration, then enters
    `DISTANCE_STRAFING` in the configured left/right direction at the configured
    duty. Confirm the high-accuracy laser profile remains selected and IMU
    heading hold corrects yaw during the strafe.
-8. Disconnect or freeze the shared line-sensor packet before LSS2 latches and
+9. Disconnect or freeze the shared line-sensor packet before both sensors latch and
    confirm both processors stop their locally owned wheels through the normal
    command-expiration path.
-9. During reverse, confirm side-sensor changes no longer alter the latched timed
+10. During reverse, confirm side-sensor changes no longer alter the latched timed
    move, while stale rear status or a failed rear command still stops it.
-10. Keep LSS2 white and confirm the overall LSS2 search timeout stops all four
-    wheels, enters `FAULT`, and reports `timed_out=true`.
-11. With the distance strafe active, supply consecutive valid measurements at
-    or below the configured threshold. Confirm only the first increments the
-    count. Supply one valid above-threshold measurement, then another
-    at-or-below measurement, and confirm the count increments once more.
-12. Confirm repeated UART packets carrying the same measurement sequence never
+11. Keep both sensors white and confirm the overall side-line timeout stops all
+    four wheels. Repeat after one sensor starts alignment while the opposite
+    sensor remains white; confirm the same timeout enters `FAULT` with
+    `timed_out=true`.
+12. With the distance strafe active, supply consecutive valid measurements at
+    or below the configured threshold during the profile's count-ignore window.
+    Confirm the count remains zero and the ignore telemetry counts down. Hold
+    the reading in-zone past the gate and confirm it still does not count until
+    one fresh above-threshold reading rearms the detector and a later fresh
+    at-or-below reading enters the zone. Then confirm consecutive in-zone
+    measurements count only once.
+13. Confirm repeated UART packets carrying the same measurement sequence never
     increment the count. Confirm a fresh N/A/no-target result displays as the
     65536 mm sentinel and acts above any configurable threshold. Confirm a
     stale or frozen measurement stream supplies no new sample and does not
     prevent the bounded strafe from starting.
-13. Reach the target count and confirm `DISTANCE_ZONE_COUNT_REACHED`, an
+14. Reach the target count and confirm `DISTANCE_ZONE_COUNT_REACHED`, an
     all-wheel stop for the configured delay, and then one timed strafe pulse.
     Confirm the pulse uses its independent exit duty rather than the long
     counting-strafe duty. Confirm the pulse ends with all wheels stopped and no
@@ -115,25 +143,25 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
     `DISTANCE_EXIT_REACHED` and `LOWER_SLIDE`. Repeat without completing the
     distance phases and confirm `DISTANCE_STRAFE_TIMEOUT`, `FAULT`, and
     all-wheel stop.
-14. Confirm the slide moves down only at the configured limit-search speed and
+15. Confirm the slide moves down only at the configured limit-search speed and
     stops at the debounced bottom switch. Confirm a missing bottom input reaches
     `SLIDE_DOWN_TIMEOUT` and stops both the chassis and slide.
-15. Confirm `APPROACH_PIECE` drives forward at the configured duty regardless
+16. Confirm `APPROACH_PIECE` drives forward at the configured duty regardless
     of laser readings. Press the active-high GPIO48 habitat-piece limit switch
     and confirm an immediate all-wheel stop before the configured pre-lift
     reverse. Confirm that reverse uses the pickup reverse duty, ends at its
     independent duration, and stops before the lift begins. Leave the switch
     released and confirm `APPROACH_LIMIT_TIMEOUT` faults and stops all wheels.
-16. Confirm the slide starts lifting by the configured steps while every wheel
+17. Confirm the slide starts lifting by the configured steps while every wheel
     remains stopped for the configured lift-start delay. After that delay,
     confirm the lift continues while the chassis performs the configured timed
     reverse. Test lift completion both before and after reverse completion; a
     stopped or timed-out stepper must fault safely.
-17. Confirm rear-line reacquisition strafes at its independent duty through IMU
+18. Confirm rear-line reacquisition strafes at its independent duty through IMU
     heading hold opposite the initial distance-strafe direction. Either rear sensor must stop all
     wheels. If the lift is unfinished, confirm the chassis remains stopped
     until the lift completes. Test stale rear data and reacquisition timeout.
-18. With Habitat Placement fully configured, confirm completion automatically
+19. With Habitat Placement fully configured, confirm completion automatically
     enters `HABITAT_PLACEMENT` and begins its rear-line-follow start sequence.
 
 For the read-only IMU soak test:
@@ -206,22 +234,29 @@ For Stage 3, keep the wheels raised for initial tests:
    is rejected while a reset acknowledgement is pending.
 9. Run normal manual drive, Stage 2 turns, and front/rear line following to
    confirm none receives an IMU-strafe yaw correction.
-10. Run every Solar lateral stage, the Tower initial strafe and both shimmy
-    directions, and the optional Time Trial transition strafe. Confirm the
-    reported autonomous mode does not change to `IMU_STRAFE_TEST`, each strafe
-    captures a heading target, and the shared Stage 3 duty/gain changes affect
-    every one of those motions.
-11. Run the Tower and PegFinder clockwise turns with low, verified angles.
+10. Run Solar's initial right approach and final front-line reacquisition, the
+    Tower initial strafe and both shimmy directions, and the optional Time Trial
+    transition strafe. Confirm the reported autonomous mode does not change to
+    `IMU_STRAFE_TEST`, each captures a heading target, and shared Stage 3
+    duty/gain changes affect them. Separately run Solar retry-left and
+    retry-right; confirm they use their independently adjustable duties and do
+    not enter IMU heading hold.
+11. For Tower shimmy, select Left and Right in separate runs. Confirm the
+    chassis stays stopped for the configured pre-delay, the selected direction
+    runs first for exactly half its normal duration, all later pulses use full
+    left/right durations, and back-line detection stops motion for the complete
+    post-delay before the optional final reverse.
+12. Run the Tower and PegFinder clockwise turns with low, verified angles.
     Confirm their panels contain angles rather than timed-turn settings and
     that both turns use the shared Stage 2 duty/gains/tolerance/timeout.
-12. During each autonomous IMU strafe/turn family, briefly interrupt SDA or
+13. During each autonomous IMU strafe/turn family, briefly interrupt SDA or
     SCL. Confirm all four wheel commands become disabled, the mission phase and
     its elapsed time stop advancing, the saved heading/target remain fixed,
     and motion resumes only after three new fresh samples.
-13. Keep the IMU disconnected beyond the displayed recovery limit. Confirm the
+14. Keep the IMU disconnected beyond the displayed recovery limit. Confirm the
     owning autonomy enters its existing terminal `IMU_UNAVAILABLE` fault and
     does not restart.
-14. With wheels raised, power-cycle the IMU during an autonomous IMU phase.
+15. With wheels raised, power-cycle the IMU during an autonomous IMU phase.
     Confirm runtime-register verification becomes false and the phase never
     resumes using the MPU reset defaults.
 
@@ -268,6 +303,27 @@ For Stage 3, keep the wheels raised for initial tests:
 9. Confirm the profile-specific pickup direction/duties and placement values
    appear in sequence on telemetry and completion reports three completed
    pickup/placement pairs.
+
+## Final Competition Bring-Up
+
+1. Keep the wheels raised and configure Solar's front-line exit duty/duration,
+   all six Habitat profiles, Tower's start-ignore window, and PegFinder shake.
+   Confirm Start is rejected unless Placement 3 returns to the rear line.
+2. Confirm Solar's final strafe stops on a front sensor and its forward PID
+   runs for the configured duration before Habitat Pickup 1 begins.
+3. Present LSS2/LSS3 HIGH during each Habitat start-ignore window and confirm
+   neither reading changes the route until its profile's gate opens.
+4. After Placement 3 finds the rear line, confirm the chassis stops for the
+   ownership handoff and Tower begins backward rear-line following. Hold LSS
+   HIGH through Tower's ignore window; verify it must return LOW before a new
+   HIGH can count.
+5. In PegFinder, confirm a left pulse followed by a right pulse occurs between
+   claw openings 1/2 and 2/3, with stopped transitions and the configured duty
+   and durations. Confirm the configured stopped post-shake delay completes
+   before the next claw opens. Confirm all-zero shake values skip both shake
+   and post-shake-delay states.
+6. Force one included-mode timeout at a time and confirm Final Competition
+   enters `FAULT`, stops chassis/funnel/stepper outputs, and does not advance.
 10. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
     or the configured return line. Each condition must stop or time out without
     advancing to the next motion phase or profile.

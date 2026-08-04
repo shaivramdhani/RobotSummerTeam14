@@ -50,14 +50,19 @@ mode-gated drive/motor/line-follow/claw commands, and refuses actuator movement
 while required hardware settings are TODO. See `docs/telemetry.md`.
 
 The dashboard also reports the ESP1-owned VL53L0X V2 distance sensor on SDA
-GPIO10/SCL GPIO9. The `HABITAT_PIECES` mode follows the front line at an
-independently adjustable duty (default `0.12`), ignores the ESP1-owned LSS2 for
-an adjustable detection delay, then stops all four wheels when LSS2 detects
-black. LSS3 remains available as telemetry but does not control this route.
-The robot next drives straight backward at an adjustable duty and duration,
+GPIO10/SCL GPIO9. ESP1 initializes it at boot but ranges only while a Habitat
+Pickup or Placement step is active. The `HABITAT_PIECES` mode follows the front line at an
+independently adjustable duty (default `0.12`) and ignores the ESP1-owned LSS2
+and LSS3 for an adjustable detection delay. Either sensor then stops all four
+wheels. LSS2 starts clockwise rotation until LSS3 sees black; LSS3 starts
+counter-clockwise rotation until LSS2 sees black. Rotation uses the same
+profile line-follow duty and configured yaw polarity. The robot stops again,
+then drives straight backward at an adjustable duty and duration,
 then strafes in an adjustable left/right direction through IMU heading hold
 while counting distinct entries at or below an adjustable laser-distance
-threshold. Consecutive in-zone samples count once, and an above-threshold
+threshold. Each pickup profile has an adjustable count-ignore duration during
+which the count stays zero. A target held in-zone across that gate must leave
+and re-enter before counting. Consecutive in-zone samples count once, and an above-threshold
 sample rearms the next count. At the target count, the robot stops for an
 adjustable delay, then repeats adjustable-duration IMU-strafe pulses with an
 independently adjustable duty, all-wheel stop, and fresh laser check between
@@ -72,8 +77,8 @@ Either rear line sensor stops the strafe; lift completion then automatically
 starts Habitat Placement. Fresh N/A/no-target laser results are treated as
 65536 mm for the distance-strafe checks. One adjustable timeout bounds the initial
 strafe, stop delay, pulses, and checks. All added strafe settings default to
-unconfigured. The laser remains in its high-accuracy profile with a 200 ms
-continuous intermeasurement period throughout.
+unconfigured. While enabled, the laser uses its high-accuracy profile with a
+200 ms continuous intermeasurement period.
 
 Habitat Pieces stores three independently adjustable pickup profiles. One
 Habitat Pieces Start alternates the matching routes in this fixed order:
@@ -167,10 +172,12 @@ initialized from the front settings the first time; the rear dashboard panel,
 base is a positive magnitude and firmware applies it as a negative wheel
 command. Starting also requires a fresh rear-sensor snapshot.
 
-All Solar Panel lateral-motion stages use the shared IMU Strafe controller:
-the initial right approach, retry left/right adjustments, and final left
-rear-line reacquisition keep their existing adjustable times/timeouts while
-holding the heading captured at the start of each strafe.
+Solar's initial right approach and final left front-line reacquisition use the
+shared IMU Strafe controller. Retry-left and retry-right use direct open-loop
+mecanum strafing at independently adjustable duties, with no IMU correction.
+All stages retain their existing adjustable times/timeouts. Once either front
+sensor sees tape, Solar follows the front line forward at its own adjustable
+duty and duration.
 
 The ESP2 dashboard also has a `Tower Pieces` panel. Its Start button enters
 `AUTONOMOUS_TOWER_PIECES`, follows the rear line backward, counts distinct LSS
@@ -178,14 +185,16 @@ LOW-to-HIGH transitions, and stops all four wheels on transition two. It then
 waits, performs an IMU-aligned right strafe for a configured duration, pauses,
 uses the IMU turn controller to rotate clockwise through a configured angle,
 pauses again, and drives backward for a configured duration. It then alternates
-IMU-aligned right and left strafes, starting right, until either back line
-sensor is HIGH or the shimmy timeout expires. After detecting that
-line, it can perform an optional timed backward drive (`0 ms` skips it), waits,
+IMU-aligned right and left strafes, starting in an adjustable direction after
+an adjustable stopped delay. The first pulse is 50% of its direction's normal
+duration; later pulses use the full configured left/right duration. When either
+back line sensor becomes HIGH, it waits for an adjustable stopped post-shimmy
+delay. It can then perform an optional timed backward drive (`0 ms` skips it), waits,
 opens the winch, waits, opens all three claws, waits, and lowers the stepper to
 the bottom limit. It then waits, closes all three claws, waits, raises the
 stepper to the top limit, and closes the winch. There is no final line-following
-stage. The right and left shimmy durations and all tail settings are adjustable
-in the panel and can be saved to NVS.
+stage. The shimmy direction, pre/post delays, right and left durations, and all
+tail settings are adjustable in the panel and can be saved to NVS.
 
 Tower Pieces strafe duty/correction/gains come directly from the shared IMU
 Strafe panel, and its turn duty/gains/tolerances/timeout come directly from the
@@ -195,8 +204,12 @@ pause and delay stages default to `1000 ms`, and
 both limit-search speeds default to `2000` driver microsteps per second. The
 shared servo defaults are claw 1 open/closed `23/110`, claw 2 `40/100`, claw 3
 `80/180`, and winch `0/180` degrees. Tower Pieces uses the same live angles as
-the `Servos` panel, so panel changes update an active servo hold and later
+the `Servo Control` panel, so panel changes update an active servo hold and later
 sequence commands; `/api/claws/save` persists them to NVS.
+
+An adjustable Tower Pieces start window ignores LSS HIGH readings during a
+mode handoff. A HIGH held through the window must return LOW before it can
+count as a crossing.
 
 The dashboard also provides a `PegFinder` mode. It uses the IMU turn
 controller to rotate clockwise through a configured angle, pauses, drives
@@ -207,8 +220,13 @@ GPIO47 is LOW while released and HIGH while pressed. If the switch is not
 pressed before the adjustable timeout, PegFinder stops with a fault. After a
 configurable delay, it opens all three claws in a dashboard-selected order with
 a configurable delay between each command, using the live angles from the
-shared `Servos` panel. It then waits for another configurable delay and runs
-the funnel in reverse at an adjustable duty for an adjustable duration. The
+shared `Servo Control` panel. Between claw openings it can run adjustable short
+left/right shake pulses to free pieces in the funnel. All three shake values
+default to zero, which disables shaking until they are calibrated. After each
+enabled left/right shake, the chassis waits stopped for an adjustable delay
+before opening the next claw. It then waits
+for another configurable delay and runs the funnel in reverse at an adjustable
+duty for an adjustable duration. The
 PegFinder turn output cap, Kp, Kd, tolerance, settling, timeout, and
 measured yaw polarity all come from the shared IMU Turn panel. Its angle,
 chassis and funnel duties, and timings
@@ -224,6 +242,14 @@ Pieces. The transition strafe uses the shared IMU Strafe tuning. These
 transition values default to `0`; a `0 ms` strafe skips
 that motion. At the Tower Pieces-to-PegFinder handoff, the claws and winch are
 commanded closed and their PWM outputs remain enabled.
+
+The `Final competition` panel runs Autonomous Solar, all three interleaved
+Habitat pickup/placement profiles, Tower Pieces, and PegFinder as one mode.
+Solar hands Habitat a forward front-line follow. Each Habitat pickup profile
+uses its adjustable LSS2/LSS3 start-ignore window. Placement profile 3 must be
+configured to reacquire the rear line; after that search completes, Tower
+Pieces begins its backward line follow and applies its own adjustable LSS
+ignore window. The final mode then hands Tower completion to PegFinder.
 
 ## Upload
 
@@ -266,10 +292,11 @@ logical four-wheel motion calculation, stepper, the remaining servos,
 mechanism limit switches, and its side of the UART link. ESP2 applies
 front-wheel commands locally and sends rear-wheel commands to ESP1.
 
-The ESP2 dashboard includes `Solar Hook Servo Control` for independently
-adjustable Open/Closed angles. ESP1 drives it on GPIO3 with LEDC channel 6 using
-the same timing and pulse range as the claw servos; the output starts detached
-and disabled.
+The ESP2 dashboard includes the Solar Hook controls in the shared `Servo
+Control` panel. Its Open and Closed angles default to `0/148` degrees and remain
+independently adjustable. ESP1 drives it on GPIO3 with LEDC channel 6 using the
+same timing and pulse range as the claw servos; the output starts detached and
+disabled.
 
 Both processors must initialize local actuator outputs disabled and stop local
 motors if valid communication becomes stale.

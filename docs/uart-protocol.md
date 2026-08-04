@@ -57,7 +57,7 @@ does not include the magic bytes or CRC field.
 
 | Byte(s) | Field |
 | --- | --- |
-| 0 | flags: bit 0 rear wheels enabled, bit 1 request VL53L0X high-accuracy profile |
+| 0 | flags: bit 0 rear wheels enabled, bit 1 request VL53L0X high-accuracy profile, bit 2 enable VL53L0X acquisition, bit 3 enable IR acquisition |
 | 1-2 | signed back-left command milli-units |
 | 3-4 | signed back-right command milli-units |
 | 5-8 | sender timestamp in ms |
@@ -75,10 +75,12 @@ ESP1 publishes `SensorSnapshot` every `10 ms` using a 6-byte payload:
 | 4 | flags: bit 0 rear sensors configured, bit 1 LSBL high, bit 2 LSBR high, bit 3 LSS configured, bit 4 LSS high, bit 5 LSS2 configured, bit 6 LSS2 high |
 | 5 | flags: bit 0 LSS3 configured, bit 1 LSS3 high |
 
-The shared snapshot keeps rear following and current/future autonomous
-side-line inputs on one coherent ESP1 acquisition path. HIGH means black tape.
-Habitat Pieces consumes LSS2 on ESP1 GPIO11 as its all-wheel stop sensor. LSS3
-on ESP1 GPIO12 remains available as telemetry but does not control this route.
+The shared snapshot keeps rear following and autonomous side-line inputs on one
+coherent ESP1 acquisition path. HIGH means black tape. Habitat Pieces stops
+line following when either LSS2 on ESP1 GPIO11 or LSS3 on ESP1 GPIO12 sees
+black. An LSS2-first detection selects clockwise rotation until LSS3 sees
+black; an LSS3-first detection selects counter-clockwise rotation until LSS2
+sees black.
 ESP2 also accepts the prior 5-byte snapshot as a migration aid and reports LSS3
 unconfigured for that packet. Flash ESP2 before ESP1 when updating processors
 separately; the older ESP2 firmware does not understand the new 6-byte packet.
@@ -112,11 +114,13 @@ sequence identifies new sensor data. Consumers must calculate measurement
 freshness from receipt of a changed measurement sequence; receipt of an
 unchanged heartbeat does not refresh sensor data.
 
-The rear-wheel command's motor outputs expire with the command, but its last
-laser-profile request is retained because sensor quality is independent of
-chassis command freshness. The initial and operational profile is high
-accuracy. ESP1 also
-publishes immediately when the active profile changes. Habitat Pieces does not
+The rear-wheel command's motor outputs and both sensor-acquisition requests
+expire with the command. Its last laser-profile request is retained because
+sensor quality is independent of chassis command freshness. The initial and
+operational profile is high accuracy. ESP1 initializes the laser without
+starting continuous ranging, starts it only while Habitat Pickup or Placement
+is active, and publishes immediately when acquisition state or profile changes.
+Habitat Pieces does not
 use laser profile acknowledgement as a Start gate. Its IMU-held pickup strafe
 consumes only new, fresh high-accuracy measurement attempts to count distinct
 entries at or below the configured distance threshold. After the target count,
@@ -187,7 +191,7 @@ rolling firmware update.
 | 5 | `FaultCode` numeric value |
 | 6-7 | back-left applied command milli-units |
 | 8-9 | back-right applied command milli-units |
-| 10 | flags: bit 0 fault active, bit 1 BL inverted, bit 2 BR inverted, bit 3 IR beacon detected, bit 4 IR switch raw high, bit 5 IR switch debounced high, bit 6 funnel configured |
+| 10 | flags: bit 0 fault active, bit 1 BL inverted, bit 2 BR inverted, bit 3 IR beacon detected, bit 4 IR switch raw high, bit 5 IR switch debounced high, bit 6 funnel configured, bit 7 IR acquisition enabled |
 | 11-12 | IR ADC average |
 | 13-14 | IR ADC minimum |
 | 15-16 | IR ADC maximum |
