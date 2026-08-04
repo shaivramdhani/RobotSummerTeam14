@@ -43,16 +43,18 @@ disabled and line following refuses to start.
   straight-backward move begins. LSS3 remains telemetry-only in this route.
   Reverse duty and duration are locked at zero until configured; completion
   begins the separately bounded distance-zone strafe. Direction, threshold,
-  target count, duty, post-count stop delay, exit-pulse duration, and timeout
-  are locked until explicitly configured. The
+  target count, duty, post-count stop delay, independent exit-pulse duty,
+  exit-pulse duration, and timeout are locked until explicitly configured. The
   overall LSS2 search timeout must be longer than the detection delay.
 - Habitat Pieces requires a configured LSS2 input, fresh shared ESP1 sensor
   snapshot, valid shared IMU heading-hold tuning, and a healthy IMU at Start.
   Missing configuration, stale LSS2 data, front line loss before detection,
   rear-command failure, or timeout stops all four wheels. No detection delay,
   search timeout, reverse duty/duration, distance direction,
-  threshold, count, duty, post-count delay, exit-pulse duration, or distance
-  timeout is compiled in; all must be explicitly configured. During the timed reverse, continued side-
+  threshold, count, duty, post-count delay, exit-pulse duty/duration, or
+  distance timeout is compiled in; all must be explicitly configured. The
+  independent exit duty inherits a legacy saved counting-strafe duty until it
+  is explicitly saved. During the timed reverse, continued side-
   sensor data is not required, but motor and communication safety gates remain
   active. Distance strafing uses the shared IMU heading-hold controller. During
   that step, only new, fresh high-accuracy measurement sequences affect the
@@ -74,6 +76,14 @@ disabled and line following refuses to start.
   Habitat Placement. Stepper-command failure, conflicting limits, stale rear
   line data, or any slide/approach/lift/reacquisition timeout stops both the
   chassis and slide.
+- Habitat Pieces Start validates all three pickup profiles and all three
+  matching placement profiles before any motion. They alternate strictly in
+  numeric order, with an explicit all-wheel stop at each handoff. Each
+  placement's Front/Rear return source is saved and validated per profile. The
+  lower-limit search starts concurrently with the forward-to-slide drive, so
+  the configured stepper timeout is measured from that command. A stopped
+  stepper before the bottom limit, timeout, conflicting limits, stale required
+  line data, or an IMU/link failure stops both chassis and slide.
 - Runtime MPU-6050 I2C transactions execute only in ESP2's sensor-acquisition
   task. The core-1 motion task consumes a copied snapshot and treats data older
   than the IMU freshness limit as unavailable.

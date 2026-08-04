@@ -764,12 +764,17 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"post_count_stop_delay_ms\":%u,"
       "\"post_count_stop_elapsed_ms\":%u,"
       "\"post_count_stop_remaining_ms\":%u,"
+      "\"exit_strafe_duty\":%.5f,"
       "\"exit_strafe_pulse_ms\":%u,"
       "\"exit_strafe_pulse_elapsed_ms\":%u,"
       "\"exit_strafe_pulse_remaining_ms\":%u,"
       "\"distance_mm\":%u,\"distance_zone_count\":%u,"
       "\"distance_exit_pulse_count\":%u,"
-      "\"configuration_valid\":%s,\"start_ready\":%s,"
+      "\"configuration_valid\":%s,\"all_profiles_valid\":%s,"
+      "\"start_ready\":%s,\"profile_count\":%u,"
+      "\"editor_profile\":%u,\"active_profile\":%u,"
+      "\"completed_profile_count\":%u,"
+      "\"sequence_active\":%s,\"sequence_phase\":\"%s\","
       "\"lss2_configured\":%s,\"lss2_data_fresh\":%s,"
       "\"lss3_configured\":%s,\"lss3_data_fresh\":%s,"
       "\"lss2_detection_armed\":%s,\"lss2_black\":%s,"
@@ -857,6 +862,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
           snapshot.habitat_pieces_post_count_stop_elapsed_ms),
       static_cast<unsigned>(
           snapshot.habitat_pieces_post_count_stop_remaining_ms),
+      snapshot.habitat_pieces_exit_strafe_duty,
       static_cast<unsigned>(
           snapshot.habitat_pieces_exit_strafe_pulse_ms),
       static_cast<unsigned>(
@@ -869,7 +875,17 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(
           snapshot.habitat_pieces_distance_exit_pulse_count),
       jsonBool(snapshot.habitat_pieces_configuration_valid),
+      jsonBool(snapshot.habitat_pieces_all_profiles_valid),
       jsonBool(snapshot.habitat_pieces_start_ready),
+      static_cast<unsigned>(kHabitatProfileCount),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_editor_profile_number),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_active_profile_number),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_completed_profile_count),
+      jsonBool(snapshot.habitat_pieces_sequence_active),
+      habitatCyclePhaseName(snapshot.habitat_cycle_phase),
       jsonBool(snapshot.habitat_pieces_lss2_configured),
       jsonBool(snapshot.habitat_pieces_lss2_data_fresh),
       jsonBool(snapshot.habitat_pieces_lss3_configured),
@@ -949,7 +965,11 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
   writer.append(
       ",\"habitat_placement\":{\"state\":\"%s\","
       "\"fault_reason\":\"%s\",\"time_in_state_ms\":%u,"
-      "\"configuration_valid\":%s,\"start_ready\":%s,"
+      "\"configuration_valid\":%s,\"all_profiles_valid\":%s,"
+      "\"start_ready\":%s,\"profile_count\":%u,"
+      "\"editor_profile\":%u,\"active_profile\":%u,"
+      "\"completed_profile_count\":%u,"
+      "\"sequence_active\":%s,\"return_line_source\":\"%s\","
       "\"initial_heading_captured\":%s,"
       "\"initial_heading_deg\":%.5f,"
       "\"counter_clockwise_target_heading_deg\":%.5f,"
@@ -988,7 +1008,19 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(
           snapshot.habitat_placement_time_in_state_ms),
       jsonBool(snapshot.habitat_placement_configuration_valid),
+      jsonBool(snapshot.habitat_placement_all_profiles_valid),
       jsonBool(snapshot.habitat_placement_start_ready),
+      static_cast<unsigned>(kHabitatProfileCount),
+      static_cast<unsigned>(
+          snapshot.habitat_placement_editor_profile_number),
+      static_cast<unsigned>(
+          snapshot.habitat_placement_active_profile_number),
+      static_cast<unsigned>(
+          snapshot.habitat_placement_completed_profile_count),
+      jsonBool(snapshot.habitat_placement_sequence_active),
+      snapshot.habitat_placement_return_uses_rear_line
+          ? "REAR"
+          : "FRONT",
       jsonBool(
           snapshot.habitat_placement_initial_heading_captured),
       snapshot.habitat_placement_initial_heading_deg,

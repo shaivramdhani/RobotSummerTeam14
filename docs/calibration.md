@@ -14,12 +14,15 @@ calibration values.
 - `LSBL` threshold: TODO
 - `LSBR` threshold: TODO
 - Rear/side active levels or ADC ranges: TODO
-- Habitat Pieces LSS2 detection delay, overall LSS2 search timeout,
+- Calibrate Habitat Pieces pickup profiles 1, 2, and 3 independently: LSS2
+  detection delay, overall LSS2 search timeout,
   line-follow duty, reverse duty/duration, distance-strafe left/right direction,
   distance threshold, target zone count, strafe duty, and strafe timeout: TODO;
   set only after raised-wheel and field-path testing. Distance strafing also
-  requires calibrated shared IMU heading-hold tuning.
-- Habitat Pieces slide-down speed/timeout, GPIO48 habitat-piece limit-switch
+  requires calibrated shared IMU heading-hold tuning. Calibrate the short
+  exit-pulse strafe duty independently from the long counting-strafe duty.
+- For each Habitat Pieces pickup profile, calibrate slide-down speed/timeout,
+  GPIO48 habitat-piece limit-switch
   operation, approach duty/timeout, pre-lift reverse duration, lift
   steps/speed/timeout/start delay, post-pickup reverse duty/duration, and
   opposite-direction rear-line strafe duty/timeout: TODO. Verify
@@ -90,12 +93,17 @@ calibration values.
 - Winch uses GPIO6/MCPWM unit 0, timer 0, generator A at 50 Hz with a 1 MHz
   timer resolution and 1000–2000 µs pulses. Its existing adjustable open and
   closed angles remain the position calibration.
-- Habitat Placement rear-line duty, LSS1 timeout/delay, return-to-initial-
+- Calibrate the three matching Habitat Placement profiles independently. Each profile's
+  rear-line duty, LSS1 timeout/delay, return-to-initial-
   heading timeout, pre-CCW right-strafe duty/duration, both configured IMU turn
   angles/timeouts, after-CW reverse duty/duration, shared left/right strafe
   duty and both strafe durations, all other
-  translation duties/durations, slide speed/timeout, and final front-line
-  strafe duty/timeout are TODO field-calibration values. The return turn uses
-  the shared adjustable IMU maximum rotation duty.
+  translation duties/durations, slide speed/timeout, and return-line strafe
+  duty/timeout are TODO field-calibration values. Select the return sensor per
+  profile; the migrated defaults are Front, Front, Rear. The
+  slide timeout begins when the concurrent forward-to-slide drive starts. The return turn uses
+  the shared adjustable IMU maximum rotation duty. Every placement strafe uses
+  the shared IMU heading-hold gains, yaw-correction limit, and measured yaw
+  command polarity.
 - Stepper step timing and direction polarity: TODO
 - Limit switch active levels: TODO

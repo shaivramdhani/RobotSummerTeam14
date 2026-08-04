@@ -8,6 +8,7 @@
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
 #include "common/FunnelCommand.h"
+#include "common/HabitatCycleAutonomy.h"
 #include "common/HabitatDistanceStop.h"
 #include "common/HabitatPiecesAutonomy.h"
 #include "common/HabitatPlacementAutonomy.h"
@@ -3132,6 +3133,13 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.habitat_pieces_post_count_stop_delay_ms = 150U;
   snapshot.habitat_pieces_post_count_stop_elapsed_ms = 50U;
   snapshot.habitat_pieces_post_count_stop_remaining_ms = 100U;
+  snapshot.habitat_pieces_exit_strafe_duty = 0.09F;
+  snapshot.habitat_pieces_all_profiles_valid = true;
+  snapshot.habitat_pieces_editor_profile_number = 2U;
+  snapshot.habitat_pieces_active_profile_number = 3U;
+  snapshot.habitat_pieces_completed_profile_count = 2U;
+  snapshot.habitat_pieces_sequence_active = true;
+  snapshot.habitat_cycle_phase = robot::HabitatCyclePhase::Pickup;
   snapshot.habitat_pieces_exit_strafe_pulse_ms = 100U;
   snapshot.habitat_pieces_exit_strafe_pulse_elapsed_ms = 25U;
   snapshot.habitat_pieces_exit_strafe_pulse_remaining_ms = 75U;
@@ -3188,6 +3196,12 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.habitat_placement_initial_heading_captured = true;
   snapshot.habitat_placement_initial_heading_deg = 12.5F;
   snapshot.habitat_placement_counter_clockwise_target_heading_deg = -77.5F;
+  snapshot.habitat_placement_all_profiles_valid = true;
+  snapshot.habitat_placement_editor_profile_number = 2U;
+  snapshot.habitat_placement_active_profile_number = 3U;
+  snapshot.habitat_placement_completed_profile_count = 2U;
+  snapshot.habitat_placement_sequence_active = true;
+  snapshot.habitat_placement_return_uses_rear_line = true;
   snapshot.habitat_placement_config.initial_heading_turn_timeout_ms =
       600U;
   snapshot.habitat_placement_config
@@ -3330,6 +3344,16 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"current_mode\":\"LINE_SENSOR_TEST\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"enabled\":false"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"habitat_placement\""));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"all_profiles_valid\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"editor_profile\":2"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"active_profile\":3"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"completed_profile_count\":2"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"return_line_source\":\"REAR\""));
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"initial_heading_captured\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(
@@ -3762,6 +3786,10 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       std::strstr(output, "\"distance_strafe_timeout_ms\":4000"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"post_count_stop_delay_ms\":150"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"exit_strafe_duty\":0.09000"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"sequence_phase\":\"PICKUP\""));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"exit_strafe_pulse_ms\":100"));
   TEST_ASSERT_NOT_NULL(
@@ -4230,6 +4258,8 @@ void test_habitat_pieces_defaults_to_requested_duty_but_stays_locked() {
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.post_count_stop_delay_ms = 50U;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.exit_strafe_duty = 0.1F;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.exit_strafe_pulse_ms = 100U;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.slide_down_speed_steps_per_second = 200U;
@@ -4258,6 +4288,11 @@ void test_habitat_pieces_defaults_to_requested_duty_but_stays_locked() {
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.rear_line_reacquire_timeout_ms = 2000U;
   TEST_ASSERT_TRUE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.exit_strafe_duty = 0.0F;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.exit_strafe_duty = 1.01F;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.exit_strafe_duty = 0.1F;
   config.run_timeout_ms = config.lss2_detection_delay_ms;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.run_timeout_ms = 1000U;
@@ -5027,6 +5062,21 @@ void test_habitat_placement_config_starts_locked() {
   config = validHabitatPlacementConfig();
   TEST_ASSERT_TRUE(
       robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
+  TEST_ASSERT_EQUAL_STRING(
+      "FRONT", robot::habitatPlacementReturnLineSourceName(
+                   config.return_line_source));
+  config.return_line_source =
+      robot::HabitatPlacementReturnLineSource::Rear;
+  TEST_ASSERT_TRUE(
+      robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
+  TEST_ASSERT_EQUAL_STRING(
+      "REAR", robot::habitatPlacementReturnLineSourceName(
+                  config.return_line_source));
+  config.return_line_source =
+      static_cast<robot::HabitatPlacementReturnLineSource>(2U);
+  TEST_ASSERT_FALSE(
+      robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
+  config = validHabitatPlacementConfig();
   config.strafe_right_duty = 0.9F;
   TEST_ASSERT_FALSE(
       robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
@@ -5042,6 +5092,10 @@ void test_habitat_placement_config_starts_locked() {
   config.post_clockwise_strafe_right_duration_ms = 0U;
   TEST_ASSERT_FALSE(
       robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
+  TEST_ASSERT_EQUAL_STRING(
+      "IMU_STRAFE_FAILED",
+      robot::habitatPlacementFaultReasonName(
+          robot::HabitatPlacementFaultReason::ImuStrafeFailed));
 }
 
 void test_habitat_placement_runs_requested_sequence() {
@@ -5088,6 +5142,7 @@ void test_habitat_placement_runs_requested_sequence() {
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  23U);
   TEST_ASSERT_TRUE(update.should_drive_forward_to_slide);
+  TEST_ASSERT_TRUE(update.should_lower_slide);
   inputs = {};
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  33U);
@@ -5136,7 +5191,7 @@ void test_habitat_placement_runs_requested_sequence() {
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  126U);
   TEST_ASSERT_TRUE(update.should_strafe_right);
-  inputs.front_line_black = true;
+  inputs.return_line_black = true;
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  127U);
   TEST_ASSERT_TRUE(update.should_close_pusher);
@@ -5145,6 +5200,50 @@ void test_habitat_placement_runs_requested_sequence() {
                                                  128U);
   TEST_ASSERT_TRUE(update.complete);
   TEST_ASSERT_TRUE(update.should_stop_drive);
+}
+
+void test_habitat_cycle_interleaves_three_pickups_and_placements() {
+  robot::HabitatCycleAutonomy cycle{};
+  robot::startHabitatCycleAutonomy(cycle);
+  TEST_ASSERT_EQUAL_STRING(
+      "PICKUP", robot::habitatCyclePhaseName(cycle.phase));
+  for (std::uint8_t profile = 0U;
+       profile < robot::kHabitatProfileCount; ++profile) {
+    TEST_ASSERT_EQUAL_UINT8(profile, cycle.active_profile_index);
+    TEST_ASSERT_TRUE(robot::advanceHabitatCycleAfterPickup(cycle));
+    TEST_ASSERT_EQUAL_STRING(
+        "PLACEMENT", robot::habitatCyclePhaseName(cycle.phase));
+    TEST_ASSERT_TRUE(robot::advanceHabitatCycleAfterPlacement(cycle));
+    TEST_ASSERT_EQUAL_UINT8(
+        static_cast<std::uint8_t>(profile + 1U),
+        cycle.completed_profile_count);
+    if (profile + 1U < robot::kHabitatProfileCount) {
+      TEST_ASSERT_EQUAL_STRING(
+          "PICKUP", robot::habitatCyclePhaseName(cycle.phase));
+    }
+  }
+  TEST_ASSERT_EQUAL_STRING(
+      "COMPLETE", robot::habitatCyclePhaseName(cycle.phase));
+  TEST_ASSERT_FALSE(robot::habitatCycleActive(cycle));
+}
+
+void test_habitat_placement_slide_timeout_includes_forward_drive() {
+  const robot::HabitatPlacementConfig config =
+      validHabitatPlacementConfig();
+  robot::HabitatPlacementAutonomy autonomy{};
+  TEST_ASSERT_TRUE(robot::startHabitatPlacementAutonomy(
+      autonomy, 0.0F, -90.0F, 0U));
+  autonomy.state = robot::HabitatPlacementState::ForwardToSlide;
+  autonomy.state_entered_at_ms = 10U;
+  autonomy.slide_down_started_at_ms = 10U;
+  const robot::HabitatPlacementUpdate update =
+      robot::updateHabitatPlacementAutonomy(
+          autonomy, robot::HabitatPlacementInputs{}, config, 110U);
+  TEST_ASSERT_TRUE(update.faulted);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPlacementFaultReason::StepperTimeout),
+      static_cast<std::uint8_t>(update.fault_reason));
 }
 
 void test_habitat_placement_lss1_timeout_faults_stopped() {
@@ -5373,6 +5472,10 @@ int main() {
   RUN_TEST(test_habitat_placement_mode_parses_and_allows_motion);
   RUN_TEST(test_habitat_placement_config_starts_locked);
   RUN_TEST(test_habitat_placement_runs_requested_sequence);
+  RUN_TEST(
+      test_habitat_cycle_interleaves_three_pickups_and_placements);
+  RUN_TEST(
+      test_habitat_placement_slide_timeout_includes_forward_drive);
   RUN_TEST(test_habitat_placement_lss1_timeout_faults_stopped);
   RUN_TEST(
       test_habitat_placement_initial_heading_turn_times_out_stopped);

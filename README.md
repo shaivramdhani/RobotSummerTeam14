@@ -60,8 +60,9 @@ while counting distinct entries at or below an adjustable laser-distance
 threshold. Consecutive in-zone samples count once, and an above-threshold
 sample rearms the next count. At the target count, the robot stops for an
 adjustable delay, then repeats adjustable-duration IMU-strafe pulses with an
-all-wheel stop and fresh laser check between pulses. An above-threshold check
-clears the final piece and begins the pickup tail. The slide seeks its bottom
+independently adjustable duty, all-wheel stop, and fresh laser check between
+pulses. An above-threshold check clears the final piece and begins the pickup
+tail. The slide seeks its bottom
 limit, the robot drives forward until the active-high ESP2 GPIO48 habitat-piece
 limit switch is pressed, briefly reverses for an adjustable duration using the
 pickup reverse duty, and starts a step-counted
@@ -73,6 +74,14 @@ starts Habitat Placement. Fresh N/A/no-target laser results are treated as
 strafe, stop delay, pulses, and checks. All added strafe settings default to
 unconfigured. The laser remains in its high-accuracy profile with a 200 ms
 continuous intermeasurement period throughout.
+
+Habitat Pieces stores three independently adjustable pickup profiles. One
+Habitat Pieces Start alternates the matching routes in this fixed order:
+Pickup 1, Placement 1, Pickup 2, Placement 2, Pickup 3, Placement 3. Matching
+placement profiles remain independently adjustable, including a selectable
+front/rear return-line source; the migrated defaults are Front, Front, Rear.
+Each placement starts with a fresh IMU heading capture, and its slide starts
+seeking the bottom limit during the forward-to-slide drive.
 
 For the current two-ESP wiring, flash both ESPs and use the ESP2 dashboard to
 test individual wheels, distributed drive, front line sensors, and the

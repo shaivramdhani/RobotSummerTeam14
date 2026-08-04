@@ -76,6 +76,7 @@ struct HabitatPiecesConfig {
   float distance_strafe_duty{0.0F};
   Milliseconds distance_strafe_timeout_ms{0U};
   Milliseconds post_count_stop_delay_ms{0U};
+  float exit_strafe_duty{0.0F};
   Milliseconds exit_strafe_pulse_ms{0U};
   std::uint32_t slide_down_speed_steps_per_second{0U};
   Milliseconds slide_down_timeout_ms{0U};

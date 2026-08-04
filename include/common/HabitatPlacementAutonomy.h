@@ -21,7 +21,7 @@ enum class HabitatPlacementState : std::uint8_t {
   PostClockwiseDelay = 11,
   ForwardExit = 12,
   PostForwardDelay = 13,
-  StrafeRightToFrontLine = 14,
+  StrafeRightToReturnLine = 14,
   ClosePusher = 15,
   Complete = 16,
   Fault = 17,
@@ -47,7 +47,13 @@ enum class HabitatPlacementFaultReason : std::uint8_t {
   StepperTimeout = 11,
   ConflictingLimitSwitches = 12,
   PusherCommandFailed = 13,
-  FrontLineTimeout = 14,
+  ReturnLineTimeout = 14,
+  ImuStrafeFailed = 15,
+};
+
+enum class HabitatPlacementReturnLineSource : std::uint8_t {
+  Front = 0,
+  Rear = 1,
 };
 
 struct HabitatPlacementConfig {
@@ -82,6 +88,8 @@ struct HabitatPlacementConfig {
   Milliseconds post_forward_delay_ms{0U};
   float strafe_right_duty{0.0F};
   Milliseconds strafe_right_timeout_ms{0U};
+  HabitatPlacementReturnLineSource return_line_source{
+      HabitatPlacementReturnLineSource::Front};
 };
 
 struct HabitatPlacementInputs {
@@ -92,7 +100,7 @@ struct HabitatPlacementInputs {
   bool top_limit_active{false};
   bool pusher_open_commanded{false};
   bool clockwise_turn_complete{false};
-  bool front_line_black{false};
+  bool return_line_black{false};
   bool pusher_closed_commanded{false};
 };
 
@@ -102,7 +110,8 @@ struct HabitatPlacementAutonomy {
       HabitatPlacementFaultReason::None};
   Milliseconds state_entered_at_ms{0U};
   Milliseconds started_at_ms{0U};
-  // Captured once, before the initial rear-line motion is enabled.
+  Milliseconds slide_down_started_at_ms{0U};
+  // Captured before rear-line motion is enabled for this placement.
   bool initial_heading_captured{false};
   float initial_heading_deg{0.0F};
   float counter_clockwise_target_heading_deg{0.0F};
@@ -137,6 +146,8 @@ struct HabitatPlacementUpdate {
 const char* habitatPlacementStateName(HabitatPlacementState state);
 const char* habitatPlacementFaultReasonName(
     HabitatPlacementFaultReason reason);
+const char* habitatPlacementReturnLineSourceName(
+    HabitatPlacementReturnLineSource source);
 bool habitatPlacementConfigValid(
     const HabitatPlacementConfig& config, float maximum_allowed_duty,
     std::uint32_t maximum_stepper_speed_steps_per_second);

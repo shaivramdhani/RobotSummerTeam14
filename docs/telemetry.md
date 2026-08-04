@@ -41,7 +41,8 @@ The `Habitat Pieces` panel owns the explicit `HABITAT_PIECES` mode. It exposes
 an independent front line-follow duty (default `0.12`), an adjustable LSS2
 detection delay, overall LSS2 search timeout, reverse duty, reverse
 duration, distance-strafe direction/threshold/target count/duty/timeout, state,
-post-count stop delay, exit-pulse duration/count/state, both sensor inputs, the
+post-count stop delay, independent exit-pulse duty, exit-pulse
+duration/count/state, both sensor inputs, the
 LSS2 latch, live distance/count state, slide-down speed/timeout, approach
 threshold/duty/timeout, lift steps/speed/timeout/start delay, post-pickup reverse settings,
 rear-line reacquisition timeout, and elapsed/active states. Apply
@@ -64,7 +65,8 @@ threshold increments `distance_zone_count`; consecutive in-zone values count
 once, and repeated UART snapshots with the same measurement sequence do not
 count again. Reaching `distance_zone_target_count` stops the wheels for
 `post_count_stop_delay_ms`, then repeats `exit_strafe_pulse_ms` IMU-held pulses.
-Every pulse ends in all-wheel stop, and the exit check waits for a new laser
+Those short pulses use `exit_strafe_duty`, independently from the long counting
+strafe's `distance_strafe_duty`. Every pulse ends in all-wheel stop, and the exit check waits for a new laser
 measurement sequence. Above threshold starts the bounded bottom-limit search;
 at-or-below starts another pulse. After homing, the robot drives forward until
 the active-high ESP2 GPIO48 habitat-piece limit switch is pressed. The laser
@@ -573,11 +575,13 @@ yaw rate, and rotation output.
 | `/api/rear-line-follow/start?ms=<>` | GET/POST | Switch to `REAR_LINE_FOLLOW_TEST` and start reverse travel using the independent rear PID configuration. |
 | `/api/rear-line-follow/stop` | GET/POST | Stop reverse rear line following. |
 | `/api/rear-line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>` | GET/POST | Update the independent rear PID/config; `base` is a positive reverse-speed magnitude. |
-| `/api/autonomous/habitat-pieces/start` | GET/POST | Enter `HABITAT_PIECES` and request the gated front line-follow approach. |
+| `/api/autonomous/habitat-pieces/start` | GET/POST | Validate all pickup and placement profiles, then start the alternating Pickup 1 / Placement 1 / Pickup 2 / Placement 2 / Pickup 3 / Placement 3 sequence. |
 | `/api/autonomous/habitat-pieces/stop` | GET/POST | Stop all Habitat Pieces wheel outputs and reset its latch/state. |
-| `/api/autonomous/habitat-pieces/config?...&slide-down-speed=<>&slide-down-timeout-ms=<>&approach-duty=<>&approach-timeout-ms=<>&pre-lift-reverse-duration-ms=<>&lift-steps=<>&lift-speed=<>&lift-timeout-ms=<>&lift-start-delay-ms=<>&post-pickup-reverse-duty=<>&post-pickup-reverse-duration-ms=<>&rear-line-duty=<>&rear-line-timeout-ms=<>` | GET/POST | Validate and apply the complete pickup route, including the bottom-limit search, GPIO48 limit-switch approach, pre-lift reverse, stopped lift-start delay, concurrent step-counted lift/reverse, independently adjustable opposite-direction IMU strafe, rear-line timeout, and automatic Habitat Placement handoff. Active-run changes are rejected. |
-| `/api/autonomous/habitat-placement/config?...&initial-heading-timeout-ms=<>&pre-ccw-strafe-right-duty=<>&pre-ccw-strafe-right-ms=<>&post-cw-reverse-duty=<>&post-cw-reverse-ms=<>&post-cw-strafe-left-duty=<>&post-cw-strafe-left-ms=<>&post-cw-strafe-right-ms=<>` | GET/POST | Validate the complete Habitat Placement route, including the return-to-initial-heading turn, pre-CCW right strafe, and the timed reverse/left/right sequence after the clockwise turn. The post-CW left and right strafes share one duty. |
-| `/api/autonomous/habitat-placement/start` | GET/POST | Enter `HABITAT_PLACEMENT` and request the fully gated placement route. |
+| `/api/autonomous/habitat-pieces/profile?profile=<1\|2\|3>` | GET/POST | Select the stopped pickup profile displayed and edited by the dashboard. |
+| `/api/autonomous/habitat-pieces/config?profile=<1\|2\|3>&...&exit-strafe-duty=<>&exit-strafe-pulse-ms=<>&slide-down-speed=<>&slide-down-timeout-ms=<>&approach-duty=<>&approach-timeout-ms=<>&pre-lift-reverse-duration-ms=<>&lift-steps=<>&lift-speed=<>&lift-timeout-ms=<>&lift-start-delay-ms=<>&post-pickup-reverse-duty=<>&post-pickup-reverse-duration-ms=<>&rear-line-duty=<>&rear-line-timeout-ms=<>` | GET/POST | Validate and apply one complete pickup profile, including its strafe direction and duties, bottom-limit search, GPIO48 approach, lift, reverse, rear-line return, and placement handoff. Active-cycle changes are rejected. |
+| `/api/autonomous/habitat-placement/profile?profile=<1\|2\|3>` | GET/POST | Select the stopped placement profile displayed and edited by the dashboard. |
+| `/api/autonomous/habitat-placement/config?profile=<1\|2\|3>&return-line-source=<FRONT\|REAR>&...&initial-heading-timeout-ms=<>&pre-ccw-strafe-right-duty=<>&pre-ccw-strafe-right-ms=<>&post-cw-reverse-duty=<>&post-cw-reverse-ms=<>&post-cw-strafe-left-duty=<>&post-cw-strafe-left-ms=<>&post-cw-strafe-right-ms=<>` | GET/POST | Validate one matching Habitat Placement profile, including its selectable return-line source. The post-CW left and right strafes share one duty. Active-cycle changes are rejected. |
+| `/api/autonomous/habitat-placement/start` | GET/POST | Run the selected placement profile once as a standalone test. The full alternating sequence starts from Habitat Pieces. |
 | `/api/autonomous/habitat-placement/stop` | GET/POST | Stop the placement route, stepper, and all wheel outputs. |
 | `/api/autonomous/solar/start` | GET/POST | Start the gated solar-panel autonomous test. |
 | `/api/autonomous/solar/config?...&retry-forward-duty=<>&post-contact-forward-ms=<>&post-contact-forward-duty=<>&post-contact-forward-delay-ms=<>&post-forward-strafe-delay-ms=<>` | GET/POST | Update solar autonomy settings, including adjustable strafe times/timeouts and post-contact motion. All lateral stages use the shared IMU Strafe tuning; `retry-forward-duty` applies only to the non-strafe forward adjustment. |
@@ -665,7 +669,9 @@ initial-right, retry-left, and retry-right strafes.
   `distance_threshold_mm`, `distance_zone_target_count`,
   `distance_strafe_duty`, `distance_strafe_timeout_ms`,
   `distance_strafe_elapsed_ms`, `distance_strafe_remaining_ms`, `distance_mm`,
-  `distance_zone_count`, `configuration_valid`, `start_ready`,
+  `distance_zone_count`, `exit_strafe_duty`, `configuration_valid`,
+  `all_profiles_valid`, `start_ready`, `editor_profile`, `active_profile`,
+  `completed_profile_count`, `sequence_active`, `sequence_phase`,
   `lss2_configured`, `lss2_data_fresh`, `lss3_configured`,
   `lss3_data_fresh`, `lss2_detection_armed`, both raw black states and latch
   states, GPIO48 `approach_limit_configured`, `approach_limit_raw_level`,
@@ -784,7 +790,8 @@ mode autonomous-dry-run
 sensor status
 line status
 rear-line status
-habitat config <duty> <lss2-delay-ms> <lss2-search-timeout-ms> <reverse-duty> <reverse-duration-ms> <left|right> <distance-threshold-mm> <zone-count> <strafe-duty> <strafe-timeout-ms>
+habitat config <duty> <lss2-delay-ms> <lss2-search-timeout-ms> <reverse-duty> <reverse-duration-ms> <left|right> <distance-threshold-mm> <zone-count> <strafe-duty> <strafe-timeout-ms> <post-count-stop-ms> <exit-duty> <exit-pulse-ms>
+habitat profile <1|2|3>
 habitat start
 habitat status
 habitat stop
@@ -879,21 +886,27 @@ Hardware verification is still required.
 ## Habitat Placement
 
 ESP2 telemetry publishes `habitat_placement` with the current state, fault
-reason, time in state, configuration/readiness flags, and every adjustable
-route value. The dashboard applies, saves, starts, and stops the route through
-`/api/autonomous/habitat-placement/config`, `/start`, and `/stop`. The
+reason, time in state, current-profile and all-profile readiness flags, editor
+and active profile numbers, completed-profile count, sequence-active state,
+return sensor source, and every adjustable value for the displayed profile.
+The dashboard selects profiles through `/profile` and applies, saves, starts,
+and stops the route through `/config`, `/start`, and `/stop`. The
 `claws.habitat_pusher` object reports the new servo's hardware, calibration,
 enabled output, and commanded target; manual testing uses
 `/api/habitat-pusher?state=open|close`.
 
-The clockwise turn now flows directly into `REVERSE_AFTER_CLOCKWISE`, then
+Habitat Pieces Start alternates the three pickup profiles with their matching
+placement profiles. Placement Start remains a standalone one-profile test.
+Profiles are saved together; when upgrading from the prior single-profile
+format, that configuration is copied into all three profiles. The clockwise
+turn flows directly into `REVERSE_AFTER_CLOCKWISE`, then
 `STRAFE_LEFT_AFTER_CLOCKWISE` and `STRAFE_RIGHT_AFTER_CLOCKWISE`, before the
 existing post-clockwise delay and forward drive. Reverse has its own duty and
 duration; the two strafes share the adjustable post-CW strafe duty and have
 independent durations. The chassis mixer applies the direction signs.
 
-When Habitat Placement starts, it captures one fresh continuous IMU heading
-before enabling rear-line motion. After LSS1 and the configured stopped delay,
+At the start of each placement, Habitat Placement captures a fresh continuous
+IMU heading before enabling rear-line motion. After LSS1 and the configured stopped delay,
 `TURN_TO_INITIAL_HEADING` returns to that exact target. The route then runs
 `STRAFE_RIGHT_BEFORE_COUNTER_CLOCKWISE` for its independently adjustable duty
 and duration. `TURN_COUNTER_CLOCKWISE` targets the same captured heading plus
@@ -907,3 +920,10 @@ reused by the later clockwise turn. The return turn uses
 duty; the right strafe uses
 `pre_counter_clockwise_strafe_right_duty` and
 `pre_counter_clockwise_strafe_right_duration_ms`.
+
+The lower-limit search begins on entry to `FORWARD_TO_SLIDE`, so slide lowering
+and the forward drive execute concurrently. Its timeout includes that drive
+time. `return_line_source` selects whether either front or either rear sensor
+finishes `STRAFE_RIGHT_TO_RETURN_LINE` for each profile. The migrated defaults
+are Front, Front, Rear. Closing the pusher completes that placement; the cycle
+then either starts the next pickup or remains stopped after Placement 3.

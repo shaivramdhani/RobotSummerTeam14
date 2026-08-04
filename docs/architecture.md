@@ -70,9 +70,10 @@ increments the zone count when the preceding reading was above; consecutive
 in-zone samples count once, and an above-threshold sample rearms the next
 entry. Reaching `distance_zone_target_count` stops every wheel for
 `post_count_stop_delay_ms`. The controller then alternates
-`exit_strafe_pulse_ms` IMU-held strafe pulses with stopped waits for a new
-measurement sequence. A fresh above-threshold check advances to a bottom-limit
-slide search; at-or-below repeats the pulse. The pickup tail then performs a
+`exit_strafe_pulse_ms` IMU-held strafe pulses at the independent
+`exit_strafe_duty`, with stopped waits for a new measurement sequence. A fresh
+above-threshold check advances to a bottom-limit slide search; at-or-below
+repeats the pulse. The pickup tail then performs a
 bounded GPIO48 limit-switch approach, a timed pre-lift reverse, and a step-counted
 lift during a stopped adjustable delay. It then runs the lift concurrently
 with a timed reverse and IMU-strafes at an independently adjustable duty
@@ -84,7 +85,14 @@ distance-strafe phases even if the stream becomes unavailable.
 than the detection delay. LSS2 configuration and snapshot freshness are
 required until it latches; LSS3 is telemetry-only. The reverse remains bounded
 by its own duration and the normal motor/link command-expiry gates.
-Mission-state integration is still separate future work.
+The Habitat cycle coordinator stores three pickup profiles and three matching
+placement profiles. One Habitat Pieces Start alternates Pickup 1, Placement 1,
+Pickup 2, Placement 2, Pickup 3, and Placement 3. Every placement captures a
+fresh initial heading when that placement begins. Its return line source is a
+per-profile Front/Rear setting; migrated defaults are Front, Front, Rear. The
+slide lower-limit search begins with, and runs concurrently through, each
+forward-to-slide drive; its timeout is measured from that earlier start. The
+third placement ends stopped, ready for a later route selection.
 
 The VL53L0X operates in its high-accuracy profile. It is not a start gate.
 Fresh N/A/no-target results participate as the large-distance sentinel; an

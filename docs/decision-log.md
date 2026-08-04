@@ -277,3 +277,42 @@ saved duration.
 Safety note: The duration defaults to unconfigured, is limited to the shared
 maximum autonomous timing, and therefore locks Habitat Placement Start until
 set. Existing command-expiry and rear-link safety behavior remains active.
+
+## 2026-08-03: IMU Heading Hold for Every Habitat Placement Strafe
+
+Decision: Route the pre-CCW right strafe, post-CW left and right strafes, and
+final right strafe to the front line through the shared IMU heading-hold
+controller. Each strafe keeps its existing direction, duty, duration, or sensor
+stop condition.
+
+Safety note: Habitat Placement Start now validates every strafe duty against
+the shared IMU correction reserve. Loss of fresh IMU data pauses and stops the
+strafe during the bounded recovery window; recovery timeout or controller/link
+failure latches a stopped autonomy fault.
+
+## 2026-08-03: Alternating Three-Profile Habitat Cycle
+
+Decision: Store three independently editable Habitat Pieces pickup profiles
+and three matching placement profiles. One Habitat Pieces Start executes
+Pickup 1, Placement 1, Pickup 2, Placement 2, Pickup 3, and Placement 3. Each
+placement profile selects Front or Rear as its return-line source; migration
+copies legacy settings into all three profiles and assigns Front, Front, Rear.
+Each placement captures a fresh initial heading at its own start.
+
+Safety note: Start validates every pickup and placement profile before motion.
+Every pickup/placement handoff commands an all-wheel stop, and stale or
+unavailable required line data, IMU/link failure, or any existing per-step
+timeout faults the complete sequence stopped.
+
+## 2026-08-03: Concurrent Placement Slide and Independent Exit-Pulse Duty
+
+Decision: Start the Habitat Placement lower-limit search when
+`FORWARD_TO_SLIDE` begins and keep it active through the following slide state.
+Also give Habitat Pieces `EXIT_STRAFE_PULSE` its own adjustable duty instead of
+reusing the long distance-counting strafe duty. Existing saved pickup settings
+inherit the counting-strafe duty until the new value is saved.
+
+Safety note: The slide timeout begins with the earlier concurrent command; an
+unexpected stop or timeout before the bottom limit faults both mechanisms. The
+new pulse duty is validated against the motor cap and IMU correction reserve,
+and every pulse still ends with an all-wheel stop before checking distance.

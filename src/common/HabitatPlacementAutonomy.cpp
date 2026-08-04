@@ -43,6 +43,7 @@ HabitatPlacementUpdate makeUpdate(
   update.should_drive_forward_to_slide =
       autonomy.state == HabitatPlacementState::ForwardToSlide;
   update.should_lower_slide =
+      autonomy.state == HabitatPlacementState::ForwardToSlide ||
       autonomy.state == HabitatPlacementState::LowerSlide;
   update.should_open_pusher =
       autonomy.state == HabitatPlacementState::OpenPusher;
@@ -61,7 +62,7 @@ HabitatPlacementUpdate makeUpdate(
   update.should_drive_forward_exit =
       autonomy.state == HabitatPlacementState::ForwardExit;
   update.should_strafe_right =
-      autonomy.state == HabitatPlacementState::StrafeRightToFrontLine;
+      autonomy.state == HabitatPlacementState::StrafeRightToReturnLine;
   update.should_close_pusher =
       autonomy.state == HabitatPlacementState::ClosePusher;
   update.should_stop_drive =
@@ -123,8 +124,8 @@ const char* habitatPlacementStateName(const HabitatPlacementState state) {
       return "FORWARD_EXIT";
     case HabitatPlacementState::PostForwardDelay:
       return "POST_FORWARD_DELAY";
-    case HabitatPlacementState::StrafeRightToFrontLine:
-      return "STRAFE_RIGHT_TO_FRONT_LINE";
+    case HabitatPlacementState::StrafeRightToReturnLine:
+      return "STRAFE_RIGHT_TO_RETURN_LINE";
     case HabitatPlacementState::ClosePusher:
       return "CLOSE_PUSHER";
     case HabitatPlacementState::Complete:
@@ -133,6 +134,17 @@ const char* habitatPlacementStateName(const HabitatPlacementState state) {
       return "FAULT";
   }
   return "WAIT_FOR_START";
+}
+
+const char* habitatPlacementReturnLineSourceName(
+    const HabitatPlacementReturnLineSource source) {
+  switch (source) {
+    case HabitatPlacementReturnLineSource::Front:
+      return "FRONT";
+    case HabitatPlacementReturnLineSource::Rear:
+      return "REAR";
+  }
+  return "FRONT";
 }
 
 const char* habitatPlacementFaultReasonName(
@@ -166,8 +178,10 @@ const char* habitatPlacementFaultReasonName(
       return "CONFLICTING_LIMIT_SWITCHES";
     case HabitatPlacementFaultReason::PusherCommandFailed:
       return "PUSHER_COMMAND_FAILED";
-    case HabitatPlacementFaultReason::FrontLineTimeout:
-      return "FRONT_LINE_TIMEOUT";
+    case HabitatPlacementFaultReason::ReturnLineTimeout:
+      return "RETURN_LINE_TIMEOUT";
+    case HabitatPlacementFaultReason::ImuStrafeFailed:
+      return "IMU_STRAFE_FAILED";
   }
   return "NONE";
 }
@@ -215,7 +229,11 @@ bool habitatPlacementConfigValid(
          config.exit_forward_duration_ms > 0U &&
          config.post_forward_delay_ms > 0U &&
          dutyValid(config.strafe_right_duty, maximum_allowed_duty) &&
-         config.strafe_right_timeout_ms > 0U;
+         config.strafe_right_timeout_ms > 0U &&
+         (config.return_line_source ==
+              HabitatPlacementReturnLineSource::Front ||
+          config.return_line_source ==
+              HabitatPlacementReturnLineSource::Rear);
 }
 
 void resetHabitatPlacementAutonomy(HabitatPlacementAutonomy& autonomy,
@@ -316,6 +334,7 @@ HabitatPlacementUpdate updateHabitatPlacementAutonomy(
       break;
     case HabitatPlacementState::TurnCounterClockwise:
       if (inputs.counter_clockwise_turn_complete) {
+        autonomy.slide_down_started_at_ms = now_ms;
         enterState(autonomy, HabitatPlacementState::ForwardToSlide,
                    now_ms);
       } else if (elapsed_ms >= config.counter_clockwise_timeout_ms) {
@@ -324,6 +343,13 @@ HabitatPlacementUpdate updateHabitatPlacementAutonomy(
       }
       break;
     case HabitatPlacementState::ForwardToSlide:
+      if (!inputs.bottom_limit_active &&
+          elapsedSince(now_ms, autonomy.slide_down_started_at_ms) >=
+              config.stepper_down_timeout_ms) {
+        failHabitatPlacementAutonomy(
+            autonomy, HabitatPlacementFaultReason::StepperTimeout, now_ms);
+        break;
+      }
       if (elapsed_ms >= config.forward_to_slide_duration_ms) {
         enterState(autonomy, HabitatPlacementState::LowerSlide, now_ms);
       }
@@ -331,7 +357,9 @@ HabitatPlacementUpdate updateHabitatPlacementAutonomy(
     case HabitatPlacementState::LowerSlide:
       if (inputs.bottom_limit_active) {
         enterState(autonomy, HabitatPlacementState::OpenPusher, now_ms);
-      } else if (elapsed_ms >= config.stepper_down_timeout_ms) {
+      } else if (elapsedSince(
+                     now_ms, autonomy.slide_down_started_at_ms) >=
+                 config.stepper_down_timeout_ms) {
         failHabitatPlacementAutonomy(
             autonomy, HabitatPlacementFaultReason::StepperTimeout, now_ms);
       }
@@ -406,16 +434,16 @@ HabitatPlacementUpdate updateHabitatPlacementAutonomy(
     case HabitatPlacementState::PostForwardDelay:
       if (elapsed_ms >= config.post_forward_delay_ms) {
         enterState(autonomy,
-                   HabitatPlacementState::StrafeRightToFrontLine,
+                   HabitatPlacementState::StrafeRightToReturnLine,
                    now_ms);
       }
       break;
-    case HabitatPlacementState::StrafeRightToFrontLine:
-      if (inputs.front_line_black) {
+    case HabitatPlacementState::StrafeRightToReturnLine:
+      if (inputs.return_line_black) {
         enterState(autonomy, HabitatPlacementState::ClosePusher, now_ms);
       } else if (elapsed_ms >= config.strafe_right_timeout_ms) {
         failHabitatPlacementAutonomy(
-            autonomy, HabitatPlacementFaultReason::FrontLineTimeout,
+            autonomy, HabitatPlacementFaultReason::ReturnLineTimeout,
             now_ms);
       }
       break;

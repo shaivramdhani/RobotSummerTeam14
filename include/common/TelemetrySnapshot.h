@@ -5,6 +5,7 @@
 
 #include "common/EventLog.h"
 #include "common/FaultHealth.h"
+#include "common/HabitatCycleAutonomy.h"
 #include "common/HabitatPiecesAutonomy.h"
 #include "common/HabitatPlacementAutonomy.h"
 #include "common/ImuHeadingHoldController.h"
@@ -479,6 +480,7 @@ struct TelemetrySnapshot {
   Milliseconds habitat_pieces_post_count_stop_delay_ms{0U};
   Milliseconds habitat_pieces_post_count_stop_elapsed_ms{0U};
   Milliseconds habitat_pieces_post_count_stop_remaining_ms{0U};
+  float habitat_pieces_exit_strafe_duty{0.0F};
   Milliseconds habitat_pieces_exit_strafe_pulse_ms{0U};
   Milliseconds habitat_pieces_exit_strafe_pulse_elapsed_ms{0U};
   Milliseconds habitat_pieces_exit_strafe_pulse_remaining_ms{0U};
@@ -506,7 +508,13 @@ struct TelemetrySnapshot {
   std::uint16_t habitat_pieces_distance_zone_count{0U};
   std::uint16_t habitat_pieces_distance_exit_pulse_count{0U};
   bool habitat_pieces_configuration_valid{false};
+  bool habitat_pieces_all_profiles_valid{false};
   bool habitat_pieces_start_ready{false};
+  std::uint8_t habitat_pieces_editor_profile_number{1U};
+  std::uint8_t habitat_pieces_active_profile_number{1U};
+  std::uint8_t habitat_pieces_completed_profile_count{0U};
+  bool habitat_pieces_sequence_active{false};
+  HabitatCyclePhase habitat_cycle_phase{HabitatCyclePhase::Idle};
   bool habitat_pieces_lss2_configured{false};
   bool habitat_pieces_lss2_data_fresh{false};
   bool habitat_pieces_lss3_configured{false};
@@ -556,7 +564,13 @@ struct TelemetrySnapshot {
   HabitatPlacementConfig habitat_placement_config{};
   Milliseconds habitat_placement_time_in_state_ms{0U};
   bool habitat_placement_configuration_valid{false};
+  bool habitat_placement_all_profiles_valid{false};
   bool habitat_placement_start_ready{false};
+  std::uint8_t habitat_placement_editor_profile_number{1U};
+  std::uint8_t habitat_placement_active_profile_number{1U};
+  std::uint8_t habitat_placement_completed_profile_count{0U};
+  bool habitat_placement_sequence_active{false};
+  bool habitat_placement_return_uses_rear_line{false};
   bool habitat_placement_initial_heading_captured{false};
   float habitat_placement_initial_heading_deg{0.0F};
   float habitat_placement_counter_clockwise_target_heading_deg{0.0F};

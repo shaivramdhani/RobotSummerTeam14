@@ -88,7 +88,7 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
    required for this transition.
 7. Confirm the reverse continues for the full configured duration, then enters
    `DISTANCE_STRAFING` in the configured left/right direction at the configured
-   duty. Confirm the normal/default laser profile remains selected and IMU
+   duty. Confirm the high-accuracy laser profile remains selected and IMU
    heading hold corrects yaw during the strafe.
 8. Disconnect or freeze the shared line-sensor packet before LSS2 latches and
    confirm both processors stop their locally owned wheels through the normal
@@ -108,11 +108,13 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
     prevent the bounded strafe from starting.
 13. Reach the target count and confirm `DISTANCE_ZONE_COUNT_REACHED`, an
     all-wheel stop for the configured delay, and then one timed strafe pulse.
-    Confirm the pulse ends with all wheels stopped and no decision is made
-    until a new measurement sequence arrives. Supply at-or-below and confirm
-    another pulse; supply above and confirm `DISTANCE_EXIT_REACHED` and
-    `LOWER_SLIDE`. Repeat without completing the distance phases and confirm
-    `DISTANCE_STRAFE_TIMEOUT`, `FAULT`, and all-wheel stop.
+    Confirm the pulse uses its independent exit duty rather than the long
+    counting-strafe duty. Confirm the pulse ends with all wheels stopped and no
+    decision is made until a new measurement sequence arrives. Supply
+    at-or-below and confirm another pulse; supply above and confirm
+    `DISTANCE_EXIT_REACHED` and `LOWER_SLIDE`. Repeat without completing the
+    distance phases and confirm `DISTANCE_STRAFE_TIMEOUT`, `FAULT`, and
+    all-wheel stop.
 14. Confirm the slide moves down only at the configured limit-search speed and
     stops at the debounced bottom switch. Confirm a missing bottom input reaches
     `SLIDE_DOWN_TIMEOUT` and stops both the chassis and slide.
@@ -229,27 +231,43 @@ For Stage 3, keep the wheels raised for initial tests:
    the Winch signal is GPIO6/MCPWM unit 0, timer 0, generator A. Confirm neither
    output produces servo pulses during boot or while disabled. Then calibrate
    pusher Closed and Open so the physical close-to-open motion is CW.
-2. Enter every Habitat Placement duty, duration, angle, timeout, slide speed,
-   and pusher-open settle time. Confirm Start Ready remains false if any field,
-   LSS1/rear/front sensor, IMU, stepper limit, pusher target, or link is absent.
+2. Select Habitat Pieces pickup profiles 1, 2, and 3 in turn and enter each
+   complete pickup route. Select the three matching Habitat Placement profiles
+   and enter every placement duty, duration, angle, timeout, slide speed,
+   pusher-open settle time, and Front/Rear return source. Confirm each selector
+   reloads its own saved values. Confirm Habitat Pieces Start Ready remains
+   false if any pickup/placement profile or required sensor, IMU, stepper limit,
+   pusher target, or link is absent.
 3. Exercise the route one phase at a time with conservative settings. Confirm
    the initial heading is captured before rear-line motion begins, LSS1 stops
    reverse line-following, and each delay holds all wheels stopped.
 4. After LSS1 and its delay, confirm the robot returns to the displayed initial
    heading within the dedicated timeout, then strafes right at the configured
-   duty for the full configured duration before beginning the CCW turn.
+   duty for the full configured duration before beginning the CCW turn. Disturb
+   the chassis gently and confirm the IMU correction holds the strafe heading.
 5. Confirm the CCW target equals the initial heading plus or minus the
    configured offset for the verified IMU polarity and remains unchanged
    throughout line following, the return turn, right strafe, and CCW turn.
-   Confirm all IMU turns obey their configured timeout and the slide stops at
-   the bottom switch.
+   Confirm all IMU turns obey their configured timeout. Confirm the slide starts
+   moving down at the beginning of the forward-to-slide drive, continues while
+   the chassis drives, and reaches the bottom switch before the pusher opens.
 6. After the CW turn, confirm the robot runs the configured backward duty for
    its full duration, then the configured left-strafe duty for its full
    duration, then strafes right at the same duty for its independently
-   configured duration before beginning the existing stopped delay and
-   forward drive.
-7. Confirm the final right strafe stops when either front sensor reads black,
-   closes the Habitat Pusher, and remains stopped in Complete.
-8. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
-   and the final front line. Each condition must stop or time out without
-   advancing to the next motion phase.
+   configured duration before beginning the existing stopped delay and forward
+   drive. Confirm both strafes hold heading with the IMU.
+7. Start from Habitat Pieces. Confirm telemetry and physical motion alternate
+   Pickup 1, Placement 1, Pickup 2, Placement 2, Pickup 3, Placement 3, with an
+   all-wheel stop at every handoff. Confirm each placement captures a new IMU
+   heading rather than retaining Placement 1's heading.
+8. With return sources set to Front, Front, Rear, confirm Placements 1 and 2
+   stop their return strafe when either front sensor reads black. Confirm
+   Placement 3 ignores the front condition and stops on either rear sensor.
+   Repeat with a different source selection to prove the setting is per
+   profile. Confirm each return strafe holds heading with the IMU.
+9. Confirm the profile-specific pickup direction/duties and placement values
+   appear in sequence on telemetry and completion reports three completed
+   pickup/placement pairs.
+10. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
+    or the configured return line. Each condition must stop or time out without
+    advancing to the next motion phase or profile.

@@ -64,16 +64,23 @@ mission-state transition into
 `NavigateToHabitatPieces` remains unimplemented.
 
 ESP2 also exposes a standalone `HABITAT_PLACEMENT` route and automatically
-hands off to it after the pickup lift and rear-line reacquisition. It captures the fresh continuous
-IMU heading at route start, reverse-line-follows on the rear sensors until LSS1
-is black, pauses, turns back to the captured initial heading, and performs a
-timed right strafe. It then turns CCW to the captured heading plus or minus the
-configured offset, drives forward, lowers the slide to its bottom limit, opens
-the Habitat Pusher, pushes forward, retreats, performs a bounded IMU CW turn,
-drives backward, strafes left, strafes right, pauses, drives forward, pauses
-again, and performs the final right strafe until either front line sensor is
-black before closing the pusher. Each motion/search has an adjustable bound;
-configuration, stale
+hands off to it after each pickup lift and rear-line reacquisition. A Habitat
+Pieces Start runs Pickup 1, Placement 1, Pickup 2, Placement 2, Pickup 3, and
+Placement 3. Each placement captures a fresh continuous IMU heading at its own
+start. It reverse-line-follows on the rear sensors until LSS1
+is black, pauses, turns back to the captured
+initial heading, and performs a timed right strafe. It then turns CCW to the
+captured heading plus or minus the configured offset, starts lowering the slide
+while driving forward, waits at the bottom limit if the drive finishes first,
+opens the Habitat Pusher, pushes forward, retreats, performs a bounded IMU CW
+turn, drives backward, strafes left, strafes right, pauses, drives forward,
+pauses again, and performs the return strafe before closing the pusher. The
+return source is selectable per matching placement profile; migrated defaults
+are Front, Front, Rear. The pre-CCW, post-CW left/right, and return strafes all
+use shared IMU heading hold. Every pickup/placement transition commands an
+all-wheel stop, and completion after Placement 3 leaves the chassis stopped for
+a later route. Each
+motion/search has an adjustable bound; configuration, stale
 communication, sensor, turn, stepper, servo, and timeout failures stop the
 chassis.
 

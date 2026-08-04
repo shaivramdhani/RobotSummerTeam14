@@ -132,6 +132,9 @@ bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
          config.post_count_stop_delay_ms > 0U &&
          config.post_count_stop_delay_ms <=
              config.distance_strafe_timeout_ms &&
+         std::isfinite(config.exit_strafe_duty) &&
+         config.exit_strafe_duty > 0.0F &&
+         config.exit_strafe_duty <= maximum_duty &&
          config.exit_strafe_pulse_ms > 0U &&
          config.exit_strafe_pulse_ms <=
              config.distance_strafe_timeout_ms &&
