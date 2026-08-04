@@ -73,6 +73,7 @@ voltage before applying power.
 | `MSCLAW3` | 12 | PWM channel/frequency/pulse range TODO |
 | `HabitatPusherServo` | 5 | LEDC channel 7, 50 Hz, 12-bit, 1000–2000 µs; open/closed angles remain adjustable |
 | `WinchServo` | 6 | MCPWM unit 0, timer 0, generator A; 50 Hz, 1 MHz timer resolution, 1000–2000 µs |
+| `LimitSwitchHabitatPiece` | 48 | Habitat Pieces forward stop, LOW released / HIGH pressed |
 | `LimitSwitchStepperBottom` | TODO | TODO |
 | `LimitSwitchStepperMiddle` | TODO | TODO |
 | `LimitSwitchStepperTop` | TODO | TODO |

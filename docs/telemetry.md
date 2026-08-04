@@ -31,7 +31,7 @@ available for two future non-conflicting pins.
 
 The `Laser distance` panel shows ESP1's VL53L0X V2 reading in millimetres and
 centimetres. It reports configuration, initialization, ranging, validity and
-freshness; the active normal/default profile; sensor and driver statuses;
+freshness; the active high-accuracy profile; sensor and driver statuses;
 measurement and UART sequences; success
 and failure counters; acquisition timing; and the configured GPIOs, address,
 and intermeasurement period. The sensor uses ESP1 SDA GPIO10/SCL GPIO9 and a
@@ -58,7 +58,7 @@ produces one control update of all-wheel stop, and transitions to `REVERSING`;
 LSS3 never changes the route. The straight-backward mecanum command runs at
 `reverse_duty` for `reverse_duration_ms`, then enters `DISTANCE_STRAFING`.
 The configured left/right strafe uses the shared IMU heading-hold controller
-while new, fresh normal-profile laser attempts are compared with
+while new, fresh high-accuracy laser attempts are compared with
 `distance_threshold_mm`. Each transition from above to at-or-below the
 threshold increments `distance_zone_count`; consecutive in-zone values count
 once, and repeated UART snapshots with the same measurement sequence do not
@@ -67,12 +67,14 @@ count again. Reaching `distance_zone_target_count` stops the wheels for
 Every pulse ends in all-wheel stop, and the exit check waits for a new laser
 measurement sequence. Above threshold starts the bounded bottom-limit search;
 at-or-below starts another pulse. After homing, the robot drives forward until
-a new valid reading is at or below `approach_distance_threshold_mm`. A fresh
-N/A/no-target result is exposed as 65536 mm, so it cannot falsely complete the
-approach. The stopped threshold transition starts the configured step-counted
-lift. The chassis remains stopped for `lift_start_delay_ms`; the lift continues
+the active-high ESP2 GPIO48 habitat-piece limit switch is pressed. The laser
+continues reporting telemetry but does not control this approach. The switch
+transition stops all wheels and runs the configured
+`pre_lift_reverse_duration_ms` using the pickup reverse duty, and then starts
+the configured step-counted lift. The chassis remains stopped for
+`lift_start_delay_ms`; the lift continues
 during that delay and then concurrently through the timed reverse and the
-opposite-direction IMU strafe. Either rear sensor stops that strafe. The route
+opposite-direction IMU strafe at `rear_line_reacquire_duty`. Either rear sensor stops that strafe. The route
 waits stopped if the lift is unfinished, then automatically requests Habitat
 Placement. An unavailable,
 stale, or frozen stream supplies no sample. The configured
@@ -86,7 +88,7 @@ expiration of `run_timeout_ms` enters `FAULT` and stops all wheels. During the
 bounded reverse and distance strafe, LSS2 is no longer required, but IMU,
 motor/link gates, and expiring rear commands remain active as applicable. The
 VL53L0X is not a Habitat Pieces Start gate, so the approach can begin without a
-reading.
+reading. GPIO48 limit-switch configuration is required for Start readiness.
 
 The `IMU` panel shows ESP2's MPU-6050-compatible sensor state. Runtime I2C reads
 run in the core-0 sensor-acquisition task and are published to the core-1 motion
@@ -573,8 +575,8 @@ yaw rate, and rotation output.
 | `/api/rear-line-follow/config?kp=<>&ki=<>&kd=<>&base=<>&max-duty=<>&max-correction=<>&integral-limit=<>&derivative-limit=<>&derivative-alpha=<>&polarity=<>&telemetry=<>` | GET/POST | Update the independent rear PID/config; `base` is a positive reverse-speed magnitude. |
 | `/api/autonomous/habitat-pieces/start` | GET/POST | Enter `HABITAT_PIECES` and request the gated front line-follow approach. |
 | `/api/autonomous/habitat-pieces/stop` | GET/POST | Stop all Habitat Pieces wheel outputs and reset its latch/state. |
-| `/api/autonomous/habitat-pieces/config?...&slide-down-speed=<>&slide-down-timeout-ms=<>&approach-threshold-mm=<>&approach-duty=<>&approach-timeout-ms=<>&lift-steps=<>&lift-speed=<>&lift-timeout-ms=<>&lift-start-delay-ms=<>&post-pickup-reverse-duty=<>&post-pickup-reverse-duration-ms=<>&rear-line-timeout-ms=<>` | GET/POST | Validate and apply the complete pickup route, including the bottom-limit search, laser approach, stopped lift-start delay, concurrent step-counted lift/reverse, opposite-direction IMU strafe, rear-line timeout, and automatic Habitat Placement handoff. Active-run changes are rejected. |
-| `/api/autonomous/habitat-placement/config?...&initial-heading-timeout-ms=<>&pre-ccw-strafe-right-duty=<>&pre-ccw-strafe-right-ms=<>&post-cw-reverse-duty=<>&post-cw-reverse-ms=<>&post-cw-strafe-left-duty=<>&post-cw-strafe-left-ms=<>` | GET/POST | Validate the complete Habitat Placement route, including the return-to-initial-heading turn, pre-CCW right strafe, and the timed reverse/left strafe after the clockwise turn. |
+| `/api/autonomous/habitat-pieces/config?...&slide-down-speed=<>&slide-down-timeout-ms=<>&approach-duty=<>&approach-timeout-ms=<>&pre-lift-reverse-duration-ms=<>&lift-steps=<>&lift-speed=<>&lift-timeout-ms=<>&lift-start-delay-ms=<>&post-pickup-reverse-duty=<>&post-pickup-reverse-duration-ms=<>&rear-line-duty=<>&rear-line-timeout-ms=<>` | GET/POST | Validate and apply the complete pickup route, including the bottom-limit search, GPIO48 limit-switch approach, pre-lift reverse, stopped lift-start delay, concurrent step-counted lift/reverse, independently adjustable opposite-direction IMU strafe, rear-line timeout, and automatic Habitat Placement handoff. Active-run changes are rejected. |
+| `/api/autonomous/habitat-placement/config?...&initial-heading-timeout-ms=<>&pre-ccw-strafe-right-duty=<>&pre-ccw-strafe-right-ms=<>&post-cw-reverse-duty=<>&post-cw-reverse-ms=<>&post-cw-strafe-left-duty=<>&post-cw-strafe-left-ms=<>&post-cw-strafe-right-ms=<>` | GET/POST | Validate the complete Habitat Placement route, including the return-to-initial-heading turn, pre-CCW right strafe, and the timed reverse/left/right sequence after the clockwise turn. The post-CW left and right strafes share one duty. |
 | `/api/autonomous/habitat-placement/start` | GET/POST | Enter `HABITAT_PLACEMENT` and request the fully gated placement route. |
 | `/api/autonomous/habitat-placement/stop` | GET/POST | Stop the placement route, stepper, and all wheel outputs. |
 | `/api/autonomous/solar/start` | GET/POST | Start the gated solar-panel autonomous test. |
@@ -666,13 +668,14 @@ initial-right, retry-left, and retry-right strafes.
   `distance_zone_count`, `configuration_valid`, `start_ready`,
   `lss2_configured`, `lss2_data_fresh`, `lss3_configured`,
   `lss3_data_fresh`, `lss2_detection_armed`, both raw black states and latch
-  states, `should_stop`, `target_reached`, `line_following`,
+  states, GPIO48 `approach_limit_configured`, `approach_limit_raw_level`,
+  `approach_limit_active`, `should_stop`, `target_reached`, `line_following`,
   `side_line_aligning`, `left_side_driving`, `right_side_driving`, `reversing`,
   `distance_strafing`, `distance_measurement_available`,
   `distance_substituted_no_target`, `distance_sample_new`,
   `distance_zone_active`, `distance_zone_entered`, slide/approach/lift/reverse/
   rear-line configuration and elapsed values, their active flags,
-  `approach_distance_reached`, `lift_complete`, `rear_line_detected`, and
+  `approach_limit_reached`, `lift_complete`, `rear_line_detected`, and
   `timed_out`. Legacy
   side-alignment fields remain present but stay false in this route.
 - IMU turn: `imu_turn.configuration_valid`, `active`, controller `state` and
@@ -884,9 +887,10 @@ enabled output, and commanded target; manual testing uses
 `/api/habitat-pusher?state=open|close`.
 
 The clockwise turn now flows directly into `REVERSE_AFTER_CLOCKWISE`, then
-`STRAFE_LEFT_AFTER_CLOCKWISE`, before the existing post-clockwise delay. Both
-motions have independently adjustable positive duty magnitudes and durations;
-the chassis mixer applies the backward and left signs.
+`STRAFE_LEFT_AFTER_CLOCKWISE` and `STRAFE_RIGHT_AFTER_CLOCKWISE`, before the
+existing post-clockwise delay and forward drive. Reverse has its own duty and
+duration; the two strafes share the adjustable post-CW strafe duty and have
+independent durations. The chassis mixer applies the direction signs.
 
 When Habitat Placement starts, it captures one fresh continuous IMU heading
 before enabling rear-line motion. After LSS1 and the configured stopped delay,

@@ -604,11 +604,11 @@ void test_valid_rear_command_is_accepted() {
   TEST_ASSERT_EQUAL_INT16(-456,
                           receiver.backRightCommand(120U).duty_command_milli);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::LaserDistanceProfile::Default),
+      static_cast<std::uint8_t>(robot::kOperationalLaserDistanceProfile),
       static_cast<std::uint8_t>(receiver.laserProfile(120U)));
 }
 
-void test_rear_command_reverts_to_default_profile_when_stale() {
+void test_rear_command_retains_laser_profile_when_stale() {
   robot::RearDriveCommandReceiver receiver{};
   robot::RearDriveCommand command{};
   command.sender_timestamp_ms = 100U;
@@ -622,7 +622,7 @@ void test_rear_command_reverts_to_default_profile_when_stale() {
       static_cast<std::uint8_t>(robot::LaserDistanceProfile::HighAccuracy),
       static_cast<std::uint8_t>(receiver.laserProfile(150U)));
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::LaserDistanceProfile::Default),
+      static_cast<std::uint8_t>(robot::LaserDistanceProfile::HighAccuracy),
       static_cast<std::uint8_t>(receiver.laserProfile(151U)));
 }
 
@@ -3137,13 +3137,20 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.habitat_pieces_exit_strafe_pulse_remaining_ms = 75U;
   snapshot.habitat_pieces_slide_down_speed_steps_per_second = 200U;
   snapshot.habitat_pieces_slide_down_timeout_ms = 1500U;
-  snapshot.habitat_pieces_approach_distance_threshold_mm = 120U;
   snapshot.habitat_pieces_approach_forward_duty = 0.14F;
+  snapshot.habitat_pieces_approach_limit_configured = true;
+  snapshot.habitat_pieces_approach_limit_raw_level = 1;
+  snapshot.habitat_pieces_approach_limit_active = true;
+  snapshot.habitat_pieces_approach_limit_reached = true;
+  snapshot.habitat_pieces_pre_lift_reverse_duration_ms = 80U;
+  snapshot.habitat_pieces_pre_lift_reverse_elapsed_ms = 30U;
+  snapshot.habitat_pieces_pre_lift_reversing = true;
   snapshot.habitat_pieces_lift_steps = 900U;
   snapshot.habitat_pieces_lift_start_delay_ms = 250U;
   snapshot.habitat_pieces_lift_start_delay_elapsed_ms = 175U;
   snapshot.habitat_pieces_lift_start_waiting = true;
   snapshot.habitat_pieces_lift_complete = true;
+  snapshot.habitat_pieces_rear_line_reacquire_duty = 0.11F;
   snapshot.habitat_pieces_rear_line_detected = true;
   snapshot.habitat_pieces_distance_mm =
       robot::kHabitatPiecesNoTargetDistanceMm;
@@ -3194,6 +3201,8 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       0.22F;
   snapshot.habitat_placement_config
       .post_clockwise_strafe_left_duration_ms = 420U;
+  snapshot.habitat_placement_config
+      .post_clockwise_strafe_right_duration_ms = 430U;
   snapshot.tower_pieces_state = robot::TowerPiecesState::ReverseLineFollow;
   snapshot.tower_pieces_fault_reason =
       robot::TowerPiecesFaultReason::None;
@@ -3336,6 +3345,8 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       output, "\"post_clockwise_reverse_duration_ms\":410"));
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"post_clockwise_strafe_left_duration_ms\":420"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"post_clockwise_strafe_right_duration_ms\":430"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"habitat_pusher\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"pwmBackend\":\"MCPWM\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"mcpwmUnit\":0"));
@@ -3794,13 +3805,23 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"slide_down_speed_steps_per_second\":200"));
   TEST_ASSERT_NOT_NULL(std::strstr(
-      output, "\"approach_distance_threshold_mm\":120"));
+      output, "\"approach_limit_configured\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"approach_limit_raw_level\":1"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"approach_limit_active\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"approach_limit_reached\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"pre_lift_reverse_duration_ms\":80"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"lift_steps\":900"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"lift_start_delay_ms\":250"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"lift_start_waiting\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"rear_line_reacquire_duty\":0.11000"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"rear_line_detected\":true"));
 
@@ -4215,11 +4236,11 @@ void test_habitat_pieces_defaults_to_requested_duty_but_stays_locked() {
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.slide_down_timeout_ms = 1000U;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
-  config.approach_distance_threshold_mm = 120U;
-  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.approach_forward_duty = 0.15F;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.approach_timeout_ms = 1500U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.pre_lift_reverse_duration_ms = 80U;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.lift_steps = 1000U;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
@@ -4232,6 +4253,8 @@ void test_habitat_pieces_defaults_to_requested_duty_but_stays_locked() {
   config.post_pickup_reverse_duty = 0.15F;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.post_pickup_reverse_duration_ms = 300U;
+  TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
+  config.rear_line_reacquire_duty = 0.11F;
   TEST_ASSERT_FALSE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
   config.rear_line_reacquire_timeout_ms = 2000U;
   TEST_ASSERT_TRUE(robot::habitatPiecesConfigValid(config, 1.0F, 30000U));
@@ -4754,11 +4777,12 @@ void test_habitat_pieces_repeats_stopped_exit_pulses_until_above_threshold() {
 void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
   robot::HabitatPiecesConfig config{};
   config.slide_down_timeout_ms = 500U;
-  config.approach_distance_threshold_mm = 120U;
   config.approach_timeout_ms = 500U;
+  config.pre_lift_reverse_duration_ms = 50U;
   config.lift_timeout_ms = 1000U;
   config.lift_start_delay_ms = 100U;
   config.post_pickup_reverse_duration_ms = 200U;
+  config.rear_line_reacquire_duty = 0.11F;
   config.rear_line_reacquire_timeout_ms = 500U;
 
   robot::HabitatPiecesAutonomy autonomy{};
@@ -4792,35 +4816,52 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
   TEST_ASSERT_FALSE(update.distance_sample_new);
 
   sample.measurement_sequence = 21U;
-  sample.distance_mm = robot::kHabitatPiecesNoTargetDistanceMm;
-  sample.substituted_no_target = true;
+  sample.distance_mm = 1U;
+  sample.substituted_no_target = false;
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, false, false, 130U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_drive_forward_to_piece);
-  TEST_ASSERT_FALSE(update.approach_distance_reached);
+  TEST_ASSERT_FALSE(update.approach_limit_reached);
 
   sample.measurement_sequence = 22U;
-  sample.distance_mm = 120U;
-  sample.substituted_no_target = false;
+  sample.distance_mm = robot::kHabitatPiecesNoTargetDistanceMm;
+  sample.substituted_no_target = true;
+  mechanisms.approach_limit_active = true;
   update = robot::updateHabitatPiecesAutonomy(
       autonomy, config, false, false, 140U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_FALSE(update.should_start_lift);
+  TEST_ASSERT_TRUE(update.approach_limit_reached);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::PreLiftReverse),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 189U, sample, mechanisms);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_drive_back_before_lift);
+  TEST_ASSERT_FALSE(update.should_start_lift);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 190U, sample, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.should_start_lift);
-  TEST_ASSERT_TRUE(update.approach_distance_reached);
+  TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
           robot::HabitatPiecesState::LiftStartDelay),
       static_cast<std::uint8_t>(update.state));
 
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 239U, sample, mechanisms);
+      autonomy, config, false, false, 289U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.should_wait_after_lift_start);
   TEST_ASSERT_FALSE(update.should_drive_back_after_pickup);
   TEST_ASSERT_FALSE(update.lift_complete);
 
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 240U, sample, mechanisms);
+      autonomy, config, false, false, 290U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT8(
@@ -4829,12 +4870,12 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
       static_cast<std::uint8_t>(update.state));
 
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 439U, sample, mechanisms);
+      autonomy, config, false, false, 489U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_drive_back_after_pickup);
   TEST_ASSERT_FALSE(update.lift_complete);
 
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 440U, sample, mechanisms);
+      autonomy, config, false, false, 490U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT8(
@@ -4844,12 +4885,12 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
 
   mechanisms.rear_line_available = true;
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 450U, sample, mechanisms);
+      autonomy, config, false, false, 500U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_reacquire_rear_line);
 
   mechanisms.rear_left_black = true;
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 460U, sample, mechanisms);
+      autonomy, config, false, false, 510U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.should_wait_for_lift);
   TEST_ASSERT_TRUE(update.rear_line_detected);
@@ -4860,7 +4901,7 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
 
   mechanisms.lift_complete = true;
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 470U, sample, mechanisms);
+      autonomy, config, false, false, 520U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.target_reached);
   TEST_ASSERT_TRUE(update.should_start_habitat_placement);
@@ -4871,6 +4912,39 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
       static_cast<std::uint8_t>(
           robot::HabitatPiecesStopReason::RearLineReached),
       static_cast<std::uint8_t>(update.stop_reason));
+}
+
+void test_habitat_pieces_approach_limit_timeout_faults_stopped() {
+  robot::HabitatPiecesConfig config{};
+  config.approach_timeout_ms = 50U;
+
+  robot::HabitatPiecesAutonomy autonomy{};
+  autonomy.state = robot::HabitatPiecesState::ApproachPiece;
+  autonomy.state_entered_at_ms = 100U;
+  robot::HabitatPiecesMechanismInputs mechanisms{};
+
+  robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 149U, {}, mechanisms);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_drive_forward_to_piece);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 150U, {}, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_FALSE(update.should_drive_forward_to_piece);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_TRUE(autonomy.timed_out);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesStopReason::ApproachLimitTimeout),
+      static_cast<std::uint8_t>(update.stop_reason));
+  TEST_ASSERT_EQUAL_STRING(
+      "APPROACH_LIMIT_TIMEOUT",
+      robot::habitatPiecesStopReasonName(update.stop_reason));
 }
 
 void test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout() {
@@ -4926,6 +5000,7 @@ robot::HabitatPlacementConfig validHabitatPlacementConfig() {
   config.post_clockwise_reverse_duration_ms = 10U;
   config.post_clockwise_strafe_left_duty = 0.2F;
   config.post_clockwise_strafe_left_duration_ms = 10U;
+  config.post_clockwise_strafe_right_duration_ms = 10U;
   config.post_clockwise_delay_ms = 10U;
   config.exit_forward_duty = 0.2F;
   config.exit_forward_duration_ms = 10U;
@@ -4961,6 +5036,10 @@ void test_habitat_placement_config_starts_locked() {
       robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
   config = validHabitatPlacementConfig();
   config.post_clockwise_strafe_left_duration_ms = 0U;
+  TEST_ASSERT_FALSE(
+      robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
+  config = validHabitatPlacementConfig();
+  config.post_clockwise_strafe_right_duration_ms = 0U;
   TEST_ASSERT_FALSE(
       robot::habitatPlacementConfigValid(config, 0.8F, 2000U));
 }
@@ -5041,23 +5120,29 @@ void test_habitat_placement_runs_requested_sequence() {
   TEST_ASSERT_TRUE(update.should_strafe_left_after_clockwise);
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  86U);
-  TEST_ASSERT_TRUE(update.should_stop_drive);
+  TEST_ASSERT_TRUE(update.should_strafe_right_after_clockwise);
+  TEST_ASSERT_EQUAL_STRING(
+      "STRAFE_RIGHT_AFTER_CLOCKWISE",
+      robot::habitatPlacementStateName(update.state));
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  96U);
-  TEST_ASSERT_TRUE(update.should_drive_forward_exit);
-  update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
-                                                 106U);
   TEST_ASSERT_TRUE(update.should_stop_drive);
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
+                                                 106U);
+  TEST_ASSERT_TRUE(update.should_drive_forward_exit);
+  update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
                                                  116U);
+  TEST_ASSERT_TRUE(update.should_stop_drive);
+  update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
+                                                 126U);
   TEST_ASSERT_TRUE(update.should_strafe_right);
   inputs.front_line_black = true;
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
-                                                 117U);
+                                                 127U);
   TEST_ASSERT_TRUE(update.should_close_pusher);
   inputs.pusher_closed_commanded = true;
   update = robot::updateHabitatPlacementAutonomy(autonomy, inputs, config,
-                                                 118U);
+                                                 128U);
   TEST_ASSERT_TRUE(update.complete);
   TEST_ASSERT_TRUE(update.should_stop_drive);
 }
@@ -5143,7 +5228,7 @@ int main() {
   RUN_TEST(test_open_loop_forward_uses_equal_positive_mecanum_signs);
   RUN_TEST(test_open_loop_clockwise_rotation_uses_mecanum_signs);
   RUN_TEST(test_valid_rear_command_is_accepted);
-  RUN_TEST(test_rear_command_reverts_to_default_profile_when_stale);
+  RUN_TEST(test_rear_command_retains_laser_profile_when_stale);
   RUN_TEST(test_corrupt_rear_packet_is_rejected);
   RUN_TEST(test_stale_rear_command_stops_motors);
   RUN_TEST(test_explicit_stop_packet_stops_motors);
@@ -5281,6 +5366,8 @@ int main() {
       test_habitat_pieces_repeats_stopped_exit_pulses_until_above_threshold);
   RUN_TEST(
       test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off);
+  RUN_TEST(
+      test_habitat_pieces_approach_limit_timeout_faults_stopped);
   RUN_TEST(
       test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout);
   RUN_TEST(test_habitat_placement_mode_parses_and_allows_motion);

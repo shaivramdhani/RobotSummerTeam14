@@ -56,6 +56,8 @@ HabitatPlacementUpdate makeUpdate(
       autonomy.state == HabitatPlacementState::ReverseAfterClockwise;
   update.should_strafe_left_after_clockwise =
       autonomy.state == HabitatPlacementState::StrafeLeftAfterClockwise;
+  update.should_strafe_right_after_clockwise =
+      autonomy.state == HabitatPlacementState::StrafeRightAfterClockwise;
   update.should_drive_forward_exit =
       autonomy.state == HabitatPlacementState::ForwardExit;
   update.should_strafe_right =
@@ -72,6 +74,7 @@ HabitatPlacementUpdate makeUpdate(
         update.should_drive_reverse_retreat || update.should_turn_clockwise ||
         update.should_drive_reverse_after_clockwise ||
         update.should_strafe_left_after_clockwise ||
+        update.should_strafe_right_after_clockwise ||
         update.should_drive_forward_exit || update.should_strafe_right);
   update.complete = autonomy.state == HabitatPlacementState::Complete;
   update.faulted = autonomy.state == HabitatPlacementState::Fault;
@@ -112,6 +115,8 @@ const char* habitatPlacementStateName(const HabitatPlacementState state) {
       return "REVERSE_AFTER_CLOCKWISE";
     case HabitatPlacementState::StrafeLeftAfterClockwise:
       return "STRAFE_LEFT_AFTER_CLOCKWISE";
+    case HabitatPlacementState::StrafeRightAfterClockwise:
+      return "STRAFE_RIGHT_AFTER_CLOCKWISE";
     case HabitatPlacementState::PostClockwiseDelay:
       return "POST_CLOCKWISE_DELAY";
     case HabitatPlacementState::ForwardExit:
@@ -204,6 +209,7 @@ bool habitatPlacementConfigValid(
          dutyValid(config.post_clockwise_strafe_left_duty,
                    maximum_allowed_duty) &&
          config.post_clockwise_strafe_left_duration_ms > 0U &&
+         config.post_clockwise_strafe_right_duration_ms > 0U &&
          config.post_clockwise_delay_ms > 0U &&
          dutyValid(config.exit_forward_duty, maximum_allowed_duty) &&
          config.exit_forward_duration_ms > 0U &&
@@ -374,6 +380,14 @@ HabitatPlacementUpdate updateHabitatPlacementAutonomy(
     case HabitatPlacementState::StrafeLeftAfterClockwise:
       if (elapsed_ms >=
           config.post_clockwise_strafe_left_duration_ms) {
+        enterState(
+            autonomy,
+            HabitatPlacementState::StrafeRightAfterClockwise, now_ms);
+      }
+      break;
+    case HabitatPlacementState::StrafeRightAfterClockwise:
+      if (elapsed_ms >=
+          config.post_clockwise_strafe_right_duration_ms) {
         enterState(autonomy, HabitatPlacementState::PostClockwiseDelay,
                    now_ms);
       }

@@ -55,7 +55,7 @@ disabled and line following refuses to start.
   timeout is compiled in; all must be explicitly configured. During the timed reverse, continued side-
   sensor data is not required, but motor and communication safety gates remain
   active. Distance strafing uses the shared IMU heading-hold controller. During
-  that step, only new, fresh normal-profile measurement sequences affect the
+  that step, only new, fresh high-accuracy measurement sequences affect the
   counter. Only entries at or below threshold count, and an above-threshold
   sample rearms the counter. After the count, each timed exit pulse ends with
   an all-wheel stop before a new measurement is evaluated. A fresh N/A/no-target
@@ -63,10 +63,13 @@ disabled and line following refuses to start.
   unavailable or stale stream supplies no sample. Repeated sequences cannot
   increment the count or satisfy a post-pulse check, and the configured timeout
   bounds the full count/delay/pulse/check sequence. Clearing the final zone begins a bounded
-  bottom-limit search and a separately bounded valid-distance approach. The
-  step-counted lift begins while every wheel remains stopped for the configured
-  lift-start delay, then runs concurrently with the bounded reverse and
-  opposite-direction IMU rear-line strafe. Either rear sensor stops chassis
+  bottom-limit search and a separately bounded active-high GPIO48 limit-switch
+  approach. A
+  duration-bounded pre-lift reverse stops before the step-counted lift begins.
+  The lift begins while every wheel remains stopped for the configured
+  lift-start delay, then continues concurrently with the bounded reverse and
+  opposite-direction IMU rear-line strafe at its independent duty. Either rear
+  sensor stops chassis
   motion; the route waits stopped for an unfinished lift before handing off to
   Habitat Placement. Stepper-command failure, conflicting limits, stale rear
   line data, or any slide/approach/lift/reacquisition timeout stops both the

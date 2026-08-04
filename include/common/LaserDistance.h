@@ -21,6 +21,9 @@ enum class LaserDistanceProfile : std::uint8_t {
   HighAccuracy = 1,
 };
 
+constexpr LaserDistanceProfile kOperationalLaserDistanceProfile =
+    LaserDistanceProfile::HighAccuracy;
+
 struct LaserDistanceSnapshot {
   Milliseconds captured_at_ms{0U};
   std::uint16_t distance_mm{0U};

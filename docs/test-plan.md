@@ -33,7 +33,7 @@ Native tests cover pure, hardware-independent logic:
   adjustable search timeout, distinct at-or-below-threshold laser-zone
   counting, repeated/invalid measurement rejection, left/right strafe mixing,
   post-count stop delay, stopped exit-pulse checks, overall strafe timeout, and
-  bottom-limit lowering, valid-distance approach, concurrent step-counted
+  bottom-limit lowering, GPIO48 limit-switch approach, concurrent step-counted
   lift/reverse, opposite IMU strafe, rear-line stop, and placement handoff.
 - Mission transition logic after transitions are defined.
 
@@ -116,16 +116,19 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
 14. Confirm the slide moves down only at the configured limit-search speed and
     stops at the debounced bottom switch. Confirm a missing bottom input reaches
     `SLIDE_DOWN_TIMEOUT` and stops both the chassis and slide.
-15. Confirm `APPROACH_PIECE` drives forward at the configured duty. Fresh N/A
-    results must not stop it. Supply a new valid reading at or below the second
-    threshold and confirm an all-wheel stop before the lift/reverse begins.
+15. Confirm `APPROACH_PIECE` drives forward at the configured duty regardless
+    of laser readings. Press the active-high GPIO48 habitat-piece limit switch
+    and confirm an immediate all-wheel stop before the configured pre-lift
+    reverse. Confirm that reverse uses the pickup reverse duty, ends at its
+    independent duration, and stops before the lift begins. Leave the switch
+    released and confirm `APPROACH_LIMIT_TIMEOUT` faults and stops all wheels.
 16. Confirm the slide starts lifting by the configured steps while every wheel
     remains stopped for the configured lift-start delay. After that delay,
     confirm the lift continues while the chassis performs the configured timed
     reverse. Test lift completion both before and after reverse completion; a
     stopped or timed-out stepper must fault safely.
-17. Confirm rear-line reacquisition strafes through IMU heading hold opposite
-    the initial distance-strafe direction. Either rear sensor must stop all
+17. Confirm rear-line reacquisition strafes at its independent duty through IMU
+    heading hold opposite the initial distance-strafe direction. Either rear sensor must stop all
     wheels. If the lift is unfinished, confirm the chassis remains stopped
     until the lift completes. Test stale rear data and reacquisition timeout.
 18. With Habitat Placement fully configured, confirm completion automatically
@@ -242,7 +245,9 @@ For Stage 3, keep the wheels raised for initial tests:
    the bottom switch.
 6. After the CW turn, confirm the robot runs the configured backward duty for
    its full duration, then the configured left-strafe duty for its full
-   duration, before beginning the existing stopped delay.
+   duration, then strafes right at the same duty for its independently
+   configured duration before beginning the existing stopped delay and
+   forward drive.
 7. Confirm the final right strafe stops when either front sensor reads black,
    closes the Habitat Pusher, and remains stopped in Complete.
 8. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,

@@ -31,6 +31,7 @@ enum class HabitatPiecesState : std::uint8_t {
   RearLineReacquire = 13,
   WaitForLiftCompletion = 14,
   LiftStartDelay = 15,
+  PreLiftReverse = 16,
 };
 
 enum class HabitatPiecesStopReason : std::uint8_t {
@@ -49,7 +50,7 @@ enum class HabitatPiecesStopReason : std::uint8_t {
   ImuStrafeFailed = 12,
   DistanceExitReached = 13,
   SlideDownTimeout = 14,
-  ApproachDistanceTimeout = 15,
+  ApproachLimitTimeout = 15,
   LiftTimeout = 16,
   RearLineTimeout = 17,
   StepperCommandFailed = 18,
@@ -78,15 +79,16 @@ struct HabitatPiecesConfig {
   Milliseconds exit_strafe_pulse_ms{0U};
   std::uint32_t slide_down_speed_steps_per_second{0U};
   Milliseconds slide_down_timeout_ms{0U};
-  std::uint16_t approach_distance_threshold_mm{0U};
   float approach_forward_duty{0.0F};
   Milliseconds approach_timeout_ms{0U};
+  Milliseconds pre_lift_reverse_duration_ms{0U};
   std::uint32_t lift_steps{0U};
   std::uint32_t lift_speed_steps_per_second{0U};
   Milliseconds lift_timeout_ms{0U};
   Milliseconds lift_start_delay_ms{0U};
   float post_pickup_reverse_duty{0.0F};
   Milliseconds post_pickup_reverse_duration_ms{0U};
+  float rear_line_reacquire_duty{0.0F};
   Milliseconds rear_line_reacquire_timeout_ms{0U};
 };
 
@@ -99,6 +101,7 @@ struct HabitatPiecesDistanceSample {
 
 struct HabitatPiecesMechanismInputs {
   bool bottom_limit_active{false};
+  bool approach_limit_active{false};
   bool lift_complete{false};
   bool rear_line_available{false};
   bool rear_left_black{false};
@@ -119,6 +122,7 @@ struct HabitatPiecesAutonomy {
   Milliseconds exit_strafe_pulse_elapsed_ms{0U};
   Milliseconds slide_down_elapsed_ms{0U};
   Milliseconds approach_elapsed_ms{0U};
+  Milliseconds pre_lift_reverse_elapsed_ms{0U};
   Milliseconds lift_started_at_ms{0U};
   Milliseconds lift_elapsed_ms{0U};
   Milliseconds lift_start_delay_elapsed_ms{0U};
@@ -137,7 +141,7 @@ struct HabitatPiecesAutonomy {
   bool distance_substituted_no_target{false};
   bool distance_zone_active{false};
   bool distance_exit_above_threshold{false};
-  bool approach_distance_reached{false};
+  bool approach_limit_reached{false};
   bool lift_complete{false};
   bool rear_line_latched{false};
   bool timed_out{false};
@@ -159,6 +163,7 @@ struct HabitatPiecesUpdate {
   bool should_check_exit_distance{false};
   bool should_lower_slide{false};
   bool should_drive_forward_to_piece{false};
+  bool should_drive_back_before_lift{false};
   bool should_start_lift{false};
   bool should_wait_after_lift_start{false};
   bool should_drive_back_after_pickup{false};
@@ -181,7 +186,7 @@ struct HabitatPiecesUpdate {
   std::uint16_t distance_exit_pulse_count{0U};
   bool distance_substituted_no_target{false};
   bool distance_exit_above_threshold{false};
-  bool approach_distance_reached{false};
+  bool approach_limit_reached{false};
   bool lift_complete{false};
   bool rear_line_detected{false};
   bool target_reached{false};

@@ -230,16 +230,50 @@ with all four wheels commanded stopped.
 ## 2026-08-02: Habitat Pieces Pickup Tail and Placement Handoff
 
 Decision: After the final above-threshold exit check, lower the linear slide to
-its bottom switch, drive forward to a separately configured valid-distance
-threshold, stop, and begin a configured step-counted lift. Run that lift
+its bottom switch, drive forward until the dedicated active-high GPIO48
+habitat-piece limit switch is pressed, stop, and begin a configured
+step-counted lift. Run that lift
 through a configurable all-wheel-stop delay, then concurrently with a timed
 reverse and an IMU-held strafe opposite the original distance-strafe
 direction. Stop the chassis when either rear line sensor sees
 black, wait stopped if the lift is unfinished, and then automatically request
 the existing Habitat Placement route.
 
-Safety note: Slide-down, distance approach, lift, reverse, and rear-line
+Safety note: Slide-down, limit-switch approach, lift, reverse, and rear-line
 reacquisition settings default to unconfigured. Each search has an independent
-timeout. N/A laser results cannot satisfy the close approach; stepper command
-failure, conflicting limits, stale rear-line data, IMU failure, or timeout
-stops the chassis and stepper.
+timeout. Laser data does not control the forward approach; it remains confined
+to the strafe/count/exit phases. Stepper command failure, conflicting limits,
+stale rear-line data, IMU failure, or timeout stops the chassis and stepper.
+
+## 2026-08-03: Restore High-Accuracy Laser at 200 ms
+
+Decision: Supersede the 2026-08-01 normal-profile selection. Use the VL53L0X
+high-accuracy profile with a 200 ms continuous intermeasurement period for
+idle, stopped, and moving operation. Motor-command expiry still disables the
+rear wheels, but no longer changes the retained laser profile.
+
+Reason: The pickup route now prioritizes measurement quality over refresh
+speed. A single shared operational-profile constant keeps ESP1 initialization,
+ESP2 commands, and Habitat Pieces profile validation consistent.
+
+## 2026-08-03: Habitat Pieces Pre-Lift Reverse and Return Duty
+
+Decision: After the habitat-piece limit-switch approach stops, reverse for an independently
+adjustable duration using the existing pickup reverse duty, stop again, and
+then start the lift. Give the opposite-direction rear-line IMU strafe its own
+adjustable duty instead of reusing the distance-counting strafe duty.
+
+Safety note: Both new values default to unconfigured. The pre-lift motion is
+duration-bounded, the rear-line strafe retains its independent timeout, and
+each transition produces an all-wheel stopped update.
+
+## 2026-08-03: Habitat Placement Post-CW Right Strafe
+
+Decision: After the existing post-clockwise left strafe, add a timed right
+strafe before the existing stopped delay and forward-exit step. Reuse the
+post-clockwise strafe duty and give the new right strafe its own adjustable,
+saved duration.
+
+Safety note: The duration defaults to unconfigured, is limited to the shared
+maximum autonomous timing, and therefore locks Habitat Placement Start until
+set. Existing command-expiry and rear-link safety behavior remains active.

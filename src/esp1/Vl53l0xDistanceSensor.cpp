@@ -104,7 +104,7 @@ bool Vl53l0xDistanceSensor::initialize(
   default_profile_captured_ = true;
 
   if (!sensor_.configSensor(
-          adafruitProfile(LaserDistanceProfile::Default))) {
+          adafruitProfile(kOperationalLaserDistanceProfile))) {
     snapshot_.driver_status = driverStatus(sensor_.Status);
     snapshot_.initialized = false;
     initialized_ = false;
@@ -115,8 +115,8 @@ bool Vl53l0xDistanceSensor::initialize(
       sensor_.startRangeContinuous(config.intermeasurement_period_ms);
   snapshot_.driver_status = driverStatus(sensor_.Status);
   snapshot_.ranging = ranging_;
-  snapshot_.profile = LaserDistanceProfile::Default;
-  profile_ = LaserDistanceProfile::Default;
+  snapshot_.profile = kOperationalLaserDistanceProfile;
+  profile_ = kOperationalLaserDistanceProfile;
   return ranging_;
 }
 

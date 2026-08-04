@@ -29,6 +29,7 @@ Every physical peripheral must have exactly one software owner.
 | Four-wheel motion calculation | logical command only | ESP2 motion controller |
 | Stepper | `STEP`, `DIR`, `SLEEP` | ESP2 stepper controller |
 | Servos | `MSCLAW1`, `MSCLAW2`, `MSCLAW3`; `HabitatPusherServo` GPIO5/LEDC 7; `WinchServo` GPIO6/MCPWM 0/0/A | ESP2 servo bank |
+| Habitat-piece approach limit switch | GPIO48, active HIGH | ESP2 sensor acquisition |
 | Stepper limit switches | `LimitSwitchStepperBottom`, `LimitSwitchStepperMiddle`, `LimitSwitchStepperTop` | ESP2 sensor acquisition |
 | Funnel limit switches | `LimitSwitchFunnelLeft`, `LimitSwitchFunnelRight` | ESP2 sensor acquisition |
 | UART link to ESP1 | TX/RX | ESP2 communication |

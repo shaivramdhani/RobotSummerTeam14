@@ -114,6 +114,7 @@ struct Esp2Pins {
   int servo_claw_3{12};               // TODO: GPIO, pulse range
   int servo_habitat_pusher{5};  // Habitat Pusher LEDC servo output
   int servo_winch{6};            // Winch MCPWM servo output
+  int limit_switch_habitat_piece{48};  // NO switch: LOW released, HIGH pressed
   int limit_switch_stepper_bottom{9};  // NO switch: LOW released, HIGH pressed
   int limit_switch_stepper_middle{kUnassignedGpio};  // TODO: GPIO, active level
   int limit_switch_stepper_top{11};     // NO switch: LOW released, HIGH pressed
@@ -161,6 +162,9 @@ inline constexpr Esp2HardwareConfig kHardwareConfig{
 
 static_assert(kPins.servo_habitat_pusher != kPins.servo_winch,
               "Habitat Pusher and winch must use distinct GPIOs");
+static_assert(kPins.limit_switch_habitat_piece != kPins.servo_habitat_pusher &&
+                  kPins.limit_switch_habitat_piece != kPins.servo_winch,
+              "Habitat-piece limit switch must not share a servo GPIO");
 static_assert(
     kHardwareConfig.servo_habitat_pusher.backend ==
         ServoPwmBackend::Ledc &&

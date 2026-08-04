@@ -775,6 +775,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"lss2_detection_armed\":%s,\"lss2_black\":%s,"
       "\"lss3_black\":%s,\"lss2_latched\":%s,"
       "\"lss3_latched\":%s,"
+      "\"approach_limit_configured\":%s,"
+      "\"approach_limit_raw_level\":%d,"
+      "\"approach_limit_active\":%s,"
       "\"should_stop\":%s,"
       "\"target_reached\":%s,\"line_following\":%s,"
       "\"side_line_aligning\":%s,"
@@ -793,10 +796,11 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"slide_down_speed_steps_per_second\":%u,"
       "\"slide_down_timeout_ms\":%u,"
       "\"slide_down_elapsed_ms\":%u,"
-      "\"approach_distance_threshold_mm\":%u,"
       "\"approach_forward_duty\":%.5f,"
       "\"approach_timeout_ms\":%u,"
       "\"approach_elapsed_ms\":%u,"
+      "\"pre_lift_reverse_duration_ms\":%u,"
+      "\"pre_lift_reverse_elapsed_ms\":%u,"
       "\"lift_steps\":%u,"
       "\"lift_speed_steps_per_second\":%u,"
       "\"lift_timeout_ms\":%u,"
@@ -806,15 +810,17 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"post_pickup_reverse_duty\":%.5f,"
       "\"post_pickup_reverse_duration_ms\":%u,"
       "\"post_pickup_reverse_elapsed_ms\":%u,"
+      "\"rear_line_reacquire_duty\":%.5f,"
       "\"rear_line_reacquire_timeout_ms\":%u,"
       "\"rear_line_reacquire_elapsed_ms\":%u,"
       "\"lowering_slide\":%s,\"approaching_piece\":%s,"
+      "\"pre_lift_reversing\":%s,"
       "\"lifting_slide\":%s,"
       "\"lift_start_waiting\":%s,"
       "\"post_pickup_reversing\":%s,"
       "\"reacquiring_rear_line\":%s,"
       "\"waiting_for_lift\":%s,"
-      "\"approach_distance_reached\":%s,"
+      "\"approach_limit_reached\":%s,"
       "\"lift_complete\":%s,"
       "\"rear_line_detected\":%s}",
       habitatPiecesStateName(snapshot.habitat_pieces_state),
@@ -873,6 +879,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.habitat_pieces_lss3_black),
       jsonBool(snapshot.habitat_pieces_lss2_latched),
       jsonBool(snapshot.habitat_pieces_lss3_latched),
+      jsonBool(snapshot.habitat_pieces_approach_limit_configured),
+      snapshot.habitat_pieces_approach_limit_raw_level,
+      jsonBool(snapshot.habitat_pieces_approach_limit_active),
       jsonBool(snapshot.habitat_pieces_should_stop),
       jsonBool(snapshot.habitat_pieces_target_reached),
       jsonBool(snapshot.habitat_pieces_line_following),
@@ -898,11 +907,13 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
           snapshot.habitat_pieces_slide_down_speed_steps_per_second),
       static_cast<unsigned>(snapshot.habitat_pieces_slide_down_timeout_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_slide_down_elapsed_ms),
-      static_cast<unsigned>(
-          snapshot.habitat_pieces_approach_distance_threshold_mm),
       snapshot.habitat_pieces_approach_forward_duty,
       static_cast<unsigned>(snapshot.habitat_pieces_approach_timeout_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_approach_elapsed_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_pre_lift_reverse_duration_ms),
+      static_cast<unsigned>(
+          snapshot.habitat_pieces_pre_lift_reverse_elapsed_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_lift_steps),
       static_cast<unsigned>(
           snapshot.habitat_pieces_lift_speed_steps_per_second),
@@ -916,18 +927,20 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
           snapshot.habitat_pieces_post_pickup_reverse_duration_ms),
       static_cast<unsigned>(
           snapshot.habitat_pieces_post_pickup_reverse_elapsed_ms),
+      snapshot.habitat_pieces_rear_line_reacquire_duty,
       static_cast<unsigned>(
           snapshot.habitat_pieces_rear_line_reacquire_timeout_ms),
       static_cast<unsigned>(
           snapshot.habitat_pieces_rear_line_reacquire_elapsed_ms),
       jsonBool(snapshot.habitat_pieces_lowering_slide),
       jsonBool(snapshot.habitat_pieces_approaching_piece),
+      jsonBool(snapshot.habitat_pieces_pre_lift_reversing),
       jsonBool(snapshot.habitat_pieces_lifting_slide),
       jsonBool(snapshot.habitat_pieces_lift_start_waiting),
       jsonBool(snapshot.habitat_pieces_post_pickup_reversing),
       jsonBool(snapshot.habitat_pieces_reacquiring_rear_line),
       jsonBool(snapshot.habitat_pieces_waiting_for_lift),
-      jsonBool(snapshot.habitat_pieces_approach_distance_reached),
+      jsonBool(snapshot.habitat_pieces_approach_limit_reached),
       jsonBool(snapshot.habitat_pieces_lift_complete),
       jsonBool(snapshot.habitat_pieces_rear_line_detected));
 
@@ -962,6 +975,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"post_clockwise_reverse_duration_ms\":%u,"
       "\"post_clockwise_strafe_left_duty\":%.5f,"
       "\"post_clockwise_strafe_left_duration_ms\":%u,"
+      "\"post_clockwise_strafe_right_duration_ms\":%u,"
       "\"post_clockwise_delay_ms\":%u,"
       "\"exit_forward_duty\":%.5f,"
       "\"exit_forward_duration_ms\":%u,"
@@ -1011,6 +1025,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       habitat_placement.post_clockwise_strafe_left_duty,
       static_cast<unsigned>(
           habitat_placement.post_clockwise_strafe_left_duration_ms),
+      static_cast<unsigned>(
+          habitat_placement.post_clockwise_strafe_right_duration_ms),
       static_cast<unsigned>(habitat_placement.post_clockwise_delay_ms),
       habitat_placement.exit_forward_duty,
       static_cast<unsigned>(habitat_placement.exit_forward_duration_ms),

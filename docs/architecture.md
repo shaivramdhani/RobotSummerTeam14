@@ -48,8 +48,8 @@ shared acquisition path for work that must be isolated from control; add future
 bounded sensor work to that service instead of adding a task for each device.
 Sensor acquisition produces immutable snapshots that downstream logic consumes.
 
-ESP1 starts the VL53L0X in continuous timed ranging with the library's normal
-default sensor profile, a 200 ms intermeasurement period, a 10 ms nonblocking service
+ESP1 starts the VL53L0X in continuous timed ranging with the library's
+high-accuracy sensor profile, a 200 ms intermeasurement period, a 10 ms nonblocking service
 period, a 100 kHz bus, and a 5 ms I2C transaction timeout. A new result is sent
 to ESP2 in a dedicated CRC-protected UART frame; an unchanged startup or fault
 snapshot is resent every 100 ms as a heartbeat. ESP2 measures freshness from
@@ -63,7 +63,7 @@ after that delay stops all four wheels before the route transitions to the
 straight-backward open-loop mecanum command at configured
 `reverse_duty` for `reverse_duration_ms`. The next state strafes left or right
 at configured duty through the shared IMU heading-hold controller while
-consuming fresh normal-profile laser attempts with a new measurement sequence.
+consuming fresh high-accuracy laser attempts with a new measurement sequence.
 A fresh N/A/no-target result is represented as 65536 mm, one above every
 configurable threshold. A new reading at or below `distance_threshold_mm`
 increments the zone count when the preceding reading was above; consecutive
@@ -73,10 +73,11 @@ entry. Reaching `distance_zone_target_count` stops every wheel for
 `exit_strafe_pulse_ms` IMU-held strafe pulses with stopped waits for a new
 measurement sequence. A fresh above-threshold check advances to a bottom-limit
 slide search; at-or-below repeats the pulse. The pickup tail then performs a
-bounded valid-distance approach, starts a step-counted lift during a stopped
-adjustable delay, then runs it concurrently with a timed reverse and
-IMU-strafes opposite the original direction until either
-rear sensor detects tape. Once the lift is also complete, ESP2 requests the
+bounded GPIO48 limit-switch approach, a timed pre-lift reverse, and a step-counted
+lift during a stopped adjustable delay. It then runs the lift concurrently
+with a timed reverse and IMU-strafes at an independently adjustable duty
+opposite the original direction until either rear sensor detects tape. Once
+the lift is also complete, ESP2 requests the
 existing Habitat Placement route. `distance_strafe_timeout_ms` bounds all of these
 distance-strafe phases even if the stream becomes unavailable.
 `run_timeout_ms` bounds the LSS2 search and must be longer
@@ -85,7 +86,7 @@ required until it latches; LSS3 is telemetry-only. The reverse remains bounded
 by its own duration and the normal motor/link command-expiry gates.
 Mission-state integration is still separate future work.
 
-The VL53L0X operates in its normal/default profile. It is not a start gate.
+The VL53L0X operates in its high-accuracy profile. It is not a start gate.
 Fresh N/A/no-target results participate as the large-distance sentinel; an
 unavailable or frozen measurement stream does not immediately block or stop
 the pickup route, and the bounded strafe timeout remains the terminal safety

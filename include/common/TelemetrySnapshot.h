@@ -485,10 +485,11 @@ struct TelemetrySnapshot {
   std::uint32_t habitat_pieces_slide_down_speed_steps_per_second{0U};
   Milliseconds habitat_pieces_slide_down_timeout_ms{0U};
   Milliseconds habitat_pieces_slide_down_elapsed_ms{0U};
-  std::uint16_t habitat_pieces_approach_distance_threshold_mm{0U};
   float habitat_pieces_approach_forward_duty{0.0F};
   Milliseconds habitat_pieces_approach_timeout_ms{0U};
   Milliseconds habitat_pieces_approach_elapsed_ms{0U};
+  Milliseconds habitat_pieces_pre_lift_reverse_duration_ms{0U};
+  Milliseconds habitat_pieces_pre_lift_reverse_elapsed_ms{0U};
   std::uint32_t habitat_pieces_lift_steps{0U};
   std::uint32_t habitat_pieces_lift_speed_steps_per_second{0U};
   Milliseconds habitat_pieces_lift_timeout_ms{0U};
@@ -498,6 +499,7 @@ struct TelemetrySnapshot {
   float habitat_pieces_post_pickup_reverse_duty{0.0F};
   Milliseconds habitat_pieces_post_pickup_reverse_duration_ms{0U};
   Milliseconds habitat_pieces_post_pickup_reverse_elapsed_ms{0U};
+  float habitat_pieces_rear_line_reacquire_duty{0.0F};
   Milliseconds habitat_pieces_rear_line_reacquire_timeout_ms{0U};
   Milliseconds habitat_pieces_rear_line_reacquire_elapsed_ms{0U};
   std::uint32_t habitat_pieces_distance_mm{0U};
@@ -514,6 +516,9 @@ struct TelemetrySnapshot {
   bool habitat_pieces_lss3_black{false};
   bool habitat_pieces_lss2_latched{false};
   bool habitat_pieces_lss3_latched{false};
+  bool habitat_pieces_approach_limit_configured{false};
+  int habitat_pieces_approach_limit_raw_level{-1};
+  bool habitat_pieces_approach_limit_active{false};
   bool habitat_pieces_should_stop{true};
   bool habitat_pieces_target_reached{false};
   bool habitat_pieces_line_following{false};
@@ -527,12 +532,13 @@ struct TelemetrySnapshot {
   bool habitat_pieces_exit_distance_checking{false};
   bool habitat_pieces_lowering_slide{false};
   bool habitat_pieces_approaching_piece{false};
+  bool habitat_pieces_pre_lift_reversing{false};
   bool habitat_pieces_lifting_slide{false};
   bool habitat_pieces_lift_start_waiting{false};
   bool habitat_pieces_post_pickup_reversing{false};
   bool habitat_pieces_reacquiring_rear_line{false};
   bool habitat_pieces_waiting_for_lift{false};
-  bool habitat_pieces_approach_distance_reached{false};
+  bool habitat_pieces_approach_limit_reached{false};
   bool habitat_pieces_lift_complete{false};
   bool habitat_pieces_rear_line_detected{false};
   bool habitat_pieces_distance_measurement_available{false};

@@ -19,10 +19,12 @@ calibration values.
   distance threshold, target zone count, strafe duty, and strafe timeout: TODO;
   set only after raised-wheel and field-path testing. Distance strafing also
   requires calibrated shared IMU heading-hold tuning.
-- Habitat Pieces slide-down speed/timeout, final approach distance threshold,
-  approach duty/timeout, lift steps/speed/timeout/start delay, post-pickup reverse
-  duty/duration, and opposite-direction rear-line strafe timeout: TODO. Verify
-  the bottom switch, step-counted lift distance, both rear sensors, and the
+- Habitat Pieces slide-down speed/timeout, GPIO48 habitat-piece limit-switch
+  operation, approach duty/timeout, pre-lift reverse duration, lift
+  steps/speed/timeout/start delay, post-pickup reverse duty/duration, and
+  opposite-direction rear-line strafe duty/timeout: TODO. Verify
+  the bottom switch, active-high approach switch, step-counted lift distance,
+  both rear sensors, and the
   automatic Habitat Placement handoff with wheels raised first.
 
 ## IR Beacon
@@ -61,6 +63,12 @@ calibration values.
 - High-accuracy sensor profile with a 200 ms continuous intermeasurement
   period. ESP1 selects this profile before ranging starts, and idle, active,
   stopped, fault, and stale-command states retain it.
+- The Adafruit high-accuracy preset disables the range-ignore threshold. If a
+  distant or absent target repeatedly appears as a short valid range, inspect
+  protective film, dust, nearby chassis edges, cover-window air gap/tilt, and
+  emitter/receiver separation before tuning a calibrated crosstalk or
+  range-ignore threshold. Do not substitute an arbitrary short range as far;
+  that would also hide a real close obstacle.
 - Confirm the exact board's supply voltage, logic/pull-up voltage, field of
   view, cover-window behavior, target reflectance response, and mounting offset
   before using it for motion.
@@ -84,7 +92,8 @@ calibration values.
   closed angles remain the position calibration.
 - Habitat Placement rear-line duty, LSS1 timeout/delay, return-to-initial-
   heading timeout, pre-CCW right-strafe duty/duration, both configured IMU turn
-  angles/timeouts, after-CW reverse and left-strafe duties/durations, all other
+  angles/timeouts, after-CW reverse duty/duration, shared left/right strafe
+  duty and both strafe durations, all other
   translation duties/durations, slide speed/timeout, and final front-line
   strafe duty/timeout are TODO field-calibration values. The return turn uses
   the shared adjustable IMU maximum rotation duty.

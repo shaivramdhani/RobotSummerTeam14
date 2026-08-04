@@ -112,11 +112,13 @@ sequence identifies new sensor data. Consumers must calculate measurement
 freshness from receipt of a changed measurement sequence; receipt of an
 unchanged heartbeat does not refresh sensor data.
 
-The rear-wheel command's laser-profile request expires with the command. ESP1
-returns to the normal/default profile when the command becomes stale. ESP1 also
+The rear-wheel command's motor outputs expire with the command, but its last
+laser-profile request is retained because sensor quality is independent of
+chassis command freshness. The initial and operational profile is high
+accuracy. ESP1 also
 publishes immediately when the active profile changes. Habitat Pieces does not
 use laser profile acknowledgement as a Start gate. Its IMU-held pickup strafe
-consumes only new, fresh normal-profile measurement attempts to count distinct
+consumes only new, fresh high-accuracy measurement attempts to count distinct
 entries at or below the configured distance threshold. After the target count,
 the same sequence gate ensures every stopped post-pulse check uses a newly
 acquired result. A fresh N/A/no-target attempt is represented locally on ESP2

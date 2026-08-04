@@ -29,6 +29,7 @@ enum class HabitatPlacementState : std::uint8_t {
   StrafeLeftAfterClockwise = 19,
   TurnToInitialHeading = 20,
   StrafeRightBeforeCounterClockwise = 21,
+  StrafeRightAfterClockwise = 22,
 };
 
 enum class HabitatPlacementFaultReason : std::uint8_t {
@@ -74,6 +75,7 @@ struct HabitatPlacementConfig {
   Milliseconds post_clockwise_reverse_duration_ms{0U};
   float post_clockwise_strafe_left_duty{0.0F};
   Milliseconds post_clockwise_strafe_left_duration_ms{0U};
+  Milliseconds post_clockwise_strafe_right_duration_ms{0U};
   Milliseconds post_clockwise_delay_ms{0U};
   float exit_forward_duty{0.0F};
   Milliseconds exit_forward_duration_ms{0U};
@@ -123,6 +125,7 @@ struct HabitatPlacementUpdate {
   bool should_turn_clockwise{false};
   bool should_drive_reverse_after_clockwise{false};
   bool should_strafe_left_after_clockwise{false};
+  bool should_strafe_right_after_clockwise{false};
   bool should_drive_forward_exit{false};
   bool should_strafe_right{false};
   bool should_close_pusher{false};

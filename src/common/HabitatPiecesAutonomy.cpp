@@ -32,6 +32,8 @@ const char* habitatPiecesStateName(const HabitatPiecesState state) {
       return "WAIT_FOR_LIFT_COMPLETION";
     case HabitatPiecesState::LiftStartDelay:
       return "LIFT_START_DELAY";
+    case HabitatPiecesState::PreLiftReverse:
+      return "PRE_LIFT_REVERSE";
     case HabitatPiecesState::Reversing:
       return "REVERSING";
     case HabitatPiecesState::Complete:
@@ -75,8 +77,8 @@ const char* habitatPiecesStopReasonName(
       return "DISTANCE_EXIT_REACHED";
     case HabitatPiecesStopReason::SlideDownTimeout:
       return "SLIDE_DOWN_TIMEOUT";
-    case HabitatPiecesStopReason::ApproachDistanceTimeout:
-      return "APPROACH_DISTANCE_TIMEOUT";
+    case HabitatPiecesStopReason::ApproachLimitTimeout:
+      return "APPROACH_LIMIT_TIMEOUT";
     case HabitatPiecesStopReason::LiftTimeout:
       return "LIFT_TIMEOUT";
     case HabitatPiecesStopReason::RearLineTimeout:
@@ -141,12 +143,14 @@ bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
          config.slide_down_timeout_ms > 0U &&
          config.slide_down_timeout_ms <=
              maximum_distance_strafe_timeout_ms &&
-         config.approach_distance_threshold_mm > 0U &&
          std::isfinite(config.approach_forward_duty) &&
          config.approach_forward_duty > 0.0F &&
          config.approach_forward_duty <= maximum_duty &&
          config.approach_timeout_ms > 0U &&
          config.approach_timeout_ms <=
+             maximum_distance_strafe_timeout_ms &&
+         config.pre_lift_reverse_duration_ms > 0U &&
+         config.pre_lift_reverse_duration_ms <=
              maximum_distance_strafe_timeout_ms &&
          config.lift_steps > 0U &&
          config.lift_speed_steps_per_second > 0U &&
@@ -161,6 +165,9 @@ bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
          config.post_pickup_reverse_duration_ms > 0U &&
          config.post_pickup_reverse_duration_ms <=
              maximum_distance_strafe_timeout_ms &&
+         std::isfinite(config.rear_line_reacquire_duty) &&
+         config.rear_line_reacquire_duty > 0.0F &&
+         config.rear_line_reacquire_duty <= maximum_duty &&
          config.rear_line_reacquire_timeout_ms > 0U &&
          config.rear_line_reacquire_timeout_ms <=
              maximum_distance_strafe_timeout_ms;
@@ -214,8 +221,7 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       autonomy.distance_substituted_no_target;
   update.distance_exit_above_threshold =
       autonomy.distance_exit_above_threshold;
-  update.approach_distance_reached =
-      autonomy.approach_distance_reached;
+  update.approach_limit_reached = autonomy.approach_limit_reached;
   update.lift_complete = autonomy.lift_complete;
   update.rear_line_detected = autonomy.rear_line_latched;
   update.target_reached = autonomy.state == HabitatPiecesState::Complete;
@@ -445,10 +451,7 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       autonomy.state = HabitatPiecesState::ApproachPiece;
       autonomy.state_entered_at_ms = now_ms;
       autonomy.approach_elapsed_ms = 0U;
-      autonomy.approach_distance_reached = false;
-      autonomy.distance_sequence_initialized = distance_sample.available;
-      autonomy.last_distance_measurement_sequence =
-          distance_sample.measurement_sequence;
+      autonomy.approach_limit_reached = false;
       update.state = autonomy.state;
       update.transitioned = true;
       return update;
@@ -470,33 +473,38 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
 
   if (autonomy.state == HabitatPiecesState::ApproachPiece) {
     autonomy.approach_elapsed_ms = now_ms - autonomy.state_entered_at_ms;
-    autonomy.distance_measurement_available = distance_sample.available;
-    update.distance_measurement_available = distance_sample.available;
-    if (distance_sample.available) {
-      autonomy.latest_distance_mm = distance_sample.distance_mm;
-      update.distance_mm = distance_sample.distance_mm;
-      const bool new_measurement =
-          !autonomy.distance_sequence_initialized ||
-          distance_sample.measurement_sequence !=
-              autonomy.last_distance_measurement_sequence;
-      if (new_measurement) {
-        autonomy.distance_sequence_initialized = true;
-        autonomy.last_distance_measurement_sequence =
-            distance_sample.measurement_sequence;
-        autonomy.distance_substituted_no_target =
-            distance_sample.substituted_no_target;
-        update.distance_substituted_no_target =
-            distance_sample.substituted_no_target;
-        update.distance_sample_new = true;
-        autonomy.approach_distance_reached =
-            !distance_sample.substituted_no_target &&
-            distance_sample.distance_mm <=
-                config.approach_distance_threshold_mm;
-        update.approach_distance_reached =
-            autonomy.approach_distance_reached;
-      }
+    if (mechanism_inputs.approach_limit_active) {
+      autonomy.approach_limit_reached = true;
+      update.approach_limit_reached = true;
+      autonomy.state = HabitatPiecesState::PreLiftReverse;
+      autonomy.state_entered_at_ms = now_ms;
+      autonomy.pre_lift_reverse_elapsed_ms = 0U;
+      update.state = autonomy.state;
+      update.transitioned = true;
+      return update;
     }
-    if (autonomy.approach_distance_reached) {
+    if (config.approach_timeout_ms == 0U ||
+        autonomy.approach_elapsed_ms >= config.approach_timeout_ms) {
+      autonomy.state = HabitatPiecesState::Fault;
+      autonomy.stop_reason =
+          HabitatPiecesStopReason::ApproachLimitTimeout;
+      autonomy.state_entered_at_ms = now_ms;
+      autonomy.timed_out = true;
+      update.state = autonomy.state;
+      update.stop_reason = autonomy.stop_reason;
+      update.transitioned = true;
+      return update;
+    }
+    update.should_stop = false;
+    update.should_drive_forward_to_piece = true;
+    return update;
+  }
+
+  if (autonomy.state == HabitatPiecesState::PreLiftReverse) {
+    autonomy.pre_lift_reverse_elapsed_ms =
+        now_ms - autonomy.state_entered_at_ms;
+    if (autonomy.pre_lift_reverse_elapsed_ms >=
+        config.pre_lift_reverse_duration_ms) {
       autonomy.state = HabitatPiecesState::LiftStartDelay;
       autonomy.state_entered_at_ms = now_ms;
       autonomy.lift_started_at_ms = now_ms;
@@ -509,20 +517,8 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       update.transitioned = true;
       return update;
     }
-    if (config.approach_timeout_ms == 0U ||
-        autonomy.approach_elapsed_ms >= config.approach_timeout_ms) {
-      autonomy.state = HabitatPiecesState::Fault;
-      autonomy.stop_reason =
-          HabitatPiecesStopReason::ApproachDistanceTimeout;
-      autonomy.state_entered_at_ms = now_ms;
-      autonomy.timed_out = true;
-      update.state = autonomy.state;
-      update.stop_reason = autonomy.stop_reason;
-      update.transitioned = true;
-      return update;
-    }
     update.should_stop = false;
-    update.should_drive_forward_to_piece = true;
+    update.should_drive_back_before_lift = true;
     return update;
   }
 

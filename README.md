@@ -62,14 +62,17 @@ sample rearms the next count. At the target count, the robot stops for an
 adjustable delay, then repeats adjustable-duration IMU-strafe pulses with an
 all-wheel stop and fresh laser check between pulses. An above-threshold check
 clears the final piece and begins the pickup tail. The slide seeks its bottom
-limit, the robot approaches a second laser threshold, and a step-counted lift
-starts during an adjustable stopped delay before continuing concurrently with
-a timed reverse and opposite-direction IMU strafe.
+limit, the robot drives forward until the active-high ESP2 GPIO48 habitat-piece
+limit switch is pressed, briefly reverses for an adjustable duration using the
+pickup reverse duty, and starts a step-counted
+lift during an adjustable stopped delay before continuing concurrently with a
+timed reverse and opposite-direction IMU strafe at its own adjustable duty.
 Either rear line sensor stops the strafe; lift completion then automatically
-starts Habitat Placement. Fresh N/A/no-target results are treated as 65536 mm
-and therefore clear the exit check but cannot satisfy the close approach. One adjustable timeout bounds the initial
+starts Habitat Placement. Fresh N/A/no-target laser results are treated as
+65536 mm for the distance-strafe checks. One adjustable timeout bounds the initial
 strafe, stop delay, pulses, and checks. All added strafe settings default to
-unconfigured. The laser remains in its normal/default profile throughout.
+unconfigured. The laser remains in its high-accuracy profile with a 200 ms
+continuous intermeasurement period throughout.
 
 For the current two-ESP wiring, flash both ESPs and use the ESP2 dashboard to
 test individual wheels, distributed drive, front line sensors, and the

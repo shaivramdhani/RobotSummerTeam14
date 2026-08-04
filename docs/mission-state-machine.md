@@ -42,12 +42,13 @@ enters `POST_COUNT_STOP_DELAY`. It then alternates `EXIT_STRAFE_PULSE` and
 requires a new measurement sequence, above threshold advances to
 `LOWER_SLIDE`, and at-or-below repeats the pulse. The distance-strafe timeout
 bounds the complete count/delay/pulse/check sequence. The slide then seeks its
-bottom limit, `APPROACH_PIECE` drives forward until a new valid laser result is
-at or below a second threshold, and the stopped transition starts a
-step-counted lift. `LIFT_START_DELAY` holds every wheel stopped for its
+bottom limit, `APPROACH_PIECE` drives forward until the active-high ESP2 GPIO48
+habitat-piece limit switch is pressed, and the stopped transition starts a bounded
+`PRE_LIFT_REVERSE` using the pickup reverse duty. Its stopped completion starts
+the step-counted lift. `LIFT_START_DELAY` holds every wheel stopped for its
 adjustable duration while the lift continues. `REVERSE_AFTER_PICKUP` and
 `REAR_LINE_REACQUIRE` then run while that lift continues. Rear-line
-reacquisition uses IMU heading hold in the
+reacquisition uses its independently adjustable duty with IMU heading hold in the
 opposite direction from the original distance strafe and stops when either
 rear sensor sees black. If necessary, the chassis waits stopped for the lift;
 once both conditions are complete, the route automatically requests
@@ -69,9 +70,10 @@ is black, pauses, turns back to the captured initial heading, and performs a
 timed right strafe. It then turns CCW to the captured heading plus or minus the
 configured offset, drives forward, lowers the slide to its bottom limit, opens
 the Habitat Pusher, pushes forward, retreats, performs a bounded IMU CW turn,
-drives backward, strafes left, pauses, drives forward, pauses again, and
-strafes right until either front line sensor is black before closing the
-pusher. Each motion/search has an adjustable bound; configuration, stale
+drives backward, strafes left, strafes right, pauses, drives forward, pauses
+again, and performs the final right strafe until either front line sensor is
+black before closing the pusher. Each motion/search has an adjustable bound;
+configuration, stale
 communication, sensor, turn, stepper, servo, and timeout failures stop the
 chassis.
 

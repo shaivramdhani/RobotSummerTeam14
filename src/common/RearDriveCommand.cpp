@@ -149,8 +149,10 @@ MotorCommand RearDriveCommandReceiver::backRightCommand(
 
 LaserDistanceProfile RearDriveCommandReceiver::laserProfile(
     const Milliseconds now_ms) const {
-  return commandIsFresh(now_ms) ? last_command_.laser_profile
-                                : LaserDistanceProfile::Default;
+  (void)now_ms;
+  // Motor commands still expire normally, but sensor quality is independent
+  // of chassis command freshness. Retain the most recently requested profile.
+  return last_command_.laser_profile;
 }
 
 RearDriveStatus RearDriveCommandReceiver::status(
