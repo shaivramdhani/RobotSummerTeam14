@@ -23,10 +23,11 @@ The page uses polling JSON endpoints. WebSocket/SSE is not required.
 The top of the dashboard includes an `IR Beacon` panel showing ESP1 GPIO7
 frequency-selective telemetry when ESP1 status packets are fresh. ESP1 GPIO2
 selects the target beacon frequency: `HIGH` selects 1 kHz and `LOW` selects
-10 kHz. Its acquisition state reads `SOLAR ACTIVE` only while standalone Solar,
-Time Trial's Solar stage, or Final Competition's Solar stage is running. ESP1
-stops sampling and clears the detection result when Solar finishes or the
-command becomes stale.
+10 kHz. Its acquisition state reads `SOLAR ACTIVE` only while the
+IR-dependent/navigation portion of standalone Solar, Time Trial's Solar stage,
+or Final Competition's Solar stage is running. ESP1 stops sampling and clears
+the detection result once navigation finishes, before the hook/funnel-only
+tail, or whenever the command becomes stale.
 
 The `Ultrasonic 1` panel reports the HC-SR04 as unconfigured because its former
 GPIO11/GPIO12 pair now belongs to LSS2/LSS3. The acquisition code remains
@@ -59,6 +60,12 @@ default start unconfigured. The delay must be nonzero and shorter than the
 overall search timeout; the distance-strafe timeout is capped at 30000 ms and
 must be greater than the count-ignore duration, post-count stop-delay, and
 exit-pulse duration combined.
+
+Every pickup profile starts its bottom-limit slide search at the same time as
+front line following. The dashboard's Slide down row therefore remains active
+through the early chassis phases and reports when the bottom limit has been
+reached. The later `LOWER_SLIDE` state is only a stopped fallback wait if the
+route reaches the approach before the concurrent search finishes.
 
 On Start, front-sensor line following begins immediately. LSS2 and LSS3 HIGH
 readings are ignored until `side_line_ignore_after_start_ms` elapses. A fresh
@@ -283,7 +290,7 @@ heading reset is pending.
 | `REAR_LINE_SENSOR_TEST` | No | Raw ESP1 LSBL/LSBR telemetry and reverse-travel line interpretation. |
 | `REAR_LINE_FOLLOW_TEST` | Yes, gated | Reverse travel using rear sensors and independent rear PID settings. |
 | `MECHANISM_TEST` | Mechanisms only, gated | Open/close claw, winch, and ESP1 Solar Hook servos and test the ESP1 funnel motor with drive outputs stopped. |
-| `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, solar-panel contact, timed forward motion, front-line reacquisition, and forward front-line PID. |
+| `AUTONOMOUS_SOLAR_PANEL` | Yes, gated | Line follow, beacon alignment, solar-panel contact, timed forward motion, front-line reacquisition, forward front-line PID, then bounded Solar Hook/funnel opening. |
 | `HABITAT_PIECES` | Yes, gated | Front-sensor line following until either side sensor sees black, sensor-directed rotation until the opposite side sensor sees black, timed reverse, then a bounded IMU-held left/right strafe that counts distinct laser-distance zone entries and stops at the configured target count. |
 | `AUTONOMOUS_TOWER_PIECES` | Yes, gated | Reverse line following, timed chassis motion, shimmy search, then the winch/claw/stepper collection tail. |
 | `PEG_FINDER` | Yes, gated | IMU-angle clockwise turn, timed linear chassis sequence, limit-terminated funnel, then sequential claw opening with optional inter-claw shake pulses. |
@@ -325,8 +332,9 @@ tower, PegFinder, line-following, and servo configurations; it does not copy
 those values. Time Trial Start applies the visible settings from all three
 individual panels and the shared Servo Control panel before requesting the run.
 
-After solar reacquires the front line and finishes its adjustable forward PID
-segment, Time Trial stops the chassis, waits for
+After solar reacquires the front line, finishes its adjustable forward PID,
+raises the Solar Hook, and finishes the timed funnel opening, Time Trial stops
+the chassis and waits for
 `post_solar_delay_ms`, and optionally strafes right for
 `strafe_right_duration_ms` using the shared IMU Strafe tuning. A duration of
 `0` skips the transition strafe.
@@ -341,7 +349,11 @@ the combined state and values under `time_trial`.
 The `Final competition` panel keeps the reported mode at
 `FINAL_COMPETITION` while it runs Autonomous Solar, the complete three-profile
 Habitat pickup/placement cycle, Tower Pieces, and PegFinder. Solar reacquires
-the front line and follows it forward before Habitat starts. Habitat pickup
+the front line and follows it forward before Habitat starts. The staged-start
+assumption is slider up, funnel closed, and Solar Hook down/closed. Solar holds
+the hook at its adjustable closed angle when the route starts, then commands
+the adjustable open angle and runs the funnel at the configured signed duty
+and duration before the Solar-to-Habitat handoff. Habitat pickup
 profiles apply their own LSS2/LSS3 ignore windows. Placement profile 3 is
 required to use the rear return-line source, so its bounded strafe ends on the
 rear line before Tower begins backward line following. Tower then applies its
@@ -384,9 +396,13 @@ clockwise rotation angle, a post-rotation pause, timed backward duty and
 duration, initial shimmy direction, stopped delays before and after shimmy,
 separate right and left shimmy durations, the shimmy timeout, optional
 final-reverse duty and duration, five mechanism
-delays, and independent down/up stepper speeds. Start enters
+delays, an initial relative stepper lift, and independent down/up stepper
+speeds. Start enters
 `AUTONOMOUS_TOWER_PIECES` and uses the independent rear PID gains with the
-panel's initial reverse-line-duty magnitude. A crossing is one LSS LOW-to-HIGH
+panel's initial reverse-line-duty magnitude. At the same start instant, the
+stepper begins the configured upward jog using
+`stepper_up_speed_steps_per_second`; the chassis sequence proceeds while that
+finite jog runs. A crossing is one LSS LOW-to-HIGH
 transition; holding LSS HIGH cannot increment the count repeatedly. If LSS is
 already HIGH at start, firmware waits for LOW before accepting a later HIGH as
 a crossing. The same re-arm rule applies when HIGH remains asserted through
@@ -409,7 +425,8 @@ this tail:
    `final_reverse_duration_ms`. A duration of `0 ms` skips this optional stage.
 2. Wait for `post_final_reverse_delay_ms`, then command the winch open.
 3. Wait for `post_winch_open_delay_ms`, then command all three claws open.
-4. Wait for `post_claws_open_delay_ms`, then move the stepper down at
+4. Wait for `post_claws_open_delay_ms` and
+   `initial_stepper_lift_steps` to finish, then move the stepper down at
    `stepper_down_speed_steps_per_second` until the bottom limit activates.
 5. Wait for `post_stepper_bottom_delay_ms`, then command all three claws closed.
 6. Wait for `post_claws_closed_delay_ms`, then move the stepper up at
@@ -417,7 +434,9 @@ this tail:
 7. Command the winch closed and complete.
 
 The final-reverse duty and duration default to `0`. All Tower Pieces pause and
-mechanism delay stages default to `1000 ms`; the new pre/post-shimmy delays
+mechanism delay stages default to `1000 ms`; the initial lift defaults to `0`
+and locks Start until calibrated within the configured stepper travel; the
+pre/post-shimmy delays
 default to `0 ms` to preserve saved behavior. Both stepper limit-search speeds
 default to `2000` driver microsteps per second. Other motion duties, durations, and
 timeouts remain `0` (unconfigured), so Start is rejected until the required
@@ -629,9 +648,9 @@ yaw rate, and rotation output.
 | `/api/autonomous/habitat-placement/start` | GET/POST | Run the selected placement profile once as a standalone test. The full alternating sequence starts from Habitat Pieces. |
 | `/api/autonomous/habitat-placement/stop` | GET/POST | Stop the placement route, stepper, and all wheel outputs. |
 | `/api/autonomous/solar/start` | GET/POST | Start the gated solar-panel autonomous test. |
-| `/api/autonomous/solar/config?...&retry-left-strafe-duty=<>&retry-right-strafe-duty=<>&retry-forward-duty=<>&post-contact-forward-ms=<>&post-contact-forward-duty=<>&post-contact-forward-delay-ms=<>&post-forward-strafe-delay-ms=<>&front-line-follow-duty=<>&front-line-follow-duration-ms=<>` | GET/POST | Update solar autonomy settings, including adjustable strafe times/timeouts, retry motion, post-contact motion, and the forward front-line exit. Retry-left and retry-right are open-loop mecanum strafes at their own duties; only the initial approach and final line reacquisition use shared IMU Strafe tuning. |
-| `/api/autonomous/tower-pieces/start` | GET/POST | Enter the tower-pieces mode and request gated reverse line following. |
-| `/api/autonomous/tower-pieces/config?duty=<>&side-line-ignore-ms=<>&timeout-ms=<>&post-line-delay-ms=<>&strafe-duration-ms=<>&post-strafe-pause-ms=<>&rotation-angle-deg=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&shimmy-initial-direction=<LEFT\|RIGHT>&pre-shimmy-delay-ms=<>&shimmy-right-ms=<>&shimmy-left-ms=<>&shimmy-timeout-ms=<>&post-shimmy-delay-ms=<>&final-reverse-duty=<>&final-reverse-duration-ms=<>&post-final-reverse-delay-ms=<>&post-winch-open-delay-ms=<>&post-claws-open-delay-ms=<>&stepper-down-speed-steps-per-second=<>&post-stepper-bottom-delay-ms=<>&post-claws-closed-delay-ms=<>&stepper-up-speed-steps-per-second=<>` | GET/POST | Update Tower Pieces start-ignore window, timings, initial shimmy direction, bounded stopped pre/post-shimmy delays, clockwise angle, non-IMU motion, optional final reverse, mechanism delays, and stepper speeds. The first shimmy pulse is half its direction's configured duration. Initial/shimmy strafes use shared IMU Strafe tuning; the clockwise turn uses shared IMU Turn tuning. |
+| `/api/autonomous/solar/config?...&retry-left-strafe-duty=<>&retry-right-strafe-duty=<>&retry-forward-duty=<>&post-contact-forward-ms=<>&post-contact-forward-duty=<>&post-contact-forward-delay-ms=<>&post-forward-strafe-delay-ms=<>&front-line-follow-duty=<>&front-line-follow-duration-ms=<>&funnel-open-duty=<>&funnel-open-duration-ms=<>` | GET/POST | Update solar autonomy settings, including adjustable strafe times/timeouts, retry motion, post-contact motion, the forward front-line exit, and the final signed funnel-open duty/duration. Retry-left and retry-right are open-loop mecanum strafes at their own duties; only the initial approach and final line reacquisition use shared IMU Strafe tuning. |
+| `/api/autonomous/tower-pieces/start` | GET/POST | Enter the tower-pieces mode and request gated reverse line following plus the concurrent initial stepper lift. |
+| `/api/autonomous/tower-pieces/config?duty=<>&side-line-ignore-ms=<>&timeout-ms=<>&post-line-delay-ms=<>&strafe-duration-ms=<>&post-strafe-pause-ms=<>&rotation-angle-deg=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&shimmy-initial-direction=<LEFT\|RIGHT>&pre-shimmy-delay-ms=<>&shimmy-right-ms=<>&shimmy-left-ms=<>&shimmy-timeout-ms=<>&post-shimmy-delay-ms=<>&final-reverse-duty=<>&final-reverse-duration-ms=<>&post-final-reverse-delay-ms=<>&post-winch-open-delay-ms=<>&post-claws-open-delay-ms=<>&initial-lift-steps=<>&stepper-down-speed-steps-per-second=<>&post-stepper-bottom-delay-ms=<>&post-claws-closed-delay-ms=<>&stepper-up-speed-steps-per-second=<>` | GET/POST | Update Tower Pieces start-ignore window, timings, initial concurrent lift distance, initial shimmy direction, bounded stopped pre/post-shimmy delays, clockwise angle, non-IMU motion, optional final reverse, mechanism delays, and stepper speeds. The first shimmy pulse is half its direction's configured duration. Initial/shimmy strafes use shared IMU Strafe tuning; the clockwise turn uses shared IMU Turn tuning. |
 | `/api/autonomous/peg-finder/start` | GET/POST | Enter `PEG_FINDER` and request the gated IMU-turn/chassis sequence. |
 | `/api/autonomous/peg-finder/config?clockwise-angle-deg=<>&post-rotation-pause-ms=<>&reverse-duty=<>&reverse-duration-ms=<>&post-reverse-pause-ms=<>&forward-duty=<>&forward-duration-ms=<>&funnel-duty=<>&funnel-timeout-ms=<>&post-funnel-limit-delay-ms=<>&claw-open-interval-ms=<>&shake-duty=<>&shake-left-ms=<>&shake-right-ms=<>&post-shake-delay-ms=<>&claw-order-1=<1..3>&claw-order-2=<1..3>&claw-order-3=<1..3>&post-claws-open-delay-ms=<>&funnel-reverse-duty=<>&funnel-reverse-duration-ms=<>` | GET/POST | Update the PegFinder IMU-controlled clockwise angle, chassis motion, limit-terminated forward funnel phase, optional inter-claw shake and stopped post-shake delay, claw order/timings, and timed reverse funnel phase. The three claw-order values must be a permutation of 1, 2, and 3. All turn tuning/output limits come from the shared IMU Turn panel. |
 | `/api/autonomous/time-trial/start` | GET/POST | Enter `TIME_TRIAL`, validate all three included modes, and start Autonomous Solar. |
@@ -658,7 +677,7 @@ yaw rate, and rotation output.
 | `/api/solar-hook/save` | GET/POST | Save the Solar Hook Open and Closed angles to ESP2 NVS. |
 | `/api/funnel?speed=<>` | GET/POST | Switch to `MECHANISM_TEST` and send a timed ESP1 funnel motor command. Use `speed=0` to release. |
 | `/api/config` | GET | Current tunable settings. |
-| `/api/config/save` | GET/POST | Save line-following, solar-autonomy, tower-pieces, PegFinder, and Time Trial transition tunables to NVS. |
+| `/api/config/save` | GET/POST | Save line-following, solar-autonomy (including final funnel duty/duration), tower-pieces, PegFinder, and Time Trial transition tunables to NVS. |
 | `/api/events` | GET | Fixed-size recent event log. |
 
 All command endpoints return JSON with `ok` and either `message` or `error`.
@@ -668,7 +687,9 @@ All command endpoints return JSON with `ok` and either `message` or `error`.
 Solar strafes at its independently adjustable front-line reacquisition duty
 until either front sensor detects tape. It then stops strafing and runs the
 front-line PID forward at an independently adjustable duty and duration. These
-values are exposed in `solar_strafe_speeds`.
+values are exposed in `solar_strafe_speeds`. The chassis then remains stopped
+while Solar commands the hook open and runs the funnel at the signed duty for
+the configured duration before the combined-mode handoff.
 
 Tower Pieces uses a timed, alternating shimmy and stops when either rear sensor
 detects tape. Its initial direction and stopped delays before/after the search
@@ -710,6 +731,11 @@ reacquisition retain IMU heading hold.
   `telemetryEnabled`, `p_term`, `i_term`, `d_term`, `correction`.
 - Rear PID: the same fields under `rear_pid`, stored independently, plus
   `effectiveBaseDuty`, which is negative while commanding reverse travel.
+- Autonomous Solar: `autonomous.state`, `time_in_state_ms`, `fault_reason`,
+  IR thresholds/filter/confirmation fields, contact and line-exit tuning,
+  `funnel_open_duty`, `funnel_open_duration_ms`,
+  `funnel_open_elapsed_ms`, `opening_hook_and_funnel`, and both Solar limit
+  states. `solar_hook.commandedOpen` reports the last requested hook position.
 - Habitat Pieces: `habitat_pieces.state`, `stop_reason`,
   `time_in_state_ms`, `line_follow_duty`, `side_line_ignore_after_start_ms`,
   `lss2_detection_remaining_ms`, `run_timeout_ms`, `run_elapsed_ms`,
@@ -719,7 +745,7 @@ reacquisition retain IMU heading hold.
   `distance_strafe_duty`, `distance_count_ignore_ms`,
   `distance_count_ignore_remaining_ms`, `distance_strafe_timeout_ms`,
   `distance_strafe_elapsed_ms`, `distance_strafe_remaining_ms`, `distance_mm`,
-  `distance_zone_count`, `exit_strafe_duty`, `configuration_valid`,
+  `distance_zone_count`, `exit_strafe_duty`, `slide_down_complete`, `configuration_valid`,
   `all_profiles_valid`, `start_ready`, `editor_profile`, `active_profile`,
   `completed_profile_count`, `sequence_active`, `sequence_phase`,
   `lss2_configured`, `lss2_data_fresh`, `lss3_configured`,
@@ -753,13 +779,14 @@ reacquisition retain IMU heading hold.
   `post_shimmy_delay_ms`,
   `final_reverse_duty`, `final_reverse_duration_ms`,
   `post_final_reverse_delay_ms`, `post_winch_open_delay_ms`,
-  `post_claws_open_delay_ms`, `stepper_down_speed_steps_per_second`,
+  `post_claws_open_delay_ms`, `initial_stepper_lift_steps`,
+  `stepper_down_speed_steps_per_second`,
   `post_stepper_bottom_delay_ms`, `post_claws_closed_delay_ms`,
   `stepper_up_speed_steps_per_second`,
   `side_line_count`, `target_side_line_count`,
   side-sensor configuration/level, `back_line_detected`,
-  `tower_line_control.side_line_ignore_active`, and active chassis,
-  final-reverse, and stepper flags.
+  `tower_line_control.side_line_ignore_active`, initial-lift active/complete/wait
+  flags, and active chassis, final-reverse, and stepper flags.
 - PegFinder: `peg_finder.state`, `fault_reason`, `time_in_state_ms`,
   `clockwise_duty` (shared IMU value), `clockwise_angle_deg`, `post_rotation_pause_ms`,
   `reverse_duty`, `reverse_duration_ms`, `post_reverse_pause_ms`,

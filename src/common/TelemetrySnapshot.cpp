@@ -652,6 +652,10 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"line_reacquire_strafe_duty\":%.5f,"
                 "\"front_line_follow_duration_ms\":%u,"
                 "\"front_line_follow_duty\":%.5f,"
+                "\"funnel_open_duty\":%.5f,"
+                "\"funnel_open_duration_ms\":%u,"
+                "\"funnel_open_elapsed_ms\":%u,"
+                "\"opening_hook_and_funnel\":%s,"
                 "\"post_contact_forward_start_delay_ms\":%u,"
                 "\"line_reacquire_strafe_start_delay_ms\":%u,"
                 "\"post_contact_forward_duty\":%.5f,"
@@ -713,6 +717,12 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 static_cast<unsigned>(
                     snapshot.solar_front_line_follow_duration_ms),
                 snapshot.solar_front_line_follow_duty,
+                snapshot.solar_funnel_open_duty,
+                static_cast<unsigned>(
+                    snapshot.solar_funnel_open_duration_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_funnel_open_elapsed_ms),
+                jsonBool(snapshot.solar_opening_hook_and_funnel),
                 static_cast<unsigned>(
                     snapshot.solar_post_contact_forward_start_delay_ms),
                 static_cast<unsigned>(
@@ -812,6 +822,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"slide_down_speed_steps_per_second\":%u,"
       "\"slide_down_timeout_ms\":%u,"
       "\"slide_down_elapsed_ms\":%u,"
+      "\"slide_down_complete\":%s,"
       "\"approach_forward_duty\":%.5f,"
       "\"approach_timeout_ms\":%u,"
       "\"approach_elapsed_ms\":%u,"
@@ -939,6 +950,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
           snapshot.habitat_pieces_slide_down_speed_steps_per_second),
       static_cast<unsigned>(snapshot.habitat_pieces_slide_down_timeout_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_slide_down_elapsed_ms),
+      jsonBool(snapshot.habitat_pieces_slide_down_complete),
       snapshot.habitat_pieces_approach_forward_duty,
       static_cast<unsigned>(snapshot.habitat_pieces_approach_timeout_ms),
       static_cast<unsigned>(snapshot.habitat_pieces_approach_elapsed_ms),
@@ -1107,6 +1119,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"post_final_reverse_delay_ms\":%u,"
       "\"post_winch_open_delay_ms\":%u,"
       "\"post_claws_open_delay_ms\":%u,"
+      "\"initial_stepper_lift_steps\":%u,"
       "\"stepper_down_speed_steps_per_second\":%u,"
       "\"post_stepper_bottom_delay_ms\":%u,"
       "\"post_claws_closed_delay_ms\":%u,"
@@ -1118,6 +1131,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       "\"driving_backward\":%s,\"shimmying_left\":%s,"
       "\"shimmying_right\":%s,\"back_line_detected\":%s,"
       "\"final_reverse_active\":%s,"
+      "\"initial_stepper_lift_active\":%s,"
+      "\"initial_stepper_lift_complete\":%s,"
+      "\"waiting_for_initial_stepper_lift\":%s,"
       "\"stepper_moving_down\":%s,\"stepper_moving_up\":%s}",
       towerPiecesStateName(snapshot.tower_pieces_state),
       towerPiecesFaultReasonName(snapshot.tower_pieces_fault_reason),
@@ -1152,6 +1168,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       static_cast<unsigned>(snapshot.tower_pieces_post_winch_open_delay_ms),
       static_cast<unsigned>(snapshot.tower_pieces_post_claws_open_delay_ms),
       static_cast<unsigned>(
+          snapshot.tower_pieces_initial_stepper_lift_steps),
+      static_cast<unsigned>(
           snapshot.tower_pieces_stepper_down_speed_steps_per_second),
       static_cast<unsigned>(
           snapshot.tower_pieces_post_stepper_bottom_delay_ms),
@@ -1170,6 +1188,9 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
       jsonBool(snapshot.tower_pieces_shimmying_right),
       jsonBool(snapshot.tower_pieces_back_line_detected),
       jsonBool(snapshot.tower_pieces_final_reverse_active),
+      jsonBool(snapshot.tower_pieces_initial_stepper_lift_active),
+      jsonBool(snapshot.tower_pieces_initial_stepper_lift_complete),
+      jsonBool(snapshot.tower_pieces_waiting_for_initial_stepper_lift),
       jsonBool(snapshot.tower_pieces_stepper_moving_down),
       jsonBool(snapshot.tower_pieces_stepper_moving_up));
 

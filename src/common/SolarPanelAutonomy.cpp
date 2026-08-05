@@ -58,6 +58,10 @@ const char* solarPanelAutonomyStateName(
       return "WAIT_BEFORE_STRAFE_LEFT_TO_FRONT_LINE";
     case SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection:
       return "FORWARD_LINE_FOLLOW_AFTER_FRONT_DETECTION";
+    case SolarPanelAutonomyState::OpenSolarHookAndFunnel:
+      return "OPEN_SOLAR_HOOK_AND_FUNNEL";
+    case SolarPanelAutonomyState::Complete:
+      return "COMPLETE";
   }
   return "WAIT_FOR_START";
 }
@@ -81,6 +85,10 @@ const char* solarPanelFaultReasonName(
       return "IMU_UNAVAILABLE";
     case SolarPanelFaultReason::ImuStrafeFailed:
       return "IMU_STRAFE_FAILED";
+    case SolarPanelFaultReason::SolarHookCommandFailed:
+      return "SOLAR_HOOK_COMMAND_FAILED";
+    case SolarPanelFaultReason::FunnelCommandFailed:
+      return "FUNNEL_COMMAND_FAILED";
   }
   return "NONE";
 }
@@ -92,7 +100,7 @@ bool solarPanelAutonomyConfigValid(
          config.filter_alpha < 1.0F && config.search_timeout_ms > 0U;
 }
 
-bool solarPanelContactConfigValid(
+bool solarPanelContactRouteConfigValid(
     const SolarPanelContactConfig& config) {
   return config.timeout_ms > 0U &&
          config.retry_strafe_timeout_ms > 0U &&
@@ -118,6 +126,15 @@ bool solarPanelContactConfigValid(
          std::isfinite(config.front_line_follow_duty) &&
          config.front_line_follow_duty > 0.0F &&
          config.front_line_follow_duty <= 1.0F;
+}
+
+bool solarPanelContactConfigValid(
+    const SolarPanelContactConfig& config) {
+  return solarPanelContactRouteConfigValid(config) &&
+         std::isfinite(config.funnel_open_duty) &&
+         std::fabs(config.funnel_open_duty) > 0.0F &&
+         std::fabs(config.funnel_open_duty) <= 1.0F &&
+         config.funnel_open_duration_ms > 0U;
 }
 
 SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
@@ -223,11 +240,20 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
                        SolarPanelAutonomyState::FrontLineFollowComplete, true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
+    case SolarPanelAutonomyState::FrontLineFollowComplete:
+      return {SolarPanelAutonomyState::OpenSolarHookAndFunnel, true};
+
+    case SolarPanelAutonomyState::OpenSolarHookAndFunnel:
+      return time_in_state_ms >= config.funnel_open_duration_ms
+                 ? SolarPanelContactSequenceUpdate{
+                       SolarPanelAutonomyState::Complete, true}
+                 : SolarPanelContactSequenceUpdate{current_state, false};
+
     case SolarPanelAutonomyState::WaitForStart:
     case SolarPanelAutonomyState::LineFollowToSolar:
     case SolarPanelAutonomyState::SolarBeaconAligned:
     case SolarPanelAutonomyState::SolarSearchFault:
-    case SolarPanelAutonomyState::FrontLineFollowComplete:
+    case SolarPanelAutonomyState::Complete:
       return {current_state, false};
   }
 

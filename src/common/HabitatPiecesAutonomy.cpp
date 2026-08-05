@@ -195,6 +195,8 @@ void startHabitatPiecesAutonomy(HabitatPiecesAutonomy& autonomy,
   autonomy.state = HabitatPiecesState::LineFollowing;
   autonomy.stop_reason = HabitatPiecesStopReason::None;
   autonomy.run_started_at_ms = now_ms;
+  autonomy.slide_down_started = true;
+  autonomy.slide_down_started_at_ms = now_ms;
 }
 
 void failHabitatPiecesAutonomy(HabitatPiecesAutonomy& autonomy,
@@ -230,10 +232,45 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       autonomy.distance_substituted_no_target;
   update.distance_exit_above_threshold =
       autonomy.distance_exit_above_threshold;
+  update.slide_down_complete = autonomy.slide_down_complete;
   update.approach_limit_reached = autonomy.approach_limit_reached;
   update.lift_complete = autonomy.lift_complete;
   update.rear_line_detected = autonomy.rear_line_latched;
   update.target_reached = autonomy.state == HabitatPiecesState::Complete;
+
+  const bool slide_down_phase =
+      autonomy.state == HabitatPiecesState::LineFollowing ||
+      autonomy.state == HabitatPiecesState::SideLineAligning ||
+      autonomy.state == HabitatPiecesState::Reversing ||
+      autonomy.state == HabitatPiecesState::DistanceStrafing ||
+      autonomy.state == HabitatPiecesState::PostCountStopDelay ||
+      autonomy.state == HabitatPiecesState::ExitStrafePulse ||
+      autonomy.state == HabitatPiecesState::ExitDistanceCheck ||
+      autonomy.state == HabitatPiecesState::LowerSlide;
+  if (autonomy.slide_down_started && !autonomy.slide_down_complete &&
+      slide_down_phase) {
+    autonomy.slide_down_elapsed_ms =
+        now_ms - autonomy.slide_down_started_at_ms;
+    if (mechanism_inputs.bottom_limit_active) {
+      autonomy.slide_down_complete = true;
+      update.slide_down_complete = true;
+    } else if (config.slide_down_timeout_ms == 0U ||
+               autonomy.slide_down_elapsed_ms >=
+                   config.slide_down_timeout_ms) {
+      autonomy.state = HabitatPiecesState::Fault;
+      autonomy.stop_reason = HabitatPiecesStopReason::SlideDownTimeout;
+      autonomy.state_entered_at_ms = now_ms;
+      autonomy.timed_out = true;
+      update.state = autonomy.state;
+      update.stop_reason = autonomy.stop_reason;
+      update.transitioned = true;
+      return update;
+    } else {
+      // Slide descent is intentionally concurrent with the pickup chassis
+      // route. Chassis flags below remain independently active.
+      update.should_lower_slide = true;
+    }
+  }
 
   if (autonomy.state == HabitatPiecesState::Reversing) {
     autonomy.reverse_elapsed_ms = now_ms - autonomy.state_entered_at_ms;
@@ -428,11 +465,14 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
         update.distance_exit_above_threshold =
             autonomy.distance_exit_above_threshold;
         if (autonomy.distance_exit_above_threshold) {
-          autonomy.state = HabitatPiecesState::LowerSlide;
+          autonomy.state = autonomy.slide_down_complete
+                               ? HabitatPiecesState::ApproachPiece
+                               : HabitatPiecesState::LowerSlide;
           autonomy.stop_reason =
               HabitatPiecesStopReason::DistanceExitReached;
           autonomy.state_entered_at_ms = now_ms;
-          autonomy.slide_down_elapsed_ms = 0U;
+          autonomy.approach_elapsed_ms = 0U;
+          autonomy.approach_limit_reached = false;
           update.state = autonomy.state;
           update.stop_reason = autonomy.stop_reason;
           update.transitioned = true;
@@ -459,8 +499,7 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
   }
 
   if (autonomy.state == HabitatPiecesState::LowerSlide) {
-    autonomy.slide_down_elapsed_ms = now_ms - autonomy.state_entered_at_ms;
-    if (mechanism_inputs.bottom_limit_active) {
+    if (autonomy.slide_down_complete) {
       autonomy.state = HabitatPiecesState::ApproachPiece;
       autonomy.state_entered_at_ms = now_ms;
       autonomy.approach_elapsed_ms = 0U;
@@ -469,18 +508,6 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       update.transitioned = true;
       return update;
     }
-    if (config.slide_down_timeout_ms == 0U ||
-        autonomy.slide_down_elapsed_ms >= config.slide_down_timeout_ms) {
-      autonomy.state = HabitatPiecesState::Fault;
-      autonomy.stop_reason = HabitatPiecesStopReason::SlideDownTimeout;
-      autonomy.state_entered_at_ms = now_ms;
-      autonomy.timed_out = true;
-      update.state = autonomy.state;
-      update.stop_reason = autonomy.stop_reason;
-      update.transitioned = true;
-      return update;
-    }
-    update.should_lower_slide = true;
     return update;
   }
 

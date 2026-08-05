@@ -123,6 +123,7 @@ struct HabitatPiecesAutonomy {
   Milliseconds distance_strafe_elapsed_ms{0U};
   Milliseconds post_count_stop_elapsed_ms{0U};
   Milliseconds exit_strafe_pulse_elapsed_ms{0U};
+  Milliseconds slide_down_started_at_ms{0U};
   Milliseconds slide_down_elapsed_ms{0U};
   Milliseconds approach_elapsed_ms{0U};
   Milliseconds pre_lift_reverse_elapsed_ms{0U};
@@ -146,6 +147,8 @@ struct HabitatPiecesAutonomy {
   bool distance_substituted_no_target{false};
   bool distance_zone_active{false};
   bool distance_exit_above_threshold{false};
+  bool slide_down_started{false};
+  bool slide_down_complete{false};
   bool approach_limit_reached{false};
   bool lift_complete{false};
   bool rear_line_latched{false};
@@ -167,6 +170,7 @@ struct HabitatPiecesUpdate {
   bool should_exit_strafe_pulse{false};
   bool should_check_exit_distance{false};
   bool should_lower_slide{false};
+  bool slide_down_complete{false};
   bool should_drive_forward_to_piece{false};
   bool should_drive_back_before_lift{false};
   bool should_start_lift{false};

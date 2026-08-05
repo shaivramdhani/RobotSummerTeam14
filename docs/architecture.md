@@ -82,9 +82,11 @@ in-zone samples count once, and an above-threshold sample rearms the next
 entry. Reaching `distance_zone_target_count` stops every wheel for
 `post_count_stop_delay_ms`. The controller then alternates
 `exit_strafe_pulse_ms` IMU-held strafe pulses at the independent
-`exit_strafe_duty`, with stopped waits for a new measurement sequence. A fresh
-above-threshold check advances to a bottom-limit slide search; at-or-below
-repeats the pulse. The pickup tail then performs a
+`exit_strafe_duty`, with stopped waits for a new measurement sequence. The
+bottom-limit slide search starts with each pickup profile and runs concurrently
+with the line, reverse, and distance route. A fresh above-threshold check
+advances directly to the pickup tail when the slide is already down, or to a
+stopped wait for that same bounded search; at-or-below repeats the pulse. The pickup tail then performs a
 bounded GPIO48 limit-switch approach, a timed pre-lift reverse, and a step-counted
 lift during a stopped adjustable delay. It then runs the lift concurrently
 with a timed reverse and IMU-strafes at an independently adjustable duty
@@ -105,6 +107,13 @@ slide lower-limit search begins with, and runs concurrently through, each
 forward-to-slide drive; its timeout is measured from that earlier start. The
 third placement ends stopped on the rear line. `FINAL_COMPETITION` then starts
 Tower Pieces in reverse line-following without changing the parent mode.
+
+Competition setup assumes the slider is physically up, the funnel is
+physically closed, and the Solar Hook is down/closed. Actuator outputs still
+initialize disabled. When Solar starts, ESP2 commands the adjustable hook
+closed angle. After Solar's forward line-follow exit, it commands the
+adjustable open angle and refreshes a signed, timeout-protected funnel command
+for the configured duration before declaring Solar complete and handing off.
 
 The VL53L0X operates in its high-accuracy profile. It is not a start gate.
 Fresh N/A/no-target results participate as the large-distance sentinel; an
@@ -147,6 +156,10 @@ strafe and shimmy, and the optional Time Trial transition use the same live
 Stage 3 configuration while retaining their mode-specific durations/timeouts.
 A Tower shimmy has stopped pre/post delays, starts in its configured direction,
 and shortens only its first directional pulse to half the normal duration.
+Tower also owns one finite, relative upward stepper jog launched with the first
+rear-line-follow update. The stepper ISR advances that jog concurrently with
+the mission state machine, while target tracking prevents the later
+bottom-limit search from replacing an unfinished jog.
 A dedicated browser heartbeat expires manual held tests after the existing
 command timeout. Autonomous uses state-machine durations and the normal
 communication expiry path.

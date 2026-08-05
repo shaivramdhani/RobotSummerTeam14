@@ -452,6 +452,10 @@ struct TelemetrySnapshot {
   float solar_post_contact_forward_duty{0.0F};
   Milliseconds solar_front_line_follow_duration_ms{0U};
   float solar_front_line_follow_duty{0.0F};
+  float solar_funnel_open_duty{0.0F};
+  Milliseconds solar_funnel_open_duration_ms{0U};
+  Milliseconds solar_funnel_open_elapsed_ms{0U};
+  bool solar_opening_hook_and_funnel{false};
   bool solar_panel_limit_switches_configured{false};
   bool solar_limit_back_right_high{false};
   bool solar_limit_front_right_high{false};
@@ -496,6 +500,7 @@ struct TelemetrySnapshot {
   std::uint32_t habitat_pieces_slide_down_speed_steps_per_second{0U};
   Milliseconds habitat_pieces_slide_down_timeout_ms{0U};
   Milliseconds habitat_pieces_slide_down_elapsed_ms{0U};
+  bool habitat_pieces_slide_down_complete{false};
   float habitat_pieces_approach_forward_duty{0.0F};
   Milliseconds habitat_pieces_approach_timeout_ms{0U};
   Milliseconds habitat_pieces_approach_elapsed_ms{0U};
@@ -617,6 +622,7 @@ struct TelemetrySnapshot {
   Milliseconds tower_pieces_post_final_reverse_delay_ms{0};
   Milliseconds tower_pieces_post_winch_open_delay_ms{0};
   Milliseconds tower_pieces_post_claws_open_delay_ms{0};
+  std::uint32_t tower_pieces_initial_stepper_lift_steps{0};
   Milliseconds tower_pieces_pre_stepper_bottom_delay_ms{0};
   std::uint32_t tower_pieces_stepper_down_speed_steps_per_second{0};
   Milliseconds tower_pieces_post_stepper_bottom_delay_ms{0};
@@ -640,6 +646,9 @@ struct TelemetrySnapshot {
   bool tower_pieces_shimmying_right{false};
   bool tower_pieces_back_line_detected{false};
   bool tower_pieces_final_reverse_active{false};
+  bool tower_pieces_initial_stepper_lift_active{false};
+  bool tower_pieces_initial_stepper_lift_complete{false};
+  bool tower_pieces_waiting_for_initial_stepper_lift{false};
   bool tower_pieces_stepper_moving_down{false};
   bool tower_pieces_stepper_moving_up{false};
 

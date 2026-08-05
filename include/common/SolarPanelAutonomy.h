@@ -21,6 +21,8 @@ enum class SolarPanelAutonomyState : std::uint8_t {
   FrontLineFollowComplete = 11,
   WaitBeforeStrafeLeftToFrontLine = 12,
   ForwardLineFollowAfterFrontDetection = 13,
+  OpenSolarHookAndFunnel = 14,
+  Complete = 15,
 };
 
 enum class SolarPanelFaultReason : std::uint8_t {
@@ -32,6 +34,8 @@ enum class SolarPanelFaultReason : std::uint8_t {
   LimitSwitchTimeout = 5,
   ImuUnavailable = 6,
   ImuStrafeFailed = 7,
+  SolarHookCommandFailed = 8,
+  FunnelCommandFailed = 9,
 };
 
 struct SolarPanelAutonomyConfig {
@@ -60,6 +64,10 @@ struct SolarPanelContactConfig {
   float line_reacquire_strafe_duty{0.0F};
   Milliseconds front_line_follow_duration_ms{0U};
   float front_line_follow_duty{0.0F};
+  // Signed because the physical funnel-open motor direction is calibrated on
+  // the robot: positive is the existing Forward convention, negative Reverse.
+  float funnel_open_duty{0.0F};
+  Milliseconds funnel_open_duration_ms{0U};
 };
 
 struct SolarPanelContactSequenceUpdate {
@@ -89,6 +97,11 @@ const char* solarPanelAutonomyStateName(SolarPanelAutonomyState state);
 const char* solarPanelFaultReasonName(SolarPanelFaultReason reason);
 
 bool solarPanelAutonomyConfigValid(const SolarPanelAutonomyConfig& config);
+// Validates the pre-existing line/contact route independently of the final
+// mechanism action. This keeps older saved route tuning usable while the new
+// funnel-open settings remain intentionally locked until calibrated.
+bool solarPanelContactRouteConfigValid(
+    const SolarPanelContactConfig& config);
 bool solarPanelContactConfigValid(const SolarPanelContactConfig& config);
 SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
     SolarPanelAutonomyState current_state, bool front_hit, bool back_hit,

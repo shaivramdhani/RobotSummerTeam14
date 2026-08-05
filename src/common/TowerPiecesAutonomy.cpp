@@ -164,6 +164,7 @@ bool towerPiecesConfigValid(const TowerPiecesConfig& config,
          config.post_final_reverse_delay_ms > 0U &&
          config.post_winch_open_delay_ms > 0U &&
          config.post_claws_open_delay_ms > 0U &&
+         config.initial_stepper_lift_steps > 0U &&
          config.stepper_down_speed_steps_per_second > 0U &&
          config.stepper_down_speed_steps_per_second <=
              maximum_stepper_speed_steps_per_second &&
@@ -417,7 +418,8 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
 
     case TowerPiecesState::PreStepperBottomDelay:
       if (now_ms - autonomy.state_entered_at_ms >=
-          config.pre_stepper_bottom_delay_ms) {
+              config.pre_stepper_bottom_delay_ms &&
+          inputs.initial_stepper_lift_complete) {
         autonomy.state = TowerPiecesState::MoveStepperBottom;
         autonomy.state_entered_at_ms = now_ms;
       }
@@ -513,6 +515,11 @@ TowerPiecesUpdate updateTowerPiecesAutonomy(
       autonomy.state == TowerPiecesState::ShimmyRight;
   update.should_drive_final_reverse =
       autonomy.state == TowerPiecesState::FinalReverse;
+  update.waiting_for_initial_stepper_lift =
+      autonomy.state == TowerPiecesState::PreStepperBottomDelay &&
+      now_ms - autonomy.state_entered_at_ms >=
+          config.pre_stepper_bottom_delay_ms &&
+      !inputs.initial_stepper_lift_complete;
   update.should_move_stepper_bottom =
       autonomy.state == TowerPiecesState::MoveStepperBottom;
   update.should_move_stepper_top =

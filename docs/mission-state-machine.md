@@ -46,9 +46,11 @@ above-threshold value rearms the next count. Reaching the configured count
 enters `POST_COUNT_STOP_DELAY`. It then alternates `EXIT_STRAFE_PULSE` and
 `EXIT_DISTANCE_CHECK`: each pulse is timed, every check occurs stopped and
 requires a new measurement sequence, above threshold advances to
-`LOWER_SLIDE`, and at-or-below repeats the pulse. The distance-strafe timeout
-bounds the complete count/delay/pulse/check sequence. The slide then seeks its
-bottom limit, `APPROACH_PIECE` drives forward until the active-high ESP2 GPIO48
+`APPROACH_PIECE` when the slide is already down (or to `LOWER_SLIDE` as a
+stopped wait), and at-or-below repeats the pulse. The distance-strafe timeout
+bounds the complete count/delay/pulse/check sequence. The slide has been
+seeking its bottom limit concurrently since the pickup profile began;
+`APPROACH_PIECE` drives forward until the active-high ESP2 GPIO48
 habitat-piece limit switch is pressed, and the stopped transition starts a bounded
 `PRE_LIFT_REVERSE` using the pickup reverse duty. Its stopped completion starts
 the step-counted lift. `LIFT_START_DELAY` holds every wheel stopped for its
@@ -91,6 +93,13 @@ without changing the parent mode. Each
 motion/search has an adjustable bound; configuration, stale
 communication, sensor, turn, stepper, servo, and timeout failures stop the
 chassis.
+
+Final Competition is staged with the slider up, funnel closed, and Solar Hook
+down/closed. Outputs remain disabled at boot. Solar commands the hook closed
+when its route starts, then commands it open and runs the funnel at the
+configured signed duty for the configured duration after the forward-line
+exit. Only after that bounded mechanism phase reports complete does Habitat
+Pickup 1 start.
 
 ## Transition TODOs
 

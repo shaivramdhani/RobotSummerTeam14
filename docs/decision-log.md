@@ -332,3 +332,37 @@ uses the chassis mixer's physical yaw convention, and remains bounded by the
 pickup run timeout. Both side-sensor snapshots must remain configured and fresh until
 alignment completes, and the transition into and out of rotation emits an
 all-wheel stopped update.
+
+## 2026-08-04: Competition Staging and Overlapped Pickup Slide
+
+Decision: Treat slider-up, funnel-closed, and Solar-Hook-down/closed as the
+physical competition staging condition without energizing outputs at boot.
+When Solar starts, command the existing adjustable hook closed angle. After
+the forward front-line exit, command the hook open angle and run the funnel at
+an explicitly calibrated signed duty for an adjustable bounded duration; Solar
+does not report complete until that mechanism phase stops.
+
+Start each Habitat pickup profile's bottom-limit search at pickup start so it
+runs concurrently with the line, alignment, reverse, and distance route. If
+the slide is already down at the distance exit, skip directly to the piece
+approach; otherwise hold the chassis stopped in the existing `LOWER_SLIDE`
+fallback until the same profile-wide timeout succeeds or faults.
+
+Safety note: The physical staging assumptions are not sensor assertions.
+Actuators still initialize disabled, funnel direction remains signed and
+locked at zero until calibrated, remote commands retain expiry, and slide
+command failure, lower-limit failure, or timeout stops the pickup route.
+
+## 2026-08-04: Concurrent Tower Initial Lift
+
+Decision: Begin a finite relative upward stepper jog at the same instant Tower
+Pieces starts rear-line following. Make its travel adjustable in driver
+microsteps and reuse Tower's existing adjustable stepper-up speed. Continue the
+chassis state machine concurrently, but do not allow the later bottom-limit
+search to replace an unfinished initial jog.
+
+Safety note: The lift defaults to zero and locks Tower start until calibrated.
+Start validates that the requested travel fits above the current stepper
+position and rejects an active top limit. Runtime tracks the exact jog target,
+faults and stops all outputs if the software motion stops early, and gates the
+later down command on successful completion.

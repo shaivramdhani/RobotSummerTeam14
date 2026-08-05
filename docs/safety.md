@@ -75,9 +75,11 @@ disabled and line following refuses to start.
   result is substituted with 65536 mm and satisfies the exit check, while an
   unavailable or stale stream supplies no sample. Repeated sequences cannot
   increment the count or satisfy a post-pulse check, and the configured timeout
-  bounds the full count/delay/pulse/check sequence. Clearing the final zone begins a bounded
-  bottom-limit search and a separately bounded active-high GPIO48 limit-switch
-  approach. A
+  bounds the full count/delay/pulse/check sequence. A bounded bottom-limit
+  search begins when each pickup profile starts and runs concurrently with the
+  early chassis route. Clearing the final zone begins the separately bounded
+  active-high GPIO48 limit-switch approach immediately if the slide is already
+  down, or holds the chassis stopped until that search finishes. A
   duration-bounded pre-lift reverse stops before the step-counted lift begins.
   The lift begins while every wheel remains stopped for the configured
   lift-start delay, then continues concurrently with the bounded reverse and
@@ -95,12 +97,23 @@ disabled and line following refuses to start.
   the configured stepper timeout is measured from that command. A stopped
   stepper before the bottom limit, timeout, conflicting limits, stale required
   line data, or an IMU/link failure stops both chassis and slide.
+- Slider-up and funnel-closed are physical staging assumptions, not boot-time
+  actuator commands or sensed conditions; all outputs still initialize
+  disabled. Solar Start requires configured hook targets and funnel hardware,
+  commands the hook closed/down, and rejects an unset final funnel duty or
+  duration. The final signed funnel command is capped, refreshed before its
+  communication timeout, stopped at the configured duration, and stopped on
+  any link or mode fault.
 - `FINAL_COMPETITION` validates all included modes before Solar moves and
   requires Placement 3 to use the rear return-line source. Each ownership
   handoff commands stopped outputs. Tower ignores side-line HIGH only for its
   bounded configured window, which must be shorter than its search timeout.
   Tower's pre/post-shimmy delays command every chassis output stopped and are
   capped at 30000 ms; the shimmy search retains its independent timeout.
+  Tower Start rejects a zero initial-lift distance, an active top limit, or a
+  relative lift that exceeds the remaining configured stepper travel. The
+  finite jog runs concurrently with the chassis, faults if it stops before its
+  tracked target, and must complete before the later bottom-limit search starts.
   PegFinder shake remains disabled while any shake field is only partially
   configured; when enabled, both directional pulses and the stopped post-shake
   delay are duration-bounded.

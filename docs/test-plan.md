@@ -249,14 +249,19 @@ For Stage 3, keep the wheels raised for initial tests:
 12. Run the Tower and PegFinder clockwise turns with low, verified angles.
     Confirm their panels contain angles rather than timed-turn settings and
     that both turns use the shared Stage 2 duty/gains/tolerance/timeout.
-13. During each autonomous IMU strafe/turn family, briefly interrupt SDA or
+13. Start Tower with a small calibrated initial lift. Confirm the stepper begins
+    its relative upward jog in the first rear-line-follow phase while the wheels
+    continue updating. Confirm the later bottom-limit search waits if the jog is
+    unfinished, and that insufficient upward travel or an early stop rejects or
+    faults the route with all outputs stopped.
+14. During each autonomous IMU strafe/turn family, briefly interrupt SDA or
     SCL. Confirm all four wheel commands become disabled, the mission phase and
     its elapsed time stop advancing, the saved heading/target remain fixed,
     and motion resumes only after three new fresh samples.
-14. Keep the IMU disconnected beyond the displayed recovery limit. Confirm the
+15. Keep the IMU disconnected beyond the displayed recovery limit. Confirm the
     owning autonomy enters its existing terminal `IMU_UNAVAILABLE` fault and
     does not restart.
-15. With wheels raised, power-cycle the IMU during an autonomous IMU phase.
+16. With wheels raised, power-cycle the IMU during an autonomous IMU phase.
     Confirm runtime-register verification becomes false and the phase never
     resumes using the MPU reset defaults.
 
@@ -272,7 +277,10 @@ For Stage 3, keep the wheels raised for initial tests:
    pusher-open settle time, and Front/Rear return source. Confirm each selector
    reloads its own saved values. Confirm Habitat Pieces Start Ready remains
    false if any pickup/placement profile or required sensor, IMU, stepper limit,
-   pusher target, or link is absent.
+   pusher target, or link is absent. For each pickup profile, confirm the slide
+   begins lowering with the first front-line-follow step, reaches the bottom
+   safely while the chassis route continues, and faults/stops if its timeout
+   expires.
 3. Exercise the route one phase at a time with conservative settings. Confirm
    the initial heading is captured before rear-line motion begins, LSS1 stops
    reverse line-following, and each delay holds all wheels stopped.
@@ -306,24 +314,30 @@ For Stage 3, keep the wheels raised for initial tests:
 
 ## Final Competition Bring-Up
 
-1. Keep the wheels raised and configure Solar's front-line exit duty/duration,
-   all six Habitat profiles, Tower's start-ignore window, and PegFinder shake.
+1. Keep the wheels raised and configure Solar's front-line exit duty/duration
+   and signed funnel-open duty/duration, all six Habitat profiles, Tower's
+   start-ignore window, and PegFinder shake.
    Confirm Start is rejected unless Placement 3 returns to the rear line.
-2. Confirm Solar's final strafe stops on a front sensor and its forward PID
-   runs for the configured duration before Habitat Pickup 1 begins.
-3. Present LSS2/LSS3 HIGH during each Habitat start-ignore window and confirm
+2. Stage the slider up, funnel closed, and Solar Hook down/closed. Confirm boot
+   still leaves all actuator outputs disabled, then Solar Start commands the
+   hook's configured closed angle.
+3. Confirm Solar's final strafe stops on a front sensor and its forward PID
+   runs for the configured duration. Verify the hook then moves to its open
+   angle and the funnel runs in the calibrated physical opening direction for
+   exactly the configured duration before Habitat Pickup 1 begins.
+4. Present LSS2/LSS3 HIGH during each Habitat start-ignore window and confirm
    neither reading changes the route until its profile's gate opens.
-4. After Placement 3 finds the rear line, confirm the chassis stops for the
+5. After Placement 3 finds the rear line, confirm the chassis stops for the
    ownership handoff and Tower begins backward rear-line following. Hold LSS
    HIGH through Tower's ignore window; verify it must return LOW before a new
    HIGH can count.
-5. In PegFinder, confirm a left pulse followed by a right pulse occurs between
+6. In PegFinder, confirm a left pulse followed by a right pulse occurs between
    claw openings 1/2 and 2/3, with stopped transitions and the configured duty
    and durations. Confirm the configured stopped post-shake delay completes
    before the next claw opens. Confirm all-zero shake values skip both shake
    and post-shake-delay states.
-6. Force one included-mode timeout at a time and confirm Final Competition
+7. Force one included-mode timeout at a time and confirm Final Competition
    enters `FAULT`, stops chassis/funnel/stepper outputs, and does not advance.
-10. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
+8. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
     or the configured return line. Each condition must stop or time out without
     advancing to the next motion phase or profile.

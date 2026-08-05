@@ -54,7 +54,7 @@ robot::SolarPanelAutonomyConfig solarConfig() {
 
 robot::SolarPanelContactConfig solarContactConfig() {
   return {100U, 0.25F, 0.2F, 0.22F, 0.25F, 10U, 20U, 30U, 40U,
-          1000U, 0U, 0U, 0.19F, 0.18F, 250U, 0.2F};
+          1000U, 0U, 0U, 0.19F, 0.18F, 250U, 0.2F, -0.16F, 400U};
 }
 
 robot::TowerPiecesConfig towerPiecesConfig() {
@@ -80,6 +80,7 @@ robot::TowerPiecesConfig towerPiecesConfig() {
   config.post_final_reverse_delay_ms = 10U;
   config.post_winch_open_delay_ms = 11U;
   config.post_claws_open_delay_ms = 12U;
+  config.initial_stepper_lift_steps = 400U;
   config.pre_stepper_bottom_delay_ms = 0U;
   config.stepper_down_speed_steps_per_second = 2000U;
   config.post_stepper_bottom_delay_ms = 13U;
@@ -151,11 +152,12 @@ robot::TowerPiecesUpdate updateTowerPiecesForTest(
     const robot::Milliseconds now_ms,
     const bool bottom_limit_active = false,
     const bool top_limit_active = false,
-    const bool clockwise_turn_complete = false) {
+    const bool clockwise_turn_complete = false,
+    const bool initial_stepper_lift_complete = true) {
   const robot::TowerPiecesInputs inputs{
       side_line_high, back_left_line_high, back_right_line_high,
       bottom_limit_active, top_limit_active,
-      clockwise_turn_complete};
+      clockwise_turn_complete, initial_stepper_lift_complete};
   return robot::updateTowerPiecesAutonomy(autonomy, inputs, config, now_ms);
 }
 
@@ -1799,6 +1801,7 @@ void test_tower_pieces_config_requires_duties_and_timings() {
                            defaults.post_final_reverse_delay_ms);
   TEST_ASSERT_EQUAL_UINT32(1000U, defaults.post_winch_open_delay_ms);
   TEST_ASSERT_EQUAL_UINT32(1000U, defaults.post_claws_open_delay_ms);
+  TEST_ASSERT_EQUAL_UINT32(0U, defaults.initial_stepper_lift_steps);
   TEST_ASSERT_EQUAL_UINT32(1000U,
                            defaults.post_stepper_bottom_delay_ms);
   TEST_ASSERT_EQUAL_UINT32(1000U,
@@ -1895,6 +1898,9 @@ void test_tower_pieces_config_requires_duties_and_timings() {
   config.post_claws_closed_delay_ms = 0U;
   TEST_ASSERT_FALSE(robot::towerPiecesConfigValid(config, 0.5F, 200000U));
 
+  config = towerPiecesConfig();
+  config.initial_stepper_lift_steps = 0U;
+  TEST_ASSERT_FALSE(robot::towerPiecesConfigValid(config, 0.5F, 200000U));
   config = towerPiecesConfig();
   config.stepper_down_speed_steps_per_second = 0U;
   TEST_ASSERT_FALSE(robot::towerPiecesConfigValid(config, 0.5F, 200000U));
@@ -2067,6 +2073,33 @@ void test_tower_pre_stepper_delay_holds_slide_stopped() {
   TEST_ASSERT_FALSE(update.should_move_stepper_bottom);
   update = updateTowerPiecesForTest(
       autonomy, false, false, false, config, 187U);
+  TEST_ASSERT_TRUE(update.should_move_stepper_bottom);
+}
+
+void test_tower_waits_for_concurrent_initial_lift_before_moving_down() {
+  robot::TowerPiecesConfig config = towerPiecesConfig();
+  config.pre_stepper_bottom_delay_ms = 75U;
+  robot::TowerPiecesAutonomy autonomy{};
+  autonomy.state = robot::TowerPiecesState::PreStepperBottomDelay;
+  autonomy.state_entered_at_ms = 100U;
+
+  robot::TowerPiecesUpdate update = updateTowerPiecesForTest(
+      autonomy, false, false, false, config, 175U, false, false, false,
+      false);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::TowerPiecesState::PreStepperBottomDelay),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.waiting_for_initial_stepper_lift);
+  TEST_ASSERT_FALSE(update.should_move_stepper_bottom);
+
+  update = updateTowerPiecesForTest(
+      autonomy, false, false, false, config, 176U, false, false, false,
+      true);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::TowerPiecesState::MoveStepperBottom),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_FALSE(update.waiting_for_initial_stepper_lift);
   TEST_ASSERT_TRUE(update.should_move_stepper_bottom);
 }
 
@@ -2673,6 +2706,7 @@ void test_motion_diagnostics_json_exposes_commands_pwm_and_timing() {
 
 void test_solar_contact_config_validation() {
   robot::SolarPanelContactConfig config = solarContactConfig();
+  TEST_ASSERT_TRUE(robot::solarPanelContactRouteConfigValid(config));
   TEST_ASSERT_TRUE(robot::solarPanelContactConfigValid(config));
 
   config.strafe_start_delay_ms = 0U;
@@ -2708,6 +2742,25 @@ void test_solar_contact_config_validation() {
 
   config.post_contact_forward_duty =
       std::numeric_limits<float>::quiet_NaN();
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config = solarContactConfig();
+  config.funnel_open_duty = 0.0F;
+  TEST_ASSERT_TRUE(robot::solarPanelContactRouteConfigValid(config));
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config.funnel_open_duty = 0.2F;
+  TEST_ASSERT_TRUE(robot::solarPanelContactConfigValid(config));
+
+  config.funnel_open_duty = 1.01F;
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config.funnel_open_duty =
+      std::numeric_limits<float>::quiet_NaN();
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config = solarContactConfig();
+  config.funnel_open_duration_ms = 0U;
   TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
 }
 
@@ -2746,6 +2799,14 @@ void test_solar_retry_state_names_are_exposed() {
       robot::solarPanelAutonomyStateName(
           robot::SolarPanelAutonomyState::
               WaitBeforeStrafeLeftToFrontLine));
+  TEST_ASSERT_EQUAL_STRING(
+      "OPEN_SOLAR_HOOK_AND_FUNNEL",
+      robot::solarPanelAutonomyStateName(
+          robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel));
+  TEST_ASSERT_EQUAL_STRING(
+      "COMPLETE",
+      robot::solarPanelAutonomyStateName(
+          robot::SolarPanelAutonomyState::Complete));
 }
 
 void test_solar_front_only_at_first_timeout_begins_adjustment() {
@@ -3029,6 +3090,34 @@ void test_solar_non_contact_state_is_unchanged() {
   assertSolarState(robot::SolarPanelAutonomyState::LineFollowToSolar,
                    update.next_state);
   TEST_ASSERT_FALSE(update.transitioned);
+}
+
+void test_solar_completion_waits_for_funnel_open_duration() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::FrontLineFollowComplete, false,
+          false, 0U, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel,
+      update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      update.next_state, false, false,
+      config.funnel_open_duration_ms - 1U, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel,
+      update.next_state);
+  TEST_ASSERT_FALSE(update.transitioned);
+
+  update = robot::updateSolarPanelContactSequence(
+      update.next_state, false, false,
+      config.funnel_open_duration_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::Complete,
+                   update.next_state);
+  TEST_ASSERT_TRUE(update.transitioned);
 }
 
 void test_solar_detector_no_beacon_does_not_confirm() {
@@ -3392,6 +3481,10 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.solar_line_reacquire_strafe_duty = 0.18F;
   snapshot.solar_front_line_follow_duration_ms = 750U;
   snapshot.solar_front_line_follow_duty = 0.21F;
+  snapshot.solar_funnel_open_duty = -0.16F;
+  snapshot.solar_funnel_open_duration_ms = 900U;
+  snapshot.solar_funnel_open_elapsed_ms = 450U;
+  snapshot.solar_opening_hook_and_funnel = true;
   snapshot.solar_post_contact_forward_start_delay_ms = 125U;
   snapshot.solar_line_reacquire_strafe_start_delay_ms = 250U;
   snapshot.solar_post_contact_forward_duty = 0.19F;
@@ -3441,6 +3534,7 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.habitat_pieces_exit_strafe_pulse_remaining_ms = 75U;
   snapshot.habitat_pieces_slide_down_speed_steps_per_second = 200U;
   snapshot.habitat_pieces_slide_down_timeout_ms = 1500U;
+  snapshot.habitat_pieces_slide_down_complete = true;
   snapshot.habitat_pieces_approach_forward_duty = 0.14F;
   snapshot.habitat_pieces_approach_limit_configured = true;
   snapshot.habitat_pieces_approach_limit_raw_level = 1;
@@ -3543,6 +3637,7 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.tower_pieces_post_final_reverse_delay_ms = 600U;
   snapshot.tower_pieces_post_winch_open_delay_ms = 610U;
   snapshot.tower_pieces_post_claws_open_delay_ms = 620U;
+  snapshot.tower_pieces_initial_stepper_lift_steps = 425U;
   snapshot.tower_pieces_stepper_down_speed_steps_per_second = 2000U;
   snapshot.tower_pieces_post_stepper_bottom_delay_ms = 630U;
   snapshot.tower_pieces_post_claws_closed_delay_ms = 640U;
@@ -3560,6 +3655,9 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.tower_pieces_shimmying_right = false;
   snapshot.tower_pieces_back_line_detected = true;
   snapshot.tower_pieces_final_reverse_active = true;
+  snapshot.tower_pieces_initial_stepper_lift_active = true;
+  snapshot.tower_pieces_initial_stepper_lift_complete = false;
+  snapshot.tower_pieces_waiting_for_initial_stepper_lift = false;
   snapshot.tower_pieces_stepper_moving_down = true;
   snapshot.tower_pieces_stepper_moving_up = true;
   snapshot.peg_finder_state = robot::PegFinderState::FunnelForward;
@@ -3969,6 +4067,8 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       std::strstr(output, "\"post_winch_open_delay_ms\":610"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"post_claws_open_delay_ms\":620"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"initial_stepper_lift_steps\":425"));
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"stepper_down_speed_steps_per_second\":2000"));
   TEST_ASSERT_NOT_NULL(
@@ -3995,6 +4095,10 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       std::strstr(output, "\"back_line_detected\":true"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"final_reverse_active\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"initial_stepper_lift_active\":true"));
+  TEST_ASSERT_NOT_NULL(
+      std::strstr(output, "\"initial_stepper_lift_complete\":false"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"stepper_moving_down\":true"));
   TEST_ASSERT_NOT_NULL(
@@ -4179,6 +4283,14 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       std::strstr(output, "\"timed_out\":false"));
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"slide_down_speed_steps_per_second\":200"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"slide_down_complete\":true"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"funnel_open_duty\":-0.16000"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"funnel_open_duration_ms\":900"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"opening_hook_and_funnel\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"approach_limit_configured\":true"));
   TEST_ASSERT_NOT_NULL(std::strstr(
@@ -4670,6 +4782,7 @@ void test_habitat_pieces_ignores_both_side_sensors_until_start_gate() {
   robot::HabitatPiecesConfig config{};
   config.side_line_ignore_after_start_ms = 100U;
   config.run_timeout_ms = 1000U;
+  config.slide_down_timeout_ms = 1000U;
   config.reverse_duty = 0.2F;
   config.reverse_duration_ms = 100U;
   robot::HabitatPiecesAutonomy autonomy{};
@@ -4716,6 +4829,7 @@ void test_habitat_pieces_lss2_stops_rotates_clockwise_until_lss3() {
   robot::HabitatPiecesConfig config{};
   config.side_line_ignore_after_start_ms = 100U;
   config.run_timeout_ms = 1000U;
+  config.slide_down_timeout_ms = 1000U;
   config.reverse_duty = 0.2F;
   config.reverse_duration_ms = 100U;
   robot::HabitatPiecesAutonomy autonomy{};
@@ -4803,6 +4917,7 @@ void test_habitat_pieces_lss3_stops_rotates_counter_clockwise_until_lss2() {
   robot::HabitatPiecesConfig config{};
   config.side_line_ignore_after_start_ms = 10U;
   config.run_timeout_ms = 1000U;
+  config.slide_down_timeout_ms = 1000U;
   config.reverse_duty = 0.2F;
   config.reverse_duration_ms = 100U;
   robot::HabitatPiecesAutonomy autonomy{};
@@ -4853,6 +4968,7 @@ void test_habitat_pieces_times_out_while_waiting_for_a_side_line() {
   robot::HabitatPiecesConfig config{};
   config.side_line_ignore_after_start_ms = 10U;
   config.run_timeout_ms = 50U;
+  config.slide_down_timeout_ms = 1000U;
   config.reverse_duty = 0.2F;
   config.reverse_duration_ms = 100U;
   robot::HabitatPiecesAutonomy autonomy{};
@@ -4887,6 +5003,7 @@ void test_habitat_pieces_times_out_during_side_line_alignment() {
   robot::HabitatPiecesConfig config{};
   config.side_line_ignore_after_start_ms = 10U;
   config.run_timeout_ms = 50U;
+  config.slide_down_timeout_ms = 1000U;
   robot::HabitatPiecesAutonomy autonomy{};
   robot::startHabitatPiecesAutonomy(autonomy, 100U);
 
@@ -4912,6 +5029,63 @@ void test_habitat_pieces_times_out_during_side_line_alignment() {
   TEST_ASSERT_TRUE(autonomy.timed_out);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(robot::HabitatPiecesStopReason::RunTimeout),
+      static_cast<std::uint8_t>(update.stop_reason));
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
+      static_cast<std::uint8_t>(update.state));
+}
+
+void test_habitat_pieces_lowers_slide_concurrently_from_profile_start() {
+  robot::HabitatPiecesConfig config{};
+  config.side_line_ignore_after_start_ms = 100U;
+  config.run_timeout_ms = 1000U;
+  config.slide_down_timeout_ms = 500U;
+  robot::HabitatPiecesAutonomy autonomy{};
+  robot::startHabitatPiecesAutonomy(autonomy, 100U);
+
+  robot::HabitatPiecesMechanismInputs mechanisms{};
+  robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 120U, {}, mechanisms);
+  TEST_ASSERT_TRUE(update.should_line_follow);
+  TEST_ASSERT_TRUE(update.should_lower_slide);
+  TEST_ASSERT_FALSE(update.slide_down_complete);
+  TEST_ASSERT_EQUAL_UINT32(20U, autonomy.slide_down_elapsed_ms);
+
+  mechanisms.bottom_limit_active = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 130U, {}, mechanisms);
+  TEST_ASSERT_TRUE(update.should_line_follow);
+  TEST_ASSERT_FALSE(update.should_lower_slide);
+  TEST_ASSERT_TRUE(update.slide_down_complete);
+  TEST_ASSERT_TRUE(autonomy.slide_down_complete);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::LineFollowing),
+      static_cast<std::uint8_t>(update.state));
+}
+
+void test_habitat_pieces_concurrent_slide_timeout_faults_route() {
+  robot::HabitatPiecesConfig config{};
+  config.side_line_ignore_after_start_ms = 100U;
+  config.run_timeout_ms = 1000U;
+  config.slide_down_timeout_ms = 50U;
+  robot::HabitatPiecesAutonomy autonomy{};
+  robot::startHabitatPiecesAutonomy(autonomy, 100U);
+
+  robot::HabitatPiecesUpdate update =
+      robot::updateHabitatPiecesAutonomy(
+          autonomy, config, false, false, 149U);
+  TEST_ASSERT_TRUE(update.should_line_follow);
+  TEST_ASSERT_TRUE(update.should_lower_slide);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 150U);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_TRUE(autonomy.timed_out);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesStopReason::SlideDownTimeout),
       static_cast<std::uint8_t>(update.stop_reason));
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
@@ -5219,6 +5393,8 @@ void test_habitat_pieces_repeats_stopped_exit_pulses_until_above_threshold() {
   autonomy.state_entered_at_ms = 100U;
   autonomy.distance_strafe_started_at_ms = 100U;
   autonomy.distance_zone_count = 2U;
+  autonomy.slide_down_started = true;
+  autonomy.slide_down_complete = true;
 
   robot::HabitatPiecesDistanceSample sample{};
   sample.available = true;
@@ -5293,7 +5469,7 @@ void test_habitat_pieces_repeats_stopped_exit_pulses_until_above_threshold() {
   TEST_ASSERT_FALSE(update.distance_zone_active);
   TEST_ASSERT_TRUE(update.distance_substituted_no_target);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::LowerSlide),
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::ApproachPiece),
       static_cast<std::uint8_t>(update.state));
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
@@ -5319,6 +5495,8 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
   autonomy.state = robot::HabitatPiecesState::LowerSlide;
   autonomy.stop_reason = robot::HabitatPiecesStopReason::DistanceExitReached;
   autonomy.state_entered_at_ms = 100U;
+  autonomy.slide_down_started = true;
+  autonomy.slide_down_started_at_ms = 100U;
 
   robot::HabitatPiecesMechanismInputs mechanisms{};
   robot::HabitatPiecesDistanceSample sample{};
@@ -5896,6 +6074,8 @@ int main() {
   RUN_TEST(
       test_tower_side_crossing_requires_cooldown_and_offline_rearm);
   RUN_TEST(test_tower_pre_stepper_delay_holds_slide_stopped);
+  RUN_TEST(
+      test_tower_waits_for_concurrent_initial_lift_before_moving_down);
   RUN_TEST(test_tower_pieces_runs_full_sequence_in_order);
   RUN_TEST(test_tower_pieces_rotation_waits_for_imu_completion);
   RUN_TEST(test_tower_pieces_shimmy_direction_half_pulse_and_delays);
@@ -5929,6 +6109,7 @@ int main() {
       test_solar_post_contact_forward_stops_if_front_line_is_already_detected);
   RUN_TEST(test_solar_post_contact_delays_are_independently_adjustable);
   RUN_TEST(test_solar_non_contact_state_is_unchanged);
+  RUN_TEST(test_solar_completion_waits_for_funnel_open_duration);
   RUN_TEST(test_solar_detector_no_beacon_does_not_confirm);
   RUN_TEST(test_solar_detector_brief_spike_does_not_confirm);
   RUN_TEST(test_solar_detector_sustained_beacon_confirms);
@@ -5958,6 +6139,10 @@ int main() {
       test_habitat_pieces_times_out_while_waiting_for_a_side_line);
   RUN_TEST(
       test_habitat_pieces_times_out_during_side_line_alignment);
+  RUN_TEST(
+      test_habitat_pieces_lowers_slide_concurrently_from_profile_start);
+  RUN_TEST(
+      test_habitat_pieces_concurrent_slide_timeout_faults_route);
   RUN_TEST(
       test_habitat_pieces_distance_strafe_counts_distinct_zone_entries);
   RUN_TEST(

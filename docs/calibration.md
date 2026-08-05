@@ -30,10 +30,18 @@ calibration values.
   opposite-direction rear-line strafe duty/timeout: TODO. Verify
   the bottom switch, active-high approach switch, step-counted lift distance,
   both rear sensors, and the
-  automatic Habitat Placement handoff with wheels raised first.
+  automatic Habitat Placement handoff with wheels raised first. Verify each
+  profile starts lowering the slide at pickup start and that the mechanism can
+  reach the bottom safely while the chassis route is still running.
 - Calibrate the Solar exit front-line reacquisition strafe duty, forward PID
   duty, and forward PID duration independently. Verify that either front sensor
   finding tape produces a stopped handoff before the PID begins.
+- Calibrate Solar's final signed funnel-open duty and duration with the chassis
+  raised/secured. Positive uses the existing Forward convention; negative uses
+  Reverse. Confirm the physical opening direction before saving a nonzero
+  value. Verify the Solar Hook's adjustable `0°` open/up and `148°`
+  closed/down positions, and confirm the hook reaches open during the bounded
+  funnel phase.
 - Calibrate the Tower Pieces side-line HIGH-ignore window so it spans the
   Habitat-to-Tower handoff but remains shorter than the side-line timeout.
   Verify that a sensor held HIGH through the window must go LOW before the next
@@ -127,5 +135,8 @@ calibration values.
 - Tower shimmy initial direction, full left/right durations, and stopped delays
   before/after shimmy: TODO. Remember that firmware automatically applies 50%
   of the selected direction's duration to the first pulse.
+- Tower initial concurrent upward jog distance: TODO. Calibrate in driver
+  microsteps with enough remaining travel at Tower start; it uses the Tower
+  stepper-up speed and must finish before the later bottom-limit search.
 - Stepper step timing and direction polarity: TODO
 - Limit switch active levels: TODO

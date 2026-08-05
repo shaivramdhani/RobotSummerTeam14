@@ -89,6 +89,9 @@ struct TowerPiecesConfig {
   Milliseconds post_final_reverse_delay_ms{1000U};
   Milliseconds post_winch_open_delay_ms{1000U};
   Milliseconds post_claws_open_delay_ms{1000U};
+  // Relative upward jog that begins concurrently with the route.
+  // Zero keeps Tower Pieces locked until the travel is calibrated.
+  std::uint32_t initial_stepper_lift_steps{0U};
   Milliseconds pre_stepper_bottom_delay_ms{0U};
   std::uint32_t stepper_down_speed_steps_per_second{2000U};
   Milliseconds post_stepper_bottom_delay_ms{1000U};
@@ -103,6 +106,7 @@ struct TowerPiecesInputs {
   bool bottom_limit_active{false};
   bool top_limit_active{false};
   bool clockwise_turn_complete{false};
+  bool initial_stepper_lift_complete{false};
 };
 
 struct TowerPiecesAutonomy {
@@ -143,6 +147,7 @@ struct TowerPiecesUpdate {
   bool should_shimmy_right{false};
   bool back_line_detected{false};
   bool should_drive_final_reverse{false};
+  bool waiting_for_initial_stepper_lift{false};
   bool should_move_stepper_bottom{false};
   bool should_move_stepper_top{false};
 };

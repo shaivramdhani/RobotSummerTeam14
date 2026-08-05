@@ -66,9 +66,11 @@ and re-enter before counting. Consecutive in-zone samples count once, and an abo
 sample rearms the next count. At the target count, the robot stops for an
 adjustable delay, then repeats adjustable-duration IMU-strafe pulses with an
 independently adjustable duty, all-wheel stop, and fresh laser check between
-pulses. An above-threshold check clears the final piece and begins the pickup
-tail. The slide seeks its bottom
-limit, the robot drives forward until the active-high ESP2 GPIO48 habitat-piece
+pulses. The slide begins seeking its bottom limit at the start of every pickup
+profile, concurrently with line following, alignment, reverse, and distance
+strafing. An above-threshold check clears the final piece and begins the pickup
+tail immediately if the slide is already down, or waits stopped for the same
+bounded slide search to finish. The robot then drives forward until the active-high ESP2 GPIO48 habitat-piece
 limit switch is pressed, briefly reverses for an adjustable duration using the
 pickup reverse duty, and starts a step-counted
 lift during an adjustable stopped delay before continuing concurrently with a
@@ -177,11 +179,18 @@ shared IMU Strafe controller. Retry-left and retry-right use direct open-loop
 mecanum strafing at independently adjustable duties, with no IMU correction.
 All stages retain their existing adjustable times/timeouts. Once either front
 sensor sees tape, Solar follows the front line forward at its own adjustable
-duty and duration.
+duty and duration. Stage the robot with the slider up, funnel mechanically
+closed, and Solar Hook down/closed. Solar commands the hook's adjustable closed
+angle at route start; after the forward line follow, it commands the adjustable
+open angle and runs the funnel at an adjustable signed duty for an adjustable
+duration before reporting Solar complete. Positive duty uses the existing
+funnel-forward convention and negative duty uses reverse.
 
 The ESP2 dashboard also has a `Tower Pieces` panel. Its Start button enters
 `AUTONOMOUS_TOWER_PIECES`, follows the rear line backward, counts distinct LSS
-LOW-to-HIGH transitions, and stops all four wheels on transition two. It then
+LOW-to-HIGH transitions, and stops all four wheels on transition two. From the
+same start instant, the stepper performs a configured relative upward jog at
+the shared Tower up speed while the chassis route continues. It then
 waits, performs an IMU-aligned right strafe for a configured duration, pauses,
 uses the IMU turn controller to rotate clockwise through a configured angle,
 pauses again, and drives backward for a configured duration. It then alternates
@@ -190,7 +199,8 @@ an adjustable stopped delay. The first pulse is 50% of its direction's normal
 duration; later pulses use the full configured left/right duration. When either
 back line sensor becomes HIGH, it waits for an adjustable stopped post-shimmy
 delay. It can then perform an optional timed backward drive (`0 ms` skips it), waits,
-opens the winch, waits, opens all three claws, waits, and lowers the stepper to
+opens the winch, waits, opens all three claws, waits for both its configured
+pre-bottom delay and the initial lift to finish, and lowers the stepper to
 the bottom limit. It then waits, closes all three claws, waits, raises the
 stepper to the top limit, and closes the winch. There is no final line-following
 stage. The shimmy direction, pre/post delays, right and left durations, and all
@@ -199,7 +209,8 @@ tail settings are adjustable in the panel and can be saved to NVS.
 Tower Pieces strafe duty/correction/gains come directly from the shared IMU
 Strafe panel, and its turn duty/gains/tolerances/timeout come directly from the
 shared IMU Turn panel. Its mode-specific durations, clockwise angle, other
-motion duties, and optional final reverse remain `0` until configured. Its
+motion duties, optional final reverse, and initial lift distance remain `0`
+until configured. Its
 pause and delay stages default to `1000 ms`, and
 both limit-search speeds default to `2000` driver microsteps per second. The
 shared servo defaults are claw 1 open/closed `23/110`, claw 2 `40/100`, claw 3
@@ -245,7 +256,9 @@ commanded closed and their PWM outputs remain enabled.
 
 The `Final competition` panel runs Autonomous Solar, all three interleaved
 Habitat pickup/placement profiles, Tower Pieces, and PegFinder as one mode.
-Solar hands Habitat a forward front-line follow. Each Habitat pickup profile
+It assumes the slider is initially up, funnel closed, and Solar Hook
+down/closed. Solar opens the hook and funnel before handing Habitat a forward
+front-line follow. Each Habitat pickup profile
 uses its adjustable LSS2/LSS3 start-ignore window. Placement profile 3 must be
 configured to reacquire the rear line; after that search completes, Tower
 Pieces begins its backward line follow and applies its own adjustable LSS

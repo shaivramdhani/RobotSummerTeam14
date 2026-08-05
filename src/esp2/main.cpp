@@ -230,7 +230,9 @@ constexpr robot::SolarPanelContactConfig kSolarPanelContactConfig{
     SOLAR_POST_CONTACT_FORWARD_DUTY,
     0.0F,  // TODO(team): tune the front-line strafe duty in telemetry.
     0U,    // TODO(team): tune the forward PID duration in telemetry.
-    0.0F}; // TODO(team): tune the forward PID duty in telemetry.
+    0.0F,  // TODO(team): tune the forward PID duty in telemetry.
+    0.0F,  // TODO(team): calibrate signed funnel-open duty in telemetry.
+    0U};   // TODO(team): calibrate funnel-open duration in telemetry.
 
 static_assert(IR_BEACON_RELEASE_THRESHOLD_1KHZ <=
                   IR_BEACON_DETECT_THRESHOLD_1KHZ,
@@ -887,6 +889,8 @@ struct ClawServoSettings {
 };
 
 struct SolarHookServoSettings {
+  // Competition staging assumes the hook is physically down/closed. Outputs
+  // still boot disabled; Solar Start explicitly commands closed before motion.
   int open_angle_deg{0};
   int closed_angle_deg{148};
 };
@@ -1361,6 +1365,9 @@ struct RuntimeContext {
   robot::TowerPiecesConfig tower_pieces_config{};
   robot::TowerPiecesAutonomy tower_pieces{};
   robot::TowerPiecesUpdate last_tower_pieces_update{};
+  std::int64_t tower_pieces_initial_lift_target_steps{0};
+  bool tower_pieces_initial_lift_active{false};
+  bool tower_pieces_initial_lift_complete{false};
   robot::PegFinderConfig peg_finder_config{};
   robot::PegFinderAutonomy peg_finder{};
   robot::TimeTrialConfig time_trial_config{};
@@ -1492,6 +1499,10 @@ bool solarIrAcquisitionRequested(const RuntimeContext& context) {
              robot::SolarPanelAutonomyState::WaitForStart &&
          context.autonomous_state !=
              robot::SolarPanelAutonomyState::FrontLineFollowComplete &&
+         context.autonomous_state !=
+             robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel &&
+         context.autonomous_state !=
+             robot::SolarPanelAutonomyState::Complete &&
          context.autonomous_state !=
              robot::SolarPanelAutonomyState::SolarSearchFault;
 }
@@ -1753,6 +1764,10 @@ void resetTowerPieces(RuntimeContext& context,
     g_runtime.stepper->stop();
   }
   robot::resetTowerPiecesAutonomy(context.tower_pieces, now_ms);
+  context.last_tower_pieces_update = {};
+  context.tower_pieces_initial_lift_target_steps = 0;
+  context.tower_pieces_initial_lift_active = false;
+  context.tower_pieces_initial_lift_complete = false;
   context.tower_pieces_start_requested = false;
   robot::resetImuTurnController(context.imu_turn_state);
   context.last_imu_turn_update = {};
@@ -1994,6 +2009,31 @@ bool sendStoppedSolarHookCommand(RearCommandLink& rear_link) {
   command.enabled = false;
   command.angle_deg = 0U;
   return rear_link.send(command);
+}
+
+bool solarHookSettingsValid(const SolarHookServoSettings& settings) {
+  return settings.open_angle_deg >= 0 &&
+         settings.open_angle_deg <= 180 &&
+         settings.closed_angle_deg >= 0 &&
+         settings.closed_angle_deg <= 180;
+}
+
+bool sendSolarHookPosition(RuntimeContext& context,
+                           RearCommandLink& rear_link,
+                           const bool open) {
+  if (!solarHookSettingsValid(context.solar_hook_servo_settings)) {
+    return false;
+  }
+  robot::SolarHookCommand command{};
+  command.enabled = true;
+  command.angle_deg = static_cast<std::uint8_t>(
+      open ? context.solar_hook_servo_settings.open_angle_deg
+           : context.solar_hook_servo_settings.closed_angle_deg);
+  if (!rear_link.send(command)) {
+    return false;
+  }
+  context.solar_hook_commanded_open = open;
+  return true;
 }
 
 bool disableMotionActuators(RuntimeContext& context,
@@ -2341,7 +2381,17 @@ bool towerPiecesStartRequirementsMet(
     const ClawServoBank& claws,
     const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
-    const RuntimeContext& context) {
+    const RuntimeContext& context,
+    const bool require_initial_lift_headroom = true) {
+  const std::int64_t current_stepper_position = stepper.positionSteps();
+  const std::int64_t maximum_stepper_position =
+      stepper.maximumPositionSteps();
+  const bool initial_lift_has_headroom =
+      current_stepper_position >= 0 && maximum_stepper_position > 0 &&
+      current_stepper_position <= maximum_stepper_position &&
+      static_cast<std::uint64_t>(
+          maximum_stepper_position - current_stepper_position) >=
+          context.tower_pieces_config.initial_stepper_lift_steps;
   return rearLineStartRequirementsMet(front_left, front_right, rear_link,
                                       now_ms, context) &&
          rear_link.latestRearLineSnapshot().side_configured &&
@@ -2352,6 +2402,8 @@ bool towerPiecesStartRequirementsMet(
          gpioAssigned(robot::esp2::kPins.limit_switch_stepper_bottom) &&
          gpioAssigned(robot::esp2::kPins.limit_switch_stepper_top) &&
          stepper.maximumPositionSteps() > 0 &&
+         (!require_initial_lift_headroom ||
+          (!stepper.upperLimitActive() && initial_lift_has_headroom)) &&
          !(stepper.lowerLimitActive() && stepper.upperLimitActive()) &&
          imuReadyForAutonomousMotion(context) &&
          imuHeadingHoldRuntimeConfigValid(
@@ -2556,7 +2608,16 @@ bool solarPanelStartRequirementsMet(
          autonomousStrafeDutyValid(
              context,
              context.solar_contact_config
-                 .line_reacquire_strafe_duty);
+                 .line_reacquire_strafe_duty) &&
+         solarHookSettingsValid(context.solar_hook_servo_settings) &&
+         rear_link.latestStatus().solar_hook_configured &&
+         rear_link.latestStatus().funnel_configured &&
+         std::isfinite(context.solar_contact_config.funnel_open_duty) &&
+         std::fabs(context.solar_contact_config.funnel_open_duty) > 0.0F &&
+         std::fabs(context.solar_contact_config.funnel_open_duty) <=
+             funnelMotionDutyCap() &&
+         context.solar_contact_config.funnel_open_duration_ms <=
+             kMaxTimedTestDurationMs;
 }
 
 bool timeTrialStartRequirementsMet(
@@ -2598,7 +2659,8 @@ bool finalCompetitionStartRequirementsMet(
              habitat_piece_limit, claws, stepper, now_ms, context) &&
          final_habitat_return_uses_rear &&
          towerPiecesStartRequirementsMet(front_left, front_right, rear_link,
-                                         claws, stepper, now_ms, context) &&
+                                         claws, stepper, now_ms, context,
+                                         false) &&
          pegFinderStartRequirementsMet(front_left, front_right, rear_link,
                                        claws, funnel_limit, now_ms, context);
 }
@@ -3878,12 +3940,28 @@ void runHabitatPieces(
       return;
     }
     robot::startHabitatPiecesAutonomy(context.habitat_pieces, now_ms);
+    if (!stepper.lowerLimitActive()) {
+      const bool slide_command_accepted =
+          stepper.setLimitSearchSpeed(
+              context.habitat_pieces_config
+                  .slide_down_speed_steps_per_second) &&
+          stepper.moveToLowerLimit();
+      if (!slide_command_accepted) {
+        enterHabitatPiecesFault(
+            context, front_left, front_right, rear_link,
+            robot::HabitatPiecesStopReason::StepperCommandFailed,
+            robot::FaultCode::InvalidCommand,
+            "Habitat Pieces start rejected: concurrent slide-down command failed",
+            robot::EventSource::Motor, now_ms);
+        return;
+      }
+    }
     robot::startLineFollower(context.follower_state, now_ms);
     context.last_update = {};
     clearFault(context);
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
-             "Habitat Pieces front line follow started; LSS2/LSS3 HIGH-ignore window active");
+             "Habitat Pieces front line follow and concurrent slide lowering started; LSS2/LSS3 HIGH-ignore window active");
   }
 
   if (context.habitat_pieces.state ==
@@ -4023,6 +4101,8 @@ void runHabitatPieces(
 
   const robot::HabitatPiecesState previous_state =
       context.habitat_pieces.state;
+  const bool slide_down_was_complete =
+      context.habitat_pieces.slide_down_complete;
   const bool lift_state =
       previous_state == robot::HabitatPiecesState::LiftStartDelay ||
       previous_state == robot::HabitatPiecesState::ReverseAfterPickup ||
@@ -4034,7 +4114,8 @@ void runHabitatPieces(
       stepper.positionSteps() ==
           context.habitat_pieces_lift_target_steps &&
       !stepper.isBusy();
-  if (previous_state == robot::HabitatPiecesState::LowerSlide &&
+  if (context.habitat_pieces.slide_down_started &&
+      !context.habitat_pieces.slide_down_complete &&
       !stepper.lowerLimitActive() &&
       (stepper.motionState() ==
            robot::esp2::StepperMotionState::LimitSearchFailed ||
@@ -4106,25 +4187,15 @@ void runHabitatPieces(
   const robot::HabitatPiecesUpdate& habitat_update =
       context.last_habitat_pieces_update;
 
+  if (!slide_down_was_complete &&
+      context.habitat_pieces.slide_down_complete) {
+    stepper.stop();
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::Motor,
+             "Habitat Pieces concurrent slide lowering reached bottom limit");
+  }
+
   if (habitat_update.state != previous_state) {
-    if (habitat_update.state == robot::HabitatPiecesState::LowerSlide) {
-      const bool accepted = stepper.setLimitSearchSpeed(
-                                context.habitat_pieces_config
-                                    .slide_down_speed_steps_per_second) &&
-                            stepper.moveToLowerLimit();
-      if (!accepted) {
-        enterHabitatPiecesFault(
-            context, front_left, front_right, rear_link,
-            robot::HabitatPiecesStopReason::StepperCommandFailed,
-            robot::FaultCode::InvalidCommand,
-            "Habitat Pieces stopped: slide-down command rejected",
-            robot::EventSource::Motor, now_ms);
-        return;
-      }
-    } else if (previous_state ==
-               robot::HabitatPiecesState::LowerSlide) {
-      stepper.stop();
-    }
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
              robot::habitatPiecesStateName(habitat_update.state));
@@ -5122,6 +5193,7 @@ void enterTowerPiecesFault(
   stopAutonomousImuStrafe(context);
   stopAutonomousImuTurn(context);
   stepper.stop();
+  context.tower_pieces_initial_lift_active = false;
   (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
                                    rear_link, now_ms);
   robot::failTowerPiecesAutonomy(context.tower_pieces, reason, now_ms);
@@ -5233,6 +5305,27 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
             robot::EventSource::System);
         return;
       }
+      const std::int64_t initial_lift_target_steps =
+          stepper.positionSteps() +
+          static_cast<std::int64_t>(
+              context.tower_pieces_config.initial_stepper_lift_steps);
+      if (!stepper.setSpeed(
+              context.tower_pieces_config
+                  .stepper_up_speed_steps_per_second) ||
+          !stepper.jogSteps(static_cast<std::int64_t>(
+              context.tower_pieces_config.initial_stepper_lift_steps))) {
+        enterTowerPiecesFault(
+            context, front_left, front_right, rear_link, stepper, now_ms,
+            robot::TowerPiecesFaultReason::StepperCommandFailed,
+            robot::FaultCode::InvalidCommand,
+            "tower pieces start rejected: initial concurrent stepper lift command failed",
+            robot::EventSource::Motor);
+        return;
+      }
+      context.tower_pieces_initial_lift_target_steps =
+          initial_lift_target_steps;
+      context.tower_pieces_initial_lift_active = true;
+      context.tower_pieces_initial_lift_complete = false;
       robot::startTowerPiecesAutonomy(
           context.tower_pieces,
           rear_link.latestRearLineSnapshot().side_electrical_high, now_ms);
@@ -5243,7 +5336,7 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       clearFault(context);
       logEvent(context, now_ms, robot::EventSeverity::Info,
                robot::EventSource::Line,
-               "tower pieces reverse line follow started");
+               "tower pieces reverse line follow and concurrent stepper lift started");
       return;
     }
 
@@ -5398,6 +5491,24 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       robot::TowerPiecesState::MoveStepperBottom;
   const bool moving_stepper_top =
       context.tower_pieces.state == robot::TowerPiecesState::MoveStepperTop;
+  if (context.tower_pieces_initial_lift_active && !stepper.isBusy()) {
+    if (stepper.positionSteps() ==
+        context.tower_pieces_initial_lift_target_steps) {
+      context.tower_pieces_initial_lift_active = false;
+      context.tower_pieces_initial_lift_complete = true;
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Motor,
+               "tower pieces initial concurrent stepper lift complete");
+    } else {
+      enterTowerPiecesFault(
+          context, front_left, front_right, rear_link, stepper, now_ms,
+          robot::TowerPiecesFaultReason::StepperCommandFailed,
+          robot::FaultCode::InvalidCommand,
+          "tower pieces stopped: initial concurrent stepper lift stopped before its target",
+          robot::EventSource::Motor);
+      return;
+    }
+  }
   if ((moving_stepper_bottom || moving_stepper_top) &&
       stepper.motionState() ==
           robot::esp2::StepperMotionState::LimitSearchFailed) {
@@ -5436,7 +5547,8 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
       context.tower_pieces.state ==
               robot::TowerPiecesState::RotateClockwise &&
           context.imu_turn_state.state ==
-              robot::ImuTurnState::Complete};
+              robot::ImuTurnState::Complete,
+      context.tower_pieces_initial_lift_complete};
   const robot::TowerPiecesUpdate tower_update =
       robot::updateTowerPiecesAutonomy(context.tower_pieces, inputs,
                                        context.tower_pieces_config, now_ms);
@@ -6402,7 +6514,7 @@ void enterSolarFrontLineFollowComplete(RuntimeContext& context,
   clearFault(context);
   logEvent(context, now_ms, robot::EventSeverity::Info,
            robot::EventSource::Line,
-           "solar run complete: forward front-line follow complete");
+           "solar forward front-line follow complete; mechanism opening next");
 }
 
 void enterSolarPanelSearchFault(
@@ -6416,7 +6528,8 @@ void enterSolarPanelSearchFault(
   enterSolarPanelAutonomyState(
       context, robot::SolarPanelAutonomyState::SolarSearchFault, now_ms,
       reason);
-  disableMotionActuators(context, front_left, front_right, rear_link, now_ms);
+  (void)stopAutonomyDriveAndFunnel(
+      context, front_left, front_right, rear_link, now_ms);
   setFault(context, fault_code, message);
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
 }
@@ -6508,8 +6621,17 @@ void runSolarPanelAutonomy(RuntimeContext& context,
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::HardwareNotReady,
             robot::FaultCode::HardwareNotConfigured,
-            "solar start rejected: hardware, front line sensors, or limit switches incomplete",
+            "solar start rejected: hardware, line/limit sensors, hook, funnel, or completion tuning incomplete",
             robot::EventSource::System);
+        return;
+      }
+      if (!sendSolarHookPosition(context, rear_link, false)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::SolarHookCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "solar start rejected: failed to command solar hook down/closed",
+            robot::EventSource::Uart);
         return;
       }
       robot::startLineFollower(context.follower_state, now_ms);
@@ -6521,7 +6643,8 @@ void runSolarPanelAutonomy(RuntimeContext& context,
           context, robot::SolarPanelAutonomyState::LineFollowToSolar,
           now_ms);
       logEvent(context, now_ms, robot::EventSeverity::Info,
-               robot::EventSource::Line, "solar line follow started");
+               robot::EventSource::Line,
+               "solar line follow started with solar hook held down/closed");
       return;
 
     case robot::SolarPanelAutonomyState::LineFollowToSolar: {
@@ -6910,10 +7033,137 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       return;
     }
 
-    case robot::SolarPanelAutonomyState::FrontLineFollowComplete:
+    case robot::SolarPanelAutonomyState::FrontLineFollowComplete: {
+      if (!stopAutonomyDriveAndFunnel(
+              context, front_left, front_right, rear_link, now_ms)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::FunnelCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "solar completion stopped: failed to hold chassis/funnel stopped",
+            robot::EventSource::Uart);
+        return;
+      }
+      if (!rear_link.remoteStatusFresh(
+              now_ms, remoteStatusTimeoutMs(context.config)) ||
+          !rear_link.latestStatus().solar_hook_configured ||
+          !rear_link.latestStatus().funnel_configured) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::HardwareNotReady,
+            robot::FaultCode::HardwareNotConfigured,
+            "solar completion stopped: solar hook or funnel unavailable",
+            robot::EventSource::System);
+        return;
+      }
+      if (!sendSolarHookPosition(context, rear_link, true)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::SolarHookCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "solar completion stopped: failed to raise/open solar hook",
+            robot::EventSource::Uart);
+        return;
+      }
+      enterSolarPanelAutonomyState(
+          context,
+          robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel,
+          now_ms);
+      context.requested_funnel_command = makeTimedMotorCommand(
+          context.solar_contact_config.funnel_open_duty, now_ms,
+          context.config.remoteCommandTimeoutMs);
+      if (!sendFunnelMotorCommand(
+              rear_link, context.requested_funnel_command,
+              context.config, now_ms)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::FunnelCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "solar completion stopped: funnel-open command failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      context.last_command_ms = now_ms;
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Motor,
+               "solar hook raised/open; timed funnel opening started");
+      return;
+    }
+
+    case robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel: {
+      if (!rear_link.remoteStatusFresh(
+              now_ms, remoteStatusTimeoutMs(context.config)) ||
+          !rear_link.latestStatus().solar_hook_configured ||
+          !rear_link.latestStatus().funnel_configured) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar funnel opening stopped: ESP1 status became stale or mechanism hardware unavailable",
+            robot::EventSource::Uart);
+        return;
+      }
+      if (!disableMotionActuators(
+              context, front_left, front_right, rear_link, now_ms)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::RearLinkStale,
+            robot::FaultCode::CommunicationStale,
+            "solar funnel opening stopped: chassis stop command failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      const robot::SolarPanelContactSequenceUpdate sequence_update =
+          robot::updateSolarPanelContactSequence(
+              context.autonomous_state, false, false, false,
+              time_in_state_ms, context.solar_contact_config);
+      if (sequence_update.next_state ==
+          robot::SolarPanelAutonomyState::Complete) {
+        context.requested_funnel_command = robot::disabledMotorCommand();
+        if (!sendStoppedFunnelCommand(
+                rear_link, context.config, now_ms)) {
+          enterSolarPanelSearchFault(
+              context, front_left, front_right, rear_link, now_ms,
+              robot::SolarPanelFaultReason::FunnelCommandFailed,
+              robot::FaultCode::CommunicationStale,
+              "solar completion stopped: funnel stop command failed",
+              robot::EventSource::Uart);
+          return;
+        }
+        enterSolarPanelAutonomyState(
+            context, robot::SolarPanelAutonomyState::Complete, now_ms);
+        clearFault(context);
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::System,
+                 "solar run complete: hook open and funnel opening finished");
+        return;
+      }
+      context.requested_funnel_command = makeTimedMotorCommand(
+          context.solar_contact_config.funnel_open_duty, now_ms,
+          context.config.remoteCommandTimeoutMs);
+      if (!sendFunnelMotorCommand(
+              rear_link, context.requested_funnel_command,
+              context.config, now_ms)) {
+        enterSolarPanelSearchFault(
+            context, front_left, front_right, rear_link, now_ms,
+            robot::SolarPanelFaultReason::FunnelCommandFailed,
+            robot::FaultCode::CommunicationStale,
+            "solar funnel opening stopped: command failed",
+            robot::EventSource::Uart);
+        return;
+      }
+      context.last_command_ms = now_ms;
+      return;
+    }
+
+    case robot::SolarPanelAutonomyState::Complete:
+      (void)stopAutonomyDriveAndFunnel(
+          context, front_left, front_right, rear_link, now_ms);
+      return;
+
     case robot::SolarPanelAutonomyState::SolarSearchFault:
-      disableMotionActuators(context, front_left, front_right, rear_link,
-                             now_ms);
+      (void)stopAutonomyDriveAndFunnel(
+          context, front_left, front_right, rear_link, now_ms);
       return;
   }
 }
@@ -7045,7 +7295,7 @@ void runTimeTrial(RuntimeContext& context,
   robot::TimeTrialInputs inputs{};
   inputs.solar_complete =
       context.autonomous_state ==
-      robot::SolarPanelAutonomyState::FrontLineFollowComplete;
+      robot::SolarPanelAutonomyState::Complete;
   inputs.solar_fault =
       context.autonomous_state ==
       robot::SolarPanelAutonomyState::SolarSearchFault;
@@ -7277,7 +7527,7 @@ void runFinalCompetition(
   robot::FinalCompetitionInputs inputs{};
   inputs.solar_complete =
       context.autonomous_state ==
-      robot::SolarPanelAutonomyState::FrontLineFollowComplete;
+      robot::SolarPanelAutonomyState::Complete;
   inputs.solar_fault =
       context.autonomous_state ==
       robot::SolarPanelAutonomyState::SolarSearchFault;
@@ -7967,6 +8217,17 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.solar_contact_config.front_line_follow_duration_ms;
   snapshot.solar_front_line_follow_duty =
       context.solar_contact_config.front_line_follow_duty;
+  snapshot.solar_funnel_open_duty =
+      context.solar_contact_config.funnel_open_duty;
+  snapshot.solar_funnel_open_duration_ms =
+      context.solar_contact_config.funnel_open_duration_ms;
+  snapshot.solar_opening_hook_and_funnel =
+      context.autonomous_state ==
+      robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel;
+  snapshot.solar_funnel_open_elapsed_ms =
+      snapshot.solar_opening_hook_and_funnel
+          ? snapshot.autonomous_time_in_state_ms
+          : 0U;
   snapshot.solar_post_contact_forward_start_delay_ms =
       context.solar_contact_config.post_contact_forward_start_delay_ms;
   snapshot.solar_line_reacquire_strafe_start_delay_ms =
@@ -8066,6 +8327,8 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.habitat_pieces_config.slide_down_timeout_ms;
   snapshot.habitat_pieces_slide_down_elapsed_ms =
       context.habitat_pieces.slide_down_elapsed_ms;
+  snapshot.habitat_pieces_slide_down_complete =
+      context.habitat_pieces.slide_down_complete;
   snapshot.habitat_pieces_approach_forward_duty =
       context.habitat_pieces_config.approach_forward_duty;
   snapshot.habitat_pieces_approach_timeout_ms =
@@ -8216,8 +8479,7 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
           robot::HabitatPiecesState::ExitDistanceCheck;
   snapshot.habitat_pieces_lowering_slide =
       habitat_pieces_mode_active &&
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::LowerSlide;
+      context.last_habitat_pieces_update.should_lower_slide;
   snapshot.habitat_pieces_approaching_piece =
       habitat_pieces_mode_active &&
       context.habitat_pieces.state ==
@@ -8376,6 +8638,8 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       context.tower_pieces_config.post_winch_open_delay_ms;
   snapshot.tower_pieces_post_claws_open_delay_ms =
       context.tower_pieces_config.post_claws_open_delay_ms;
+  snapshot.tower_pieces_initial_stepper_lift_steps =
+      context.tower_pieces_config.initial_stepper_lift_steps;
   snapshot.tower_pieces_pre_stepper_bottom_delay_ms =
       context.tower_pieces_config.pre_stepper_bottom_delay_ms;
   snapshot.tower_pieces_stepper_down_speed_steps_per_second =
@@ -8428,6 +8692,16 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.tower_pieces_final_reverse_active =
       tower_pieces_mode_active &&
       context.tower_pieces.state == robot::TowerPiecesState::FinalReverse;
+  snapshot.tower_pieces_initial_stepper_lift_active =
+      tower_pieces_mode_active &&
+      context.tower_pieces_initial_lift_active;
+  snapshot.tower_pieces_initial_stepper_lift_complete =
+      tower_pieces_mode_active &&
+      context.tower_pieces_initial_lift_complete;
+  snapshot.tower_pieces_waiting_for_initial_stepper_lift =
+      tower_pieces_mode_active &&
+      context.last_tower_pieces_update
+          .waiting_for_initial_stepper_lift;
   snapshot.tower_pieces_stepper_moving_down =
       tower_pieces_mode_active &&
       context.tower_pieces.state ==
@@ -9032,7 +9306,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Habitat Pieces</h2>
-    <div class="muted">Three pickup profiles run as an ordered cycle: Pickup 1 → Placement 1 → Pickup 2 → Placement 2 → Pickup 3 → Placement 3. Each pickup profile has independent values for the complete pickup route.</div>
+    <div class="muted">Three pickup profiles run as an ordered cycle: Pickup 1 → Placement 1 → Pickup 2 → Placement 2 → Pickup 3 → Placement 3. The robot is staged with the slider up; each pickup starts lowering it immediately, concurrently with the line-follow/search route.</div>
     <div class="kv">
       <span>Configuration</span><span id="habitatConfig" class="mono"></span>
       <span>Start ready</span><span id="habitatReady" class="mono"></span>
@@ -9270,7 +9544,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Autonomous Solar</h2>
-    <div class="muted">Each strafe has an independent translational duty while sharing the IMU yaw-hold gains above. The final strafe stops when either front sensor detects tape, then the front-line PID follows forward at the configured duty and duration.</div>
+    <div class="muted">Stage the robot with the slider up, funnel mechanically closed, and solar hook down/closed. Solar explicitly holds the hook closed at its start. After the final forward front-line follow, it raises the hook and runs the funnel at the signed duty for the configured duration.</div>
     <div class="kv">
       <span>State</span><span id="autoState" class="mono"></span>
       <span>Fault</span><span id="autoFault" class="mono"></span>
@@ -9281,6 +9555,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Thresholds</span><span id="autoThresholds" class="mono"></span>
       <span>Confirm</span><span id="autoConfirm" class="mono"></span>
       <span>Slow mode</span><span id="autoSlow" class="mono"></span>
+      <span>Completion mechanisms</span><span id="autoMechanisms" class="mono"></span>
     </div>
     <div class="two">
       <label>1 kHz detect <input id="solarDetect1" type="number" min="0" max="65535" step="1"></label>
@@ -9310,6 +9585,8 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Front-line reacquire strafe duty <input id="solarLineReacquireDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Forward front-line PID duty <input id="solarFrontLineFollowDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Forward front-line PID duration ms <input id="solarFrontLineFollowDurationMs" type="number" min="1" step="100"></label>
+      <label>Funnel-open signed duty (+ forward / − reverse) <input id="solarFunnelOpenDuty" type="number" min="-1" max="1" step="0.01"></label>
+      <label>Funnel-open duration ms <input id="solarFunnelOpenDurationMs" type="number" min="1" max="30000" step="100"></label>
     </div>
     <div class="row">
       <button class="run" onclick="autoSolarStart()">Start</button>
@@ -9320,7 +9597,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Tower Pieces</h2>
-    <div class="muted">The initial timed strafe and timed alternating shimmy have independent duties while sharing IMU yaw-hold gains. Shimmy starts left or right after an adjustable stopped delay; its first pulse is half that direction's normal duration. Either rear sensor stops the search, followed by another adjustable stopped delay.</div>
+    <div class="muted">The slider begins an adjustable relative lift as soon as Tower Pieces starts and continues concurrently with the route. It uses the stepper-up speed below. The later move-to-bottom step waits for that initial lift to finish. The initial timed strafe and timed alternating shimmy have independent duties while sharing IMU yaw-hold gains.</div>
     <div class="kv">
       <span>State</span><span id="towerState" class="mono"></span>
       <span>Fault</span><span id="towerFault" class="mono"></span>
@@ -9330,6 +9607,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <span>Side-line count</span><span id="towerSideCount" class="mono"></span>
       <span>Crossing gate</span><span id="towerCrossingGate" class="mono"></span>
       <span>Back line detected</span><span id="towerBackLineDetected" class="mono"></span>
+      <span>Initial slide lift</span><span id="towerInitialLift" class="mono"></span>
       <span>Active output</span><span id="towerOutput" class="mono"></span>
       <span>Last command</span><span id="towerCommand" class="mono"></span>
     </div>
@@ -9359,11 +9637,12 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Delay after final backward ms <input id="towerPostFinalReverseDelayMs" type="number" min="1" step="100"></label>
       <label>Delay after winch opens ms <input id="towerPostWinchOpenDelayMs" type="number" min="1" step="100"></label>
       <label>Delay after claws open ms <input id="towerPostClawsOpenDelayMs" type="number" min="1" step="100"></label>
+      <label>Initial concurrent lift (microsteps) <input id="towerInitialLiftSteps" type="number" min="1" step="100"></label>
       <label>Delay before slide moves down ms <input id="towerPreStepperBottomDelayMs" type="number" min="0" step="100"></label>
       <label>Stepper down speed (microsteps/s) <input id="towerStepperDownSpeed" type="number" min="1" max="200000" step="100"></label>
       <label>Delay at bottom ms <input id="towerPostStepperBottomDelayMs" type="number" min="1" step="100"></label>
       <label>Delay after claws close ms <input id="towerPostClawsClosedDelayMs" type="number" min="1" step="100"></label>
-      <label>Stepper up speed (microsteps/s) <input id="towerStepperUpSpeed" type="number" min="1" max="200000" step="100"></label>
+      <label>Stepper up / initial-lift speed (microsteps/s) <input id="towerStepperUpSpeed" type="number" min="1" max="200000" step="100"></label>
     </div>
     <div class="row">
       <button class="run" onclick="towerStart()">Start</button>
@@ -9439,7 +9718,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Final competition</h2>
-    <div class="muted">Runs Autonomous Solar → all three Habitat pickup/placement profiles → Tower Pieces → PegFinder. Habitat placement profile 3 must return to the rear line before Tower Pieces begins its backward line follow.</div>
+    <div class="muted">Runs Autonomous Solar → all three Habitat pickup/placement profiles → Tower Pieces → PegFinder. Stage with the slider up, funnel closed, and solar hook down/closed. Habitat placement profile 3 must return to the rear line before Tower Pieces begins its backward line follow.</div>
     <div class="kv">
       <span>State</span><span id="finalCompetitionState" class="mono"></span>
       <span>Time</span><span id="finalCompetitionTime" class="mono"></span>
@@ -10067,6 +10346,7 @@ function loadTowerControls(j){
   setLfValue('towerPostFinalReverseDelayMs', j.tower_pieces.post_final_reverse_delay_ms);
   setLfValue('towerPostWinchOpenDelayMs', j.tower_pieces.post_winch_open_delay_ms);
   setLfValue('towerPostClawsOpenDelayMs', j.tower_pieces.post_claws_open_delay_ms);
+  setLfValue('towerInitialLiftSteps', j.tower_pieces.initial_stepper_lift_steps);
   setLfValue('towerPreStepperBottomDelayMs', line.pre_stepper_bottom_delay_ms);
   setLfValue('towerStepperDownSpeed', j.tower_pieces.stepper_down_speed_steps_per_second);
   setLfValue('towerPostStepperBottomDelayMs', j.tower_pieces.post_stepper_bottom_delay_ms);
@@ -10101,6 +10381,7 @@ function towerParams(){
   p.set('post-final-reverse-delay-ms', qs('towerPostFinalReverseDelayMs').value);
   p.set('post-winch-open-delay-ms', qs('towerPostWinchOpenDelayMs').value);
   p.set('post-claws-open-delay-ms', qs('towerPostClawsOpenDelayMs').value);
+  p.set('initial-lift-steps', qs('towerInitialLiftSteps').value);
   p.set('pre-stepper-bottom-delay-ms', qs('towerPreStepperBottomDelayMs').value);
   p.set('stepper-down-speed-steps-per-second', qs('towerStepperDownSpeed').value);
   p.set('post-stepper-bottom-delay-ms', qs('towerPostStepperBottomDelayMs').value);
@@ -10496,6 +10777,8 @@ function loadSolarControls(j){
   setLfValue('solarLineReacquireDuty', speeds.front_line_strafe_duty);
   setLfValue('solarFrontLineFollowDuty', speeds.forward_pid_duty);
   setLfValue('solarFrontLineFollowDurationMs', speeds.forward_pid_duration_ms);
+  setLfValue('solarFunnelOpenDuty', a.funnel_open_duty);
+  setLfValue('solarFunnelOpenDurationMs', a.funnel_open_duration_ms);
   solarLoaded = true;
 }
 function solarParams(){
@@ -10528,6 +10811,8 @@ function solarParams(){
   add('line-reacquire-strafe-duty', 'solarLineReacquireDuty');
   add('front-line-follow-duty', 'solarFrontLineFollowDuty');
   add('front-line-follow-duration-ms', 'solarFrontLineFollowDurationMs');
+  add('funnel-open-duty', 'solarFunnelOpenDuty');
+  add('funnel-open-duration-ms', 'solarFunnelOpenDurationMs');
   return p;
 }
 function autoSolarApply(){ return api(`/api/autonomous/solar/config?${solarParams().toString()}`); }
@@ -10727,7 +11012,7 @@ function update(){
     qs('habitatDistanceExit').className =
       habitat.exit_strafe_pulsing ? 'mono good' : 'mono muted';
     qs('habitatSlideDown').textContent =
-      `${habitat.slide_down_elapsed_ms ?? 0} / ${habitat.slide_down_timeout_ms ?? 0} ms at ${habitat.slide_down_speed_steps_per_second ?? 0} steps/s · active=${yn(habitat.lowering_slide)}`;
+      `${habitat.slide_down_elapsed_ms ?? 0} / ${habitat.slide_down_timeout_ms ?? 0} ms at ${habitat.slide_down_speed_steps_per_second ?? 0} steps/s · active=${yn(habitat.lowering_slide)} · bottom reached=${yn(habitat.slide_down_complete)}`;
     qs('habitatSlideDown').className =
       habitat.lowering_slide ? 'mono good' : 'mono muted';
     qs('habitatApproach').textContent =
@@ -10884,6 +11169,14 @@ function update(){
     qs('autoThresholds').textContent = `${a.ir_detection_threshold ?? 0} / ${a.ir_release_threshold ?? 0}`;
     qs('autoConfirm').textContent = `${a.confirmation_progress_ms ?? 0} / ${a.confirmation_time_ms ?? 0} ms detected=${yn(a.beacon_detected)}`;
     qs('autoSlow').textContent = `${yn(a.slow_mode_active)} start=${a.start_base_duty ?? 0} after=${a.slow_after_ms ?? 0} ms slow=${a.slow_base_duty ?? 0}`;
+    const solarHook = j.solar_hook || {};
+    const funnelOpenDuty = Number(a.funnel_open_duty ?? 0);
+    const funnelDirection = funnelOpenDuty < 0
+      ? 'reverse' : (funnelOpenDuty > 0 ? 'forward' : 'unset');
+    const hookOutput = solarHook.outputEnabled
+      ? '' : ' (output disabled; last request/staging)';
+    qs('autoMechanisms').textContent =
+      `hook=${solarHook.commandedOpen ? 'OPEN/UP' : 'CLOSED/DOWN'}${hookOutput} · funnel ${funnelDirection} duty=${funnelOpenDuty.toFixed(3)} · ${a.funnel_open_elapsed_ms ?? 0} / ${a.funnel_open_duration_ms ?? 0} ms · active=${yn(a.opening_hook_and_funnel)}`;
     const limits = j.solarLimitSwitches || a.limit_switches || {};
     const backRightHigh = limits.backRightHigh ?? limits.back_right_high;
     const backRightHit = limits.backRightHit ?? limits.back_right_hit;
@@ -10914,7 +11207,11 @@ function update(){
       `ignore=${yn(towerLine.side_line_ignore_active)} armed=${yn(towerLine.side_line_armed)} accepted=${yn(towerLine.detection_accepted)} rejected=${yn(towerLine.detection_rejected)} count=${towerLine.crossing_count ?? 0} rejectedTotal=${towerLine.rejected_detection_count ?? 0}`;
     qs('towerBackLineDetected').textContent = yn(tower.back_line_detected);
     qs('towerBackLineDetected').className = tower.back_line_detected ? 'mono good' : 'mono';
-    qs('towerOutput').textContent = tower.final_reverse_active ? 'final backward' : (tower.stepper_moving_down ? 'stepper down' : (tower.stepper_moving_up ? 'stepper up' : (tower.line_following ? 'line following' : (tower.strafing_right ? 'strafe right' : (tower.rotating_clockwise ? 'clockwise' : (tower.driving_backward ? 'backward' : (tower.shimmying_left ? 'shimmy left' : (tower.shimmying_right ? 'shimmy right' : 'stopped'))))))));
+    qs('towerInitialLift').textContent = tower.initial_stepper_lift_active
+      ? `lifting +${tower.initial_stepper_lift_steps ?? 0} microsteps`
+      : (tower.initial_stepper_lift_complete ? 'complete' : 'not started');
+    qs('towerInitialLift').className = tower.initial_stepper_lift_complete ? 'mono good' : 'mono';
+    qs('towerOutput').textContent = tower.final_reverse_active ? 'final backward' : (tower.stepper_moving_down ? 'stepper down' : (tower.stepper_moving_up ? 'stepper up' : (tower.initial_stepper_lift_active ? 'initial stepper lift + route' : (tower.line_following ? 'line following' : (tower.strafing_right ? 'strafe right' : (tower.rotating_clockwise ? 'clockwise' : (tower.driving_backward ? 'backward' : (tower.shimmying_left ? 'shimmy left' : (tower.shimmying_right ? 'shimmy right' : 'stopped')))))))));
     const pegFinder = j.peg_finder || {};
     qs('pegFinderState').textContent = pegFinder.state || 'WAIT_FOR_START';
     qs('pegFinderFault').textContent = pegFinder.fault_reason || 'NONE';
@@ -12285,6 +12582,20 @@ void handleAutonomousSolarConfig() {
     sendErrorJson(400, "malformed front-line-follow-duty");
     return;
   }
+  if (g_server.hasArg("funnel-open-duty") &&
+      !argFloat("funnel-open-duty", next_contact.funnel_open_duty,
+                next_contact.funnel_open_duty, true)) {
+    sendErrorJson(400, "malformed funnel-open-duty");
+    return;
+  }
+  if (g_server.hasArg("funnel-open-duration-ms")) {
+    if (!argUnsigned("funnel-open-duration-ms", milliseconds_value,
+                     next_contact.funnel_open_duration_ms, true)) {
+      sendErrorJson(400, "malformed funnel-open-duration-ms");
+      return;
+    }
+    next_contact.funnel_open_duration_ms = milliseconds_value;
+  }
   if (g_server.hasArg("strafe-delay-ms")) {
     if (!argUnsigned("strafe-delay-ms", milliseconds_value,
                      next_contact.strafe_start_delay_ms, true)) {
@@ -12382,9 +12693,13 @@ void handleAutonomousSolarConfig() {
       !openLoopMotionDutyValid(
           context, next_contact.retry_strafe_right_duty) ||
       !autonomousStrafeDutyValid(
-          context, next_contact.line_reacquire_strafe_duty)) {
+          context, next_contact.line_reacquire_strafe_duty) ||
+      std::fabs(next_contact.funnel_open_duty) >
+          funnelMotionDutyCap() ||
+      next_contact.funnel_open_duration_ms >
+          kMaxTimedTestDurationMs) {
     sendErrorJson(409,
-                  "solar config requires release <= detect, alpha [0,1), contact timeouts > 0, duties [0,1]");
+                  "solar config requires release <= detect, alpha [0,1), contact timeouts > 0, route duties within their caps, and a nonzero signed funnel-open duty/duration within the funnel cap and 30000 ms");
     return;
   }
 
@@ -12634,6 +12949,13 @@ void handleTowerPiecesConfig() {
     sendErrorJson(400, "malformed post-claws-open-delay-ms");
     return;
   }
+  if (g_server.hasArg("initial-lift-steps") &&
+      !argUnsigned(
+          "initial-lift-steps", next.initial_stepper_lift_steps,
+          context.tower_pieces_config.initial_stepper_lift_steps, true)) {
+    sendErrorJson(400, "malformed initial-lift-steps");
+    return;
+  }
   if (g_server.hasArg("stepper-down-speed-steps-per-second") &&
       !argUnsigned(
           "stepper-down-speed-steps-per-second",
@@ -12691,10 +13013,13 @@ void handleTowerPiecesConfig() {
       !autonomousStrafeDutyValid(context, next.strafe_right_duty) ||
       !autonomousStrafeDutyValid(context, next.shimmy_duty) ||
       next.pre_shimmy_delay_ms > kMaxTimedTestDurationMs ||
-      next.post_shimmy_delay_ms > kMaxTimedTestDurationMs) {
+      next.post_shimmy_delay_ms > kMaxTimedTestDurationMs ||
+      static_cast<std::uint64_t>(next.initial_stepper_lift_steps) >
+          static_cast<std::uint64_t>(
+              g_runtime.stepper->maximumPositionSteps())) {
     sendErrorJson(
         409,
-        "tower pieces config requires a valid shimmy direction, an initial shimmy duration of at least 2 ms, pre/post shimmy delays no longer than 30000 ms, a positive clockwise angle, safe nonzero drive duties/timings, an ignore window shorter than the side-line timeout, positive mechanism delays/speeds, and a valid optional final reverse");
+        "tower pieces config requires a positive initial lift within the configured stepper travel, a valid shimmy direction, an initial shimmy duration of at least 2 ms, pre/post shimmy delays no longer than 30000 ms, a positive clockwise angle, safe nonzero drive duties/timings, an ignore window shorter than the side-line timeout, positive mechanism delays/speeds, and a valid optional final reverse");
     return;
   }
 
@@ -14655,6 +14980,9 @@ void handleConfigSave() {
   g_runtime.preferences->putUInt(
       "tp_co_p", context.tower_pieces_config.post_claws_open_delay_ms);
   g_runtime.preferences->putUInt(
+      "tp_init_stp",
+      context.tower_pieces_config.initial_stepper_lift_steps);
+  g_runtime.preferences->putUInt(
       "tp_pre_dn",
       context.tower_pieces_config.pre_stepper_bottom_delay_ms);
   g_runtime.preferences->putUInt(
@@ -14777,6 +15105,10 @@ void handleConfigSave() {
       "slpidms", context.solar_contact_config.front_line_follow_duration_ms);
   g_runtime.preferences->putFloat(
       "slpidd", context.solar_contact_config.front_line_follow_duty);
+  g_runtime.preferences->putFloat(
+      "sfunopd", context.solar_contact_config.funnel_open_duty);
+  g_runtime.preferences->putUInt(
+      "sfunopms", context.solar_contact_config.funnel_open_duration_ms);
   sendOkJson("config saved");
 }
 
@@ -15050,6 +15382,10 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
   Serial.print(", solar-post-forward-strafe-delay-ms=");
   Serial.print(
       context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
+  Serial.print(", solar-funnel-open-duty=");
+  Serial.print(context.solar_contact_config.funnel_open_duty, 4);
+  Serial.print(", solar-funnel-open-duration-ms=");
+  Serial.print(context.solar_contact_config.funnel_open_duration_ms);
   if (rear_link.statusAvailable()) {
     const robot::Esp1StatusReport& esp1 = rear_link.latestStatus();
     Serial.print(", solar-limit-configured=");
@@ -16644,6 +16980,10 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       "tp_co_p",
       preferences.getUInt(
           "pf_co_p", context.tower_pieces_config.post_claws_open_delay_ms));
+  context.tower_pieces_config.initial_stepper_lift_steps =
+      preferences.getUInt(
+          "tp_init_stp",
+          context.tower_pieces_config.initial_stepper_lift_steps);
   context.tower_pieces_config.pre_stepper_bottom_delay_ms =
       preferences.getUInt(
           "tp_pre_dn",
@@ -16816,6 +17156,13 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
   context.solar_contact_config.front_line_follow_duty =
       preferences.getFloat(
           "slpidd", context.solar_contact_config.front_line_follow_duty);
+  context.solar_contact_config.funnel_open_duty =
+      preferences.getFloat(
+          "sfunopd", context.solar_contact_config.funnel_open_duty);
+  context.solar_contact_config.funnel_open_duration_ms =
+      preferences.getUInt(
+          "sfunopms",
+          context.solar_contact_config.funnel_open_duration_ms);
   context.solar_hook_servo_settings.open_angle_deg =
       preferences.getInt(
           "shopen",
@@ -16910,7 +17257,8 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
       !robot::solarPanelAutonomyConfigValid(
           activeSolarPanelConfig(context, kIrBeaconFrequency10Khz)) ||
       !solarSpeedConfigValid(context.solar_speed_config) ||
-      !robot::solarPanelContactConfigValid(context.solar_contact_config)) {
+      !robot::solarPanelContactRouteConfigValid(
+          context.solar_contact_config)) {
     context.solar_config = kSolarPanelAutonomyConfig;
     context.solar_thresholds = {};
     context.solar_speed_config = {};
