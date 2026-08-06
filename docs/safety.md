@@ -128,12 +128,6 @@ disabled and line following refuses to start.
   relative lift that exceeds the remaining configured stepper travel. The
   finite jog runs concurrently with the chassis, faults if it stops before its
   tracked target, and must complete before the later bottom-limit search starts.
-  In Time Trial and Final Competition, the later top-limit search overlaps only
-  with PegFinder chassis/funnel alignment after the Tower claws have received
-  their full settling delay. The transition owner monitors the bounded limit
-  search, commands the winch closed only with the debounced top limit active,
-  blocks the first PegFinder claw selection until that command is accepted, and
-  faults if the top interlock is lost before the final funnel reverse.
   PegFinder shake remains disabled while any shake field is only partially
   configured; when enabled, both directional pulses and the stopped post-shake
   delay are duration-bounded.

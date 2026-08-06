@@ -264,14 +264,8 @@ shared servo angles. Its only separate settings are the delay after solar, an
 optional timed right strafe before Tower Pieces, and the delay after Tower
 Pieces. The transition strafe uses the shared IMU Strafe tuning. These
 transition values default to `0`; a `0 ms` strafe skips
-that motion. Once Tower's claws have been commanded closed and the configured
-settling delay has elapsed, the stepper starts its top-limit search and the
-combined mode may begin PegFinder's turn and funnel alignment concurrently.
-PegFinder waits after alignment if necessary: it cannot open the first claw
-until the live top limit is active and the winch-close command has been
-accepted. The top interlock remains mandatory before the final funnel reverse.
-The optional post-Tower Time Trial delay is still honored while the stepper
-continues upward.
+that motion. At the Tower Pieces-to-PegFinder handoff, the claws and winch are
+commanded closed and their PWM outputs remain enabled.
 
 The `Final competition` panel runs Autonomous Solar, all three interleaved
 Habitat pickup/placement profiles, Tower Pieces, and PegFinder as one mode.
@@ -282,11 +276,7 @@ Habitat and Tower. Each Habitat pickup profile
 uses its adjustable LSS2/LSS3 start-ignore window. Placement profile 3 must be
 configured to reacquire the rear line; after that search completes, Tower
 Pieces begins its backward line follow and applies its own adjustable LSS
-ignore window. After Tower closes and settles all three claws, Final
-Competition starts the stepper top search and PegFinder concurrently. A failed
-or prematurely stopped top search, conflicting stepper limits, or loss of the
-top interlock stops the combined mission. Standalone Tower Pieces still waits
-for the top limit and closes the winch before reporting complete.
+ignore window. The final mode then hands Tower completion to PegFinder.
 
 ## Upload
 

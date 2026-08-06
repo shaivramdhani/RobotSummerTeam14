@@ -110,8 +110,7 @@ TimeTrialUpdate updateTimeTrialAutonomy(
     case TimeTrialState::TowerPieces:
       if (inputs.tower_pieces_fault) {
         failTimeTrialAutonomy(autonomy, now_ms);
-      } else if (inputs.tower_pieces_ready_for_peg_finder ||
-                 inputs.tower_pieces_complete) {
+      } else if (inputs.tower_pieces_complete) {
         enterState(autonomy, TimeTrialState::PostTowerDelay, now_ms);
       }
       break;

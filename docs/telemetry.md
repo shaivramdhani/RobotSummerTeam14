@@ -725,13 +725,6 @@ detects tape. Its initial direction and stopped delays before/after the search
 are adjustable. The first pulse is half-duration; its initial-strafe and
 shimmy duties remain independently adjustable.
 
-During a combined Tower-to-PegFinder overlap, `tower_pieces_state` remains
-`MOVE_STEPPER_TOP` until the top limit causes the winch-close command, then
-advances through `WINCH_CLOSED` to `COMPLETE` while PegFinder is already active.
-If funnel alignment finishes first, `peg_finder_state` reports
-`WAIT_FOR_TOWER_HANDOFF` and all chassis/funnel outputs remain stopped until the
-top/winch interlock is satisfied.
-
 Tower Pieces also exposes the initial timed-strafe duty, right-sensor crossing
 cooldown and off-line re-arm time, and the delay before the slide moves down.
 `tower_line_control` reports whether the crossing detector is armed, the

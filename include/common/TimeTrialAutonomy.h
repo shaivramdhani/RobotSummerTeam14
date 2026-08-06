@@ -29,7 +29,6 @@ struct TimeTrialInputs {
   bool solar_complete{false};
   bool solar_fault{false};
   bool tower_pieces_complete{false};
-  bool tower_pieces_ready_for_peg_finder{false};
   bool tower_pieces_fault{false};
   bool peg_finder_complete{false};
   bool peg_finder_fault{false};

@@ -22,8 +22,6 @@ const char* pegFinderStateName(const PegFinderState state) {
       return "FUNNEL_FORWARD";
     case PegFinderState::PostFunnelLimitDelay:
       return "POST_FUNNEL_LIMIT_DELAY";
-    case PegFinderState::WaitForTowerHandoff:
-      return "WAIT_FOR_TOWER_HANDOFF";
     case PegFinderState::OpenClaw1:
       return "OPEN_FIRST_CLAW";
     case PegFinderState::PostClaw1OpenDelay:
@@ -86,14 +84,6 @@ const char* pegFinderFaultReasonName(const PegFinderFaultReason reason) {
       return "IMU_TURN_FAILED";
     case PegFinderFaultReason::ImuTurnTimeout:
       return "IMU_TURN_TIMEOUT";
-    case PegFinderFaultReason::StepperCommandFailed:
-      return "STEPPER_COMMAND_FAILED";
-    case PegFinderFaultReason::StepperLimitSearchFailed:
-      return "STEPPER_LIMIT_SEARCH_FAILED";
-    case PegFinderFaultReason::StepperTopInterlockLost:
-      return "STEPPER_TOP_INTERLOCK_LOST";
-    case PegFinderFaultReason::ConflictingLimitSwitches:
-      return "CONFLICTING_LIMIT_SWITCHES";
   }
   return "NONE";
 }
@@ -241,14 +231,6 @@ PegFinderUpdate updatePegFinderAutonomy(PegFinderAutonomy& autonomy,
       break;
     case PegFinderState::PostFunnelLimitDelay:
       if (elapsed_ms >= config.post_funnel_limit_delay_ms) {
-        autonomy.state = inputs.tower_handoff_complete
-                             ? PegFinderState::OpenClaw1
-                             : PegFinderState::WaitForTowerHandoff;
-        autonomy.state_entered_at_ms = now_ms;
-      }
-      break;
-    case PegFinderState::WaitForTowerHandoff:
-      if (inputs.tower_handoff_complete) {
         autonomy.state = PegFinderState::OpenClaw1;
         autonomy.state_entered_at_ms = now_ms;
       }

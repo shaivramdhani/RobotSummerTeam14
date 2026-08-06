@@ -373,24 +373,15 @@ For Stage 3, keep the wheels raised for initial tests:
    ownership handoff and Tower begins backward rear-line following. Hold LSS
    HIGH through Tower's ignore window; verify it must return LOW before a new
    HIGH can count.
-8. At the Tower-to-PegFinder handoff, confirm the claw-close settling delay
-   completes before both the upper-limit search and PegFinder turn begin.
-   Confirm PegFinder can turn, translate, and align the funnel while the
-   stepper is still rising. Withhold the top limit and confirm PegFinder waits
-   after funnel alignment without opening a claw, closing the winch, or
-   reversing the funnel. Activate the top limit and confirm the winch closes
-   before the first claw selection. Release the top limit or force the search
-   to fail in separate runs and confirm Final Competition faults with chassis,
-   funnel, and stepper stopped.
-9. In PegFinder, confirm a left pulse followed by a right pulse occurs after
+8. In PegFinder, confirm a left pulse followed by a right pulse occurs after
    each of the three claw selections, with stopped transitions and the configured
    duty and durations. For every selection, confirm exactly the selected claw
    is open and the other two are closed. Confirm the configured stopped
    post-shake delay completes before the next claw is selected or, after the
    third claw, before the funnel reverses. Confirm all-zero shake values skip
    all shake and post-shake-delay states.
-10. Force one included-mode timeout at a time and confirm Final Competition
+8. Force one included-mode timeout at a time and confirm Final Competition
    enters `FAULT`, stops chassis/funnel/stepper outputs, and does not advance.
-11. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
+9. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
     or the configured return line. Each condition must stop or time out without
     advancing to the next motion phase or profile.

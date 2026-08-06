@@ -141,11 +141,9 @@ robot::PegFinderUpdate updatePegFinderForTest(
     const robot::PegFinderConfig& config,
     const robot::Milliseconds now_ms,
     const bool funnel_limit_active = false,
-    const bool clockwise_turn_complete = false,
-    const bool tower_handoff_complete = true) {
+    const bool clockwise_turn_complete = false) {
   const robot::PegFinderInputs inputs{
-      funnel_limit_active, clockwise_turn_complete,
-      tower_handoff_complete};
+      funnel_limit_active, clockwise_turn_complete};
   return robot::updatePegFinderAutonomy(autonomy, inputs, config, now_ms);
 }
 
@@ -1571,55 +1569,6 @@ void test_final_competition_runs_all_modes_in_order() {
       static_cast<std::uint8_t>(update.state));
 }
 
-void test_time_trial_hands_off_when_tower_top_search_starts() {
-  const robot::TimeTrialConfig config{0U, 0U, 30U};
-  robot::TimeTrialAutonomy autonomy{};
-  autonomy.state = robot::TimeTrialState::TowerPieces;
-  autonomy.state_entered_at_ms = 100U;
-
-  robot::TimeTrialInputs inputs{};
-  inputs.tower_pieces_ready_for_peg_finder = true;
-  robot::TimeTrialUpdate update = robot::updateTimeTrialAutonomy(
-      autonomy, inputs, config, 110U);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::TimeTrialState::PostTowerDelay),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_FALSE(update.should_start_peg_finder);
-
-  inputs = {};
-  update = robot::updateTimeTrialAutonomy(autonomy, inputs, config, 139U);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::TimeTrialState::PostTowerDelay),
-      static_cast<std::uint8_t>(update.state));
-
-  update = robot::updateTimeTrialAutonomy(autonomy, inputs, config, 140U);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::TimeTrialState::PegFinder),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_TRUE(update.should_start_peg_finder);
-}
-
-void test_final_competition_hands_off_when_tower_top_search_starts() {
-  robot::FinalCompetitionAutonomy autonomy{};
-  autonomy.state = robot::FinalCompetitionState::TowerPieces;
-  autonomy.state_entered_at_ms = 100U;
-
-  robot::FinalCompetitionInputs inputs{};
-  robot::FinalCompetitionUpdate update =
-      robot::updateFinalCompetitionAutonomy(autonomy, inputs, 110U);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::FinalCompetitionState::TowerPieces),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_FALSE(update.should_start_peg_finder);
-
-  inputs.tower_ready_for_peg_finder = true;
-  update = robot::updateFinalCompetitionAutonomy(autonomy, inputs, 111U);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::FinalCompetitionState::PegFinder),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_TRUE(update.should_start_peg_finder);
-}
-
 void test_time_trial_propagates_included_mode_faults() {
   const robot::TimeTrialConfig config{};
   robot::TimeTrialAutonomy autonomy{};
@@ -1696,51 +1645,6 @@ void test_peg_finder_config_requires_safe_duties_angle_and_timings() {
   TEST_ASSERT_TRUE(robot::pegFinderConfigValid(config, 0.5F, 0.4F));
   config.shake_duty = 0.6F;
   TEST_ASSERT_FALSE(robot::pegFinderConfigValid(config, 0.5F, 0.4F));
-}
-
-void test_peg_finder_waits_for_tower_handoff_before_opening_a_claw() {
-  const robot::PegFinderConfig config = pegFinderConfig();
-  robot::PegFinderAutonomy autonomy{};
-  autonomy.state = robot::PegFinderState::PostFunnelLimitDelay;
-  autonomy.state_entered_at_ms = 100U;
-
-  robot::PegFinderUpdate update = updatePegFinderForTest(
-      autonomy, config, 116U, true, false, false);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(
-          robot::PegFinderState::WaitForTowerHandoff),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_FALSE(update.should_open_claw_1);
-  TEST_ASSERT_FALSE(update.should_open_claw_2);
-  TEST_ASSERT_FALSE(update.should_open_claw_3);
-
-  update = updatePegFinderForTest(
-      autonomy, config, 117U, true, false, false);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(
-          robot::PegFinderState::WaitForTowerHandoff),
-      static_cast<std::uint8_t>(update.state));
-
-  update = updatePegFinderForTest(
-      autonomy, config, 118U, true, false, true);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::PegFinderState::OpenClaw1),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_TRUE(update.should_open_claw_1);
-}
-
-void test_standalone_peg_finder_skips_tower_handoff_wait() {
-  const robot::PegFinderConfig config = pegFinderConfig();
-  robot::PegFinderAutonomy autonomy{};
-  autonomy.state = robot::PegFinderState::PostFunnelLimitDelay;
-  autonomy.state_entered_at_ms = 100U;
-
-  const robot::PegFinderUpdate update =
-      updatePegFinderForTest(autonomy, config, 116U, true);
-  TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::PegFinderState::OpenClaw1),
-      static_cast<std::uint8_t>(update.state));
-  TEST_ASSERT_TRUE(update.should_open_claw_1);
 }
 
 void test_peg_finder_clockwise_turn_waits_for_imu_completion() {
@@ -6460,17 +6364,11 @@ int main() {
       test_time_trial_config_allows_skipped_or_safe_transition_strafe);
   RUN_TEST(
       test_time_trial_runs_solar_strafe_tower_and_peg_finder_in_order);
-  RUN_TEST(test_time_trial_hands_off_when_tower_top_search_starts);
   RUN_TEST(
       test_time_trial_does_not_handoff_before_solar_is_complete);
   RUN_TEST(test_time_trial_propagates_included_mode_faults);
   RUN_TEST(test_final_competition_runs_all_modes_in_order);
-  RUN_TEST(
-      test_final_competition_hands_off_when_tower_top_search_starts);
   RUN_TEST(test_peg_finder_config_requires_safe_duties_angle_and_timings);
-  RUN_TEST(
-      test_peg_finder_waits_for_tower_handoff_before_opening_a_claw);
-  RUN_TEST(test_standalone_peg_finder_skips_tower_handoff_wait);
   RUN_TEST(test_peg_finder_clockwise_turn_waits_for_imu_completion);
   RUN_TEST(
       test_peg_finder_selects_one_open_claw_in_configured_order_then_reverses_funnel);

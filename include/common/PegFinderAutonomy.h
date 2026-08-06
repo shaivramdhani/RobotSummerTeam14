@@ -33,7 +33,6 @@ enum class PegFinderState : std::uint8_t {
   ShakeLeftAfterClaw3 = 23,
   ShakeRightAfterClaw3 = 24,
   PostShakeAfterClaw3Delay = 25,
-  WaitForTowerHandoff = 26,
 };
 
 enum class PegFinderFaultReason : std::uint8_t {
@@ -47,10 +46,6 @@ enum class PegFinderFaultReason : std::uint8_t {
   ImuUnavailable = 7,
   ImuTurnFailed = 8,
   ImuTurnTimeout = 9,
-  StepperCommandFailed = 10,
-  StepperLimitSearchFailed = 11,
-  StepperTopInterlockLost = 12,
-  ConflictingLimitSwitches = 13,
 };
 
 struct PegFinderConfig {
@@ -81,8 +76,6 @@ struct PegFinderConfig {
 struct PegFinderInputs {
   bool funnel_limit_active{false};
   bool clockwise_turn_complete{false};
-  // Standalone PegFinder has no Tower mechanism handoff to await.
-  bool tower_handoff_complete{true};
 };
 
 struct PegFinderAutonomy {

@@ -103,15 +103,6 @@ motion/search has an adjustable bound; configuration, stale
 communication, sensor, turn, stepper, servo, and timeout failures stop the
 chassis.
 
-The Tower-to-PegFinder transition is an intentional overlap in Time Trial and
-Final Competition. After the Tower claw-close settling delay, Tower starts the
-upper-limit search and hands chassis/funnel ownership to PegFinder. PegFinder
-may turn, translate, and align the funnel while the stepper rises. It waits in
-`WAIT_FOR_TOWER_HANDOFF` before the first claw selection until the debounced top
-limit is active and the winch-close command has been accepted. The live top
-interlock is retained through the final funnel-reverse command. Standalone
-Tower and PegFinder modes retain their independent completion behavior.
-
 Final Competition is staged with the slider up, funnel closed, and Solar Hook
 down/closed. Outputs remain disabled at boot. Solar commands the hook closed
 when its route starts. At the final left line-return strafe it starts the

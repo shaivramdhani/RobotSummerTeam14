@@ -1571,8 +1571,6 @@ struct RuntimeContext {
   bool habitat_placement_start_requested{false};
   bool tower_pieces_start_requested{false};
   bool peg_finder_start_requested{false};
-  bool peg_finder_tower_handoff_active{false};
-  bool peg_finder_tower_handoff_winch_closed{false};
   bool time_trial_start_requested{false};
   bool final_competition_start_requested{false};
   robot::FinalCompetitionStartSwitchState final_competition_start_switch{};
@@ -2011,8 +2009,6 @@ void resetPegFinder(RuntimeContext& context,
                     const robot::Milliseconds now_ms) {
   robot::resetPegFinderAutonomy(context.peg_finder, now_ms);
   context.peg_finder_start_requested = false;
-  context.peg_finder_tower_handoff_active = false;
-  context.peg_finder_tower_handoff_winch_closed = false;
   robot::resetImuTurnController(context.imu_turn_state);
   context.last_imu_turn_update = {};
   robot::cancelImuRecovery(context.imu_turn_recovery);
@@ -6557,10 +6553,6 @@ void enterPegFinderFault(
     const robot::PegFinderFaultReason reason,
     const robot::FaultCode fault_code, const char* message,
     const robot::EventSource source) {
-  if (context.peg_finder_tower_handoff_active &&
-      g_runtime.stepper != nullptr) {
-    g_runtime.stepper->stop();
-  }
   robot::cancelImuRecovery(context.imu_turn_recovery);
   if (robot::imuTurnActive(context.imu_turn_state)) {
     robot::stopImuTurn(context.imu_turn_state);
@@ -6594,163 +6586,12 @@ bool stopPegFinderOutputsOrFault(RuntimeContext& context,
   return false;
 }
 
-void enterPegFinderTowerHandoffFault(
-    RuntimeContext& context, robot::IMotorOutput& front_left,
-    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
-    robot::esp2::StepperAxis& stepper,
-    const robot::Milliseconds now_ms,
-    const robot::TowerPiecesFaultReason tower_reason,
-    const robot::PegFinderFaultReason peg_finder_reason,
-    const robot::FaultCode fault_code, const char* message,
-    const robot::EventSource source) {
-  stepper.stop();
-  robot::failTowerPiecesAutonomy(context.tower_pieces, tower_reason,
-                                 now_ms);
-  enterPegFinderFault(context, front_left, front_right, rear_link, now_ms,
-                      peg_finder_reason, fault_code, message, source);
-}
-
-bool pegFinderTowerHandoffComplete(
-    const RuntimeContext& context,
-    const robot::esp2::StepperAxis& stepper) {
-  return !context.peg_finder_tower_handoff_active ||
-         (context.peg_finder_tower_handoff_winch_closed &&
-          stepper.upperLimitActive());
-}
-
-bool servicePegFinderTowerHandoff(
-    RuntimeContext& context, robot::IMotorOutput& front_left,
-    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
-    ClawServoBank& claws, robot::esp2::StepperAxis& stepper,
-    const robot::Milliseconds now_ms) {
-  if (!context.peg_finder_tower_handoff_active) {
-    return true;
-  }
-
-  if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
-    enterPegFinderTowerHandoffFault(
-        context, front_left, front_right, rear_link, stepper, now_ms,
-        robot::TowerPiecesFaultReason::ConflictingLimitSwitches,
-        robot::PegFinderFaultReason::ConflictingLimitSwitches,
-        robot::FaultCode::LimitSwitchConflict,
-        "PegFinder handoff stopped: bottom and top stepper limits are both active",
-        robot::EventSource::Motor);
-    return false;
-  }
-
-  if (context.peg_finder_tower_handoff_winch_closed) {
-    if (!stepper.upperLimitActive()) {
-      enterPegFinderTowerHandoffFault(
-          context, front_left, front_right, rear_link, stepper, now_ms,
-          robot::TowerPiecesFaultReason::StepperCommandFailed,
-          robot::PegFinderFaultReason::StepperTopInterlockLost,
-          robot::FaultCode::InvalidCommand,
-          "PegFinder handoff stopped: stepper top interlock released after winch close",
-          robot::EventSource::Motor);
-      return false;
-    }
-
-    if (context.tower_pieces.state ==
-        robot::TowerPiecesState::WinchClosed) {
-      const robot::TowerPiecesInputs inputs{
-          false, false, false, stepper.lowerLimitActive(),
-          stepper.upperLimitActive(), false, true};
-      context.last_tower_pieces_update =
-          robot::updateTowerPiecesAutonomy(
-              context.tower_pieces, inputs,
-              context.tower_pieces_config, now_ms);
-    }
-    return true;
-  }
-
-  if (stepper.motionState() ==
-      robot::esp2::StepperMotionState::LimitSearchFailed) {
-    enterPegFinderTowerHandoffFault(
-        context, front_left, front_right, rear_link, stepper, now_ms,
-        robot::TowerPiecesFaultReason::StepperLimitSearchFailed,
-        robot::PegFinderFaultReason::StepperLimitSearchFailed,
-        robot::FaultCode::SearchTimeout,
-        "PegFinder handoff stopped: stepper top limit search failed",
-        robot::EventSource::Motor);
-    return false;
-  }
-  if (!stepper.upperLimitActive() &&
-      stepper.motionState() ==
-          robot::esp2::StepperMotionState::Stopped) {
-    enterPegFinderTowerHandoffFault(
-        context, front_left, front_right, rear_link, stepper, now_ms,
-        robot::TowerPiecesFaultReason::StepperCommandFailed,
-        robot::PegFinderFaultReason::StepperCommandFailed,
-        robot::FaultCode::InvalidCommand,
-        "PegFinder handoff stopped: stepper stopped before the top limit",
-        robot::EventSource::Motor);
-    return false;
-  }
-
-  if (context.tower_pieces.state !=
-          robot::TowerPiecesState::MoveStepperTop &&
-      context.tower_pieces.state !=
-          robot::TowerPiecesState::WinchClosed) {
-    enterPegFinderTowerHandoffFault(
-        context, front_left, front_right, rear_link, stepper, now_ms,
-        robot::TowerPiecesFaultReason::StepperCommandFailed,
-        robot::PegFinderFaultReason::StepperCommandFailed,
-        robot::FaultCode::InvalidCommand,
-        "PegFinder handoff stopped: Tower mechanism state is invalid",
-        robot::EventSource::System);
-    return false;
-  }
-
-  const robot::TowerPiecesState previous_tower_state =
-      context.tower_pieces.state;
-  const robot::TowerPiecesInputs inputs{
-      false, false, false, stepper.lowerLimitActive(),
-      stepper.upperLimitActive(), false, true};
-  context.last_tower_pieces_update =
-      robot::updateTowerPiecesAutonomy(
-          context.tower_pieces, inputs, context.tower_pieces_config,
-          now_ms);
-  if (context.tower_pieces.state == robot::TowerPiecesState::Fault) {
-    enterPegFinderTowerHandoffFault(
-        context, front_left, front_right, rear_link, stepper, now_ms,
-        context.tower_pieces.fault_reason,
-        robot::PegFinderFaultReason::ConflictingLimitSwitches,
-        robot::FaultCode::LimitSwitchConflict,
-        "PegFinder handoff stopped: conflicting stepper limits",
-        robot::EventSource::Motor);
-    return false;
-  }
-
-  if (previous_tower_state == robot::TowerPiecesState::MoveStepperTop &&
-      context.tower_pieces.state ==
-          robot::TowerPiecesState::WinchClosed) {
-    stepper.stop();
-    const ClawServoCommandResult result = claws.command(
-        kWinchServoIndex, ClawServoPositionRequest::Closed);
-    if (result != ClawServoCommandResult::Accepted) {
-      enterPegFinderTowerHandoffFault(
-          context, front_left, front_right, rear_link, stepper, now_ms,
-          robot::TowerPiecesFaultReason::ServoCommandFailed,
-          robot::PegFinderFaultReason::ServoCommandFailed,
-          clawFaultCode(result), clawServoResultReason(result),
-          robot::EventSource::Motor);
-      return false;
-    }
-    context.peg_finder_tower_handoff_winch_closed = true;
-    logEvent(context, now_ms, robot::EventSeverity::Info,
-             robot::EventSource::Motor,
-             "Tower stepper reached top; winch closed while PegFinder continues");
-  }
-  return true;
-}
-
 void runPegFinder(RuntimeContext& context,
                   DualPwmMotorOutput& front_left,
                   DualPwmMotorOutput& front_right,
                   RearCommandLink& rear_link,
                   ClawServoBank& claws,
                   const DigitalActiveHighLimitSwitch& funnel_limit,
-                  robot::esp2::StepperAxis& stepper,
                   const robot::Milliseconds now_ms) {
   switch (context.peg_finder.state) {
     case robot::PegFinderState::WaitForStart: {
@@ -6801,7 +6642,6 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::Forward:
     case robot::PegFinderState::FunnelForward:
     case robot::PegFinderState::PostFunnelLimitDelay:
-    case robot::PegFinderState::WaitForTowerHandoff:
     case robot::PegFinderState::OpenClaw1:
     case robot::PegFinderState::PostClaw1OpenDelay:
     case robot::PegFinderState::ShakeLeftAfterClaw1:
@@ -6894,12 +6734,6 @@ void runPegFinder(RuntimeContext& context,
     return;
   }
 
-  if (!servicePegFinderTowerHandoff(
-          context, front_left, front_right, rear_link, claws, stepper,
-          now_ms)) {
-    return;
-  }
-
   bool clockwise_turn_complete = false;
   if (context.peg_finder.state ==
       robot::PegFinderState::RotateClockwise) {
@@ -6954,8 +6788,7 @@ void runPegFinder(RuntimeContext& context,
 
   const robot::PegFinderState previous_state = context.peg_finder.state;
   const robot::PegFinderInputs inputs{
-      funnel_limit.active(), clockwise_turn_complete,
-      pegFinderTowerHandoffComplete(context, stepper)};
+      funnel_limit.active(), clockwise_turn_complete};
   const robot::PegFinderUpdate update = robot::updatePegFinderAutonomy(
       context.peg_finder, inputs, context.peg_finder_config, now_ms);
   if (update.state == robot::PegFinderState::Fault &&
@@ -6990,7 +6823,6 @@ void runPegFinder(RuntimeContext& context,
       case robot::PegFinderState::Forward:
       case robot::PegFinderState::FunnelForward:
       case robot::PegFinderState::PostFunnelLimitDelay:
-      case robot::PegFinderState::WaitForTowerHandoff:
       case robot::PegFinderState::PostClaw1OpenDelay:
       case robot::PegFinderState::ShakeLeftAfterClaw1:
       case robot::PegFinderState::ShakeRightAfterClaw1:
@@ -7037,10 +6869,6 @@ void runPegFinder(RuntimeContext& context,
       case robot::PegFinderState::PostFunnelLimitDelay:
         message =
             "PegFinder funnel limit pressed; funnel stopped and delay started";
-        break;
-      case robot::PegFinderState::WaitForTowerHandoff:
-        message =
-            "PegFinder funnel aligned; waiting for stepper top and winch close";
         break;
       case robot::PegFinderState::OpenClaw1:
       case robot::PegFinderState::OpenClaw2:
@@ -7150,7 +6978,6 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::PostRotationPause:
     case robot::PegFinderState::PostReversePause:
     case robot::PegFinderState::PostFunnelLimitDelay:
-    case robot::PegFinderState::WaitForTowerHandoff:
     case robot::PegFinderState::OpenClaw1:
     case robot::PegFinderState::PostClaw1OpenDelay:
     case robot::PegFinderState::PostShakeAfterClaw1Delay:
@@ -7179,17 +7006,6 @@ void runPegFinder(RuntimeContext& context,
         return;
       }
       const bool reversing = update.should_run_funnel_reverse;
-      if (reversing &&
-          !pegFinderTowerHandoffComplete(context, stepper)) {
-        enterPegFinderTowerHandoffFault(
-            context, front_left, front_right, rear_link, stepper, now_ms,
-            robot::TowerPiecesFaultReason::StepperCommandFailed,
-            robot::PegFinderFaultReason::StepperTopInterlockLost,
-            robot::FaultCode::InvalidCommand,
-            "PegFinder stopped: funnel close blocked because the stepper top interlock is not active",
-            robot::EventSource::Motor);
-        return;
-      }
       const float duty_magnitude =
           clampFloat(reversing
                          ? context.peg_finder_config.funnel_reverse_duty
@@ -8008,10 +7824,6 @@ void enterTimeTrialFault(RuntimeContext& context,
                          const robot::FaultCode fault_code,
                          const char* message,
                          const robot::EventSource source) {
-  if (context.peg_finder_tower_handoff_active &&
-      g_runtime.stepper != nullptr) {
-    g_runtime.stepper->stop();
-  }
   stopAutonomousImuStrafe(context);
   (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
                                    rear_link, now_ms);
@@ -8117,21 +7929,13 @@ void runTimeTrial(RuntimeContext& context,
   } else if (context.time_trial.state ==
              robot::TimeTrialState::PegFinder) {
     runPegFinder(context, front_left, front_right, rear_link, claws,
-                 funnel_limit, stepper, now_ms);
+                 funnel_limit, now_ms);
   } else if (context.time_trial.state ==
                  robot::TimeTrialState::PostSolarDelay ||
              context.time_trial.state ==
                  robot::TimeTrialState::PostTowerDelay) {
     if (!stopTimeTrialOutputsOrFault(context, front_left, front_right,
                                      rear_link, now_ms)) {
-      return;
-    }
-    if (context.time_trial.state ==
-            robot::TimeTrialState::PostTowerDelay &&
-        !servicePegFinderTowerHandoff(
-            context, front_left, front_right, rear_link, claws, stepper,
-            now_ms)) {
-      robot::failTimeTrialAutonomy(context.time_trial, now_ms);
       return;
     }
   }
@@ -8146,9 +7950,6 @@ void runTimeTrial(RuntimeContext& context,
       robot::SolarPanelAutonomyState::SolarSearchFault;
   inputs.tower_pieces_complete =
       context.tower_pieces.state == robot::TowerPiecesState::Complete;
-  inputs.tower_pieces_ready_for_peg_finder =
-      context.tower_pieces.state ==
-          robot::TowerPiecesState::MoveStepperTop;
   inputs.tower_pieces_fault =
       context.tower_pieces.state == robot::TowerPiecesState::Fault;
   inputs.peg_finder_complete =
@@ -8157,13 +7958,6 @@ void runTimeTrial(RuntimeContext& context,
       context.peg_finder.state == robot::PegFinderState::Fault;
   const robot::TimeTrialUpdate update = robot::updateTimeTrialAutonomy(
       context.time_trial, inputs, context.time_trial_config, now_ms);
-
-  if (previous_state == robot::TimeTrialState::TowerPieces &&
-      update.state == robot::TimeTrialState::PostTowerDelay &&
-      context.tower_pieces.state != robot::TowerPiecesState::Complete) {
-    context.peg_finder_tower_handoff_active = true;
-    context.peg_finder_tower_handoff_winch_closed = false;
-  }
 
   if (update.state == robot::TimeTrialState::Fault) {
     (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
@@ -8183,30 +7977,27 @@ void runTimeTrial(RuntimeContext& context,
              "Time Trial tower pieces started");
   }
   if (update.should_start_peg_finder) {
-    const bool tower_handoff_winch_already_closed =
-        context.peg_finder_tower_handoff_winch_closed;
-    const bool tower_handoff_required =
-        context.peg_finder_tower_handoff_active ||
-        context.tower_pieces.state != robot::TowerPiecesState::Complete;
-    resetPegFinder(context, now_ms);
-    context.peg_finder_tower_handoff_active = tower_handoff_required;
-    context.peg_finder_tower_handoff_winch_closed =
-        tower_handoff_winch_already_closed || !tower_handoff_required;
     const ClawServoCommandResult claws_result =
         claws.commandAll(ClawServoPositionRequest::Closed);
-    if (claws_result != ClawServoCommandResult::Accepted) {
+    const ClawServoCommandResult winch_result =
+        claws.command(kWinchServoIndex, ClawServoPositionRequest::Closed);
+    if (claws_result != ClawServoCommandResult::Accepted ||
+        winch_result != ClawServoCommandResult::Accepted) {
+      const ClawServoCommandResult failed_result =
+          claws_result != ClawServoCommandResult::Accepted
+              ? claws_result
+              : winch_result;
       enterTimeTrialFault(
           context, front_left, front_right, rear_link, now_ms,
-          clawFaultCode(claws_result), clawServoResultReason(claws_result),
+          clawFaultCode(failed_result), clawServoResultReason(failed_result),
           robot::EventSource::Motor);
       return;
     }
+    // Keep the closed servo PWM outputs enabled across this handoff.
     context.peg_finder_start_requested = true;
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
-             context.peg_finder_tower_handoff_active
-                 ? "Time Trial PegFinder started with the Tower top/winch interlock active"
-                 : "Time Trial PegFinder started after Tower completion");
+             "Time Trial PegFinder started with servos held closed");
   }
 
   if (update.state == robot::TimeTrialState::SolarToTowerStrafeRight) {
@@ -8266,8 +8057,7 @@ void runTimeTrial(RuntimeContext& context,
                robot::TimeTrialState::SolarToTowerStrafeRight) {
       message = "Time Trial solar-to-tower right strafe started";
     } else if (update.state == robot::TimeTrialState::PostTowerDelay) {
-      message =
-          "Time Trial Tower claws settled and top search started; PegFinder delay started";
+      message = "Time Trial tower pieces complete; PegFinder delay started";
     } else if (update.state == robot::TimeTrialState::Complete) {
       message = "Time Trial complete";
       clearFault(context);
@@ -8366,7 +8156,7 @@ void runFinalCompetition(
       break;
     case robot::FinalCompetitionState::PegFinder:
       runPegFinder(context, front_left, front_right, rear_link, claws,
-                   funnel_limit, stepper, now_ms);
+                   funnel_limit, now_ms);
       break;
     case robot::FinalCompetitionState::Complete:
       stepper.stop();
@@ -8397,9 +8187,6 @@ void runFinalCompetition(
       context.habitat_cycle.phase == robot::HabitatCyclePhase::Fault;
   inputs.tower_complete =
       context.tower_pieces.state == robot::TowerPiecesState::Complete;
-  inputs.tower_ready_for_peg_finder =
-      context.tower_pieces.state ==
-          robot::TowerPiecesState::MoveStepperTop;
   inputs.tower_fault =
       context.tower_pieces.state == robot::TowerPiecesState::Fault;
   inputs.peg_finder_complete =
@@ -8441,29 +8228,22 @@ void runFinalCompetition(
   }
 
   if (update.should_start_peg_finder) {
-    const bool tower_handoff_winch_already_closed =
-        context.peg_finder_tower_handoff_winch_closed;
-    const bool tower_handoff_required =
-        context.peg_finder_tower_handoff_active ||
-        context.tower_pieces.state != robot::TowerPiecesState::Complete;
-    resetPegFinder(context, now_ms);
-    context.peg_finder_tower_handoff_active = tower_handoff_required;
-    context.peg_finder_tower_handoff_winch_closed =
-        tower_handoff_winch_already_closed || !tower_handoff_required;
     const ClawServoCommandResult claws_result =
         claws.commandAll(ClawServoPositionRequest::Closed);
-    if (claws_result != ClawServoCommandResult::Accepted) {
+    const ClawServoCommandResult winch_result =
+        claws.command(kWinchServoIndex, ClawServoPositionRequest::Closed);
+    if (claws_result != ClawServoCommandResult::Accepted ||
+        winch_result != ClawServoCommandResult::Accepted) {
       enterFinalCompetitionFault(
           context, front_left, front_right, rear_link, stepper, now_ms,
           "Final competition PegFinder handoff failed: servo command rejected");
       return;
     }
+    resetPegFinder(context, now_ms);
     context.peg_finder_start_requested = true;
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
-             context.peg_finder_tower_handoff_active
-                 ? "Final competition Tower claws settled; PegFinder started while the stepper continues toward the top limit"
-                 : "Final competition Tower Pieces complete; PegFinder started");
+             "Final competition Tower Pieces complete; PegFinder started");
     return;
   }
 
@@ -18562,7 +18342,7 @@ void motionControlTask(void* parameters) {
                              rear_link, claws, stepper, now_ms);
     } else if (mode == robot::RobotTestMode::PegFinder) {
       runPegFinder(context, front_left_motor, front_right_motor, rear_link,
-                   claws, peg_finder_funnel_limit, stepper, now_ms);
+                   claws, peg_finder_funnel_limit, now_ms);
     } else if (mode == robot::RobotTestMode::TimeTrial) {
       runTimeTrial(context, line_sensor_reader, front_left_motor,
                    front_right_motor, rear_link, claws,

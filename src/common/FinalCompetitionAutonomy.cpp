@@ -79,8 +79,7 @@ FinalCompetitionUpdate updateFinalCompetitionAutonomy(
     case FinalCompetitionState::TowerPieces:
       if (inputs.tower_fault) {
         failFinalCompetitionAutonomy(autonomy, now_ms);
-      } else if (inputs.tower_ready_for_peg_finder ||
-                 inputs.tower_complete) {
+      } else if (inputs.tower_complete) {
         enterState(autonomy, FinalCompetitionState::PegFinder, now_ms);
         update.should_start_peg_finder = true;
       }
