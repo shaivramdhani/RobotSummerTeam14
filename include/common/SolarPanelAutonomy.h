@@ -36,6 +36,7 @@ enum class SolarPanelFaultReason : std::uint8_t {
   ImuStrafeFailed = 7,
   SolarHookCommandFailed = 8,
   FunnelCommandFailed = 9,
+  LineReacquireTimeout = 10,
 };
 
 struct SolarPanelAutonomyConfig {
@@ -48,6 +49,8 @@ struct SolarPanelAutonomyConfig {
 };
 
 struct SolarPanelContactConfig {
+  // Bounds the initial right strafe. Front-only contact enters the retry;
+  // otherwise expiry continues into the post-contact forward phase.
   Milliseconds timeout_ms{0};
   float initial_strafe_right_duty{0.0F};
   float retry_strafe_left_duty{0.0F};
@@ -56,6 +59,7 @@ struct SolarPanelContactConfig {
   Milliseconds strafe_start_delay_ms{0};
   Milliseconds retry_strafe_left_duration_ms{0};
   Milliseconds retry_forward_duration_ms{0};
+  // Bounds the single right-strafe retry; expiry continues forward.
   Milliseconds retry_strafe_timeout_ms{0};
   Milliseconds post_contact_forward_duration_ms{0};
   Milliseconds post_contact_forward_start_delay_ms{0};
@@ -68,6 +72,9 @@ struct SolarPanelContactConfig {
   // the robot: positive is the existing Forward convention, negative Reverse.
   float funnel_open_duty{0.0F};
   Milliseconds funnel_open_duration_ms{0U};
+  // Bounds the final left strafe. Line detection always takes priority and
+  // advances the route immediately.
+  Milliseconds line_reacquire_strafe_timeout_ms{0U};
 };
 
 struct SolarPanelContactSequenceUpdate {
@@ -110,6 +117,8 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
     SolarPanelAutonomyState current_state, bool front_hit, bool back_hit,
     bool reacquisition_line_detected, Milliseconds time_in_state_ms,
     const SolarPanelContactConfig& config);
+bool shouldOpenSolarHookAfterLineDetection(
+    const SolarPanelContactSequenceUpdate& update);
 void resetSolarBeaconDetectorState(SolarBeaconDetectorState& state);
 SolarBeaconDetectorUpdate updateSolarBeaconDetector(
     SolarBeaconDetectorState& state, std::uint16_t raw_amplitude,

@@ -36,12 +36,21 @@ const char* habitatPiecesStateName(const HabitatPiecesState state) {
       return "PRE_LIFT_REVERSE";
     case HabitatPiecesState::Reversing:
       return "REVERSING";
+    case HabitatPiecesState::ClosePusherBeforeDistanceStrafe:
+      return "CLOSE_PUSHER_BEFORE_DISTANCE_STRAFE";
     case HabitatPiecesState::Complete:
       return "COMPLETE";
     case HabitatPiecesState::Fault:
       return "FAULT";
   }
   return "FAULT";
+}
+
+bool habitatPiecesStateRequiresImuStrafe(
+    const HabitatPiecesState state) {
+  return state == HabitatPiecesState::DistanceStrafing ||
+         state == HabitatPiecesState::ExitStrafePulse ||
+         state == HabitatPiecesState::RearLineReacquire;
 }
 
 const char* habitatPiecesStopReasonName(
@@ -89,6 +98,8 @@ const char* habitatPiecesStopReasonName(
       return "REAR_LINE_REACHED";
     case HabitatPiecesStopReason::Lss3Detected:
       return "LSS3_DETECTED";
+    case HabitatPiecesStopReason::PusherCommandFailed:
+      return "PUSHER_COMMAND_FAILED";
   }
   return "CONFIGURATION_INCOMPLETE";
 }
@@ -242,6 +253,8 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       autonomy.state == HabitatPiecesState::LineFollowing ||
       autonomy.state == HabitatPiecesState::SideLineAligning ||
       autonomy.state == HabitatPiecesState::Reversing ||
+      autonomy.state ==
+          HabitatPiecesState::ClosePusherBeforeDistanceStrafe ||
       autonomy.state == HabitatPiecesState::DistanceStrafing ||
       autonomy.state == HabitatPiecesState::PostCountStopDelay ||
       autonomy.state == HabitatPiecesState::ExitStrafePulse ||
@@ -275,6 +288,22 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
   if (autonomy.state == HabitatPiecesState::Reversing) {
     autonomy.reverse_elapsed_ms = now_ms - autonomy.state_entered_at_ms;
     if (autonomy.reverse_elapsed_ms >= config.reverse_duration_ms) {
+      autonomy.state =
+          HabitatPiecesState::ClosePusherBeforeDistanceStrafe;
+      autonomy.state_entered_at_ms = now_ms;
+      update.state = autonomy.state;
+      update.should_close_pusher = true;
+      update.transitioned = true;
+      return update;
+    }
+    update.should_stop = false;
+    update.should_reverse = true;
+    return update;
+  }
+
+  if (autonomy.state ==
+      HabitatPiecesState::ClosePusherBeforeDistanceStrafe) {
+    if (mechanism_inputs.pusher_closed_commanded) {
       autonomy.state = HabitatPiecesState::DistanceStrafing;
       autonomy.state_entered_at_ms = now_ms;
       autonomy.distance_strafe_started_at_ms = now_ms;
@@ -295,8 +324,7 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
       update.transitioned = true;
       return update;
     }
-    update.should_stop = false;
-    update.should_reverse = true;
+    update.should_close_pusher = true;
     return update;
   }
 
@@ -357,13 +385,20 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
     if (config.distance_strafe_timeout_ms == 0U ||
         autonomy.distance_strafe_elapsed_ms >=
             config.distance_strafe_timeout_ms) {
-      autonomy.state = HabitatPiecesState::Fault;
+      // Missing the target count must not abort the pickup or jump into the
+      // stopped slide gate. Treat expiry as the end of the counting strafe and
+      // continue through the normal post-count exit sequence with a fresh
+      // bound for its delay, pulses, and stopped distance checks.
+      autonomy.state = HabitatPiecesState::PostCountStopDelay;
       autonomy.stop_reason =
           HabitatPiecesStopReason::DistanceStrafeTimeout;
       autonomy.state_entered_at_ms = now_ms;
-      autonomy.timed_out = true;
+      autonomy.distance_strafe_started_at_ms = now_ms;
+      autonomy.distance_strafe_elapsed_ms = 0U;
+      autonomy.post_count_stop_elapsed_ms = 0U;
       update.state = autonomy.state;
       update.stop_reason = autonomy.stop_reason;
+      update.should_wait_after_distance_count = true;
       update.transitioned = true;
       return update;
     }
@@ -381,11 +416,14 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
     if (config.distance_strafe_timeout_ms == 0U ||
         autonomy.distance_strafe_elapsed_ms >=
             config.distance_strafe_timeout_ms) {
-      autonomy.state = HabitatPiecesState::Fault;
+      autonomy.state = autonomy.slide_down_complete
+                           ? HabitatPiecesState::ApproachPiece
+                           : HabitatPiecesState::LowerSlide;
       autonomy.stop_reason =
           HabitatPiecesStopReason::DistanceStrafeTimeout;
       autonomy.state_entered_at_ms = now_ms;
-      autonomy.timed_out = true;
+      autonomy.approach_elapsed_ms = 0U;
+      autonomy.approach_limit_reached = false;
       update.state = autonomy.state;
       update.stop_reason = autonomy.stop_reason;
       update.transitioned = true;
@@ -525,11 +563,14 @@ HabitatPiecesUpdate updateHabitatPiecesAutonomy(
     }
     if (config.approach_timeout_ms == 0U ||
         autonomy.approach_elapsed_ms >= config.approach_timeout_ms) {
-      autonomy.state = HabitatPiecesState::Fault;
+      // Bound the forward approach, but treat a missing limit-switch contact as
+      // a recoverable pickup miss. The stopped transition below removes the
+      // forward command before the existing reverse/lift pickup tail continues.
+      autonomy.state = HabitatPiecesState::PreLiftReverse;
       autonomy.stop_reason =
           HabitatPiecesStopReason::ApproachLimitTimeout;
       autonomy.state_entered_at_ms = now_ms;
-      autonomy.timed_out = true;
+      autonomy.pre_lift_reverse_elapsed_ms = 0U;
       update.state = autonomy.state;
       update.stop_reason = autonomy.stop_reason;
       update.transitioned = true;

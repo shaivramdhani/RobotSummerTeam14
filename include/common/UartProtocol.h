@@ -23,6 +23,7 @@ enum class UartMessageType : std::uint8_t {
   HealthReport = 6,
   Fault = 7,
   LaserDistanceSnapshot = 8,
+  DiagnosticReport = 9,
 };
 
 struct UartPacketHeader {

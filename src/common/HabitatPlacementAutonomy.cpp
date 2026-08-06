@@ -136,6 +136,22 @@ const char* habitatPlacementStateName(const HabitatPlacementState state) {
   return "WAIT_FOR_START";
 }
 
+bool habitatPlacementStateRequiresImuTurn(
+    const HabitatPlacementState state) {
+  return state == HabitatPlacementState::TurnToInitialHeading ||
+         state == HabitatPlacementState::TurnCounterClockwise ||
+         state == HabitatPlacementState::TurnClockwise;
+}
+
+bool habitatPlacementStateRequiresImuStrafe(
+    const HabitatPlacementState state) {
+  return state ==
+             HabitatPlacementState::StrafeRightBeforeCounterClockwise ||
+         state == HabitatPlacementState::StrafeLeftAfterClockwise ||
+         state == HabitatPlacementState::StrafeRightAfterClockwise ||
+         state == HabitatPlacementState::StrafeRightToReturnLine;
+}
+
 const char* habitatPlacementReturnLineSourceName(
     const HabitatPlacementReturnLineSource source) {
   switch (source) {

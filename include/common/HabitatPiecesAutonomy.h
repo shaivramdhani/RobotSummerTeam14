@@ -32,6 +32,7 @@ enum class HabitatPiecesState : std::uint8_t {
   WaitForLiftCompletion = 14,
   LiftStartDelay = 15,
   PreLiftReverse = 16,
+  ClosePusherBeforeDistanceStrafe = 17,
 };
 
 enum class HabitatPiecesStopReason : std::uint8_t {
@@ -56,6 +57,7 @@ enum class HabitatPiecesStopReason : std::uint8_t {
   StepperCommandFailed = 18,
   RearLineReached = 19,
   Lss3Detected = 20,
+  PusherCommandFailed = 21,
 };
 
 enum class HabitatPiecesStrafeDirection : std::int8_t {
@@ -106,6 +108,7 @@ struct HabitatPiecesMechanismInputs {
   bool bottom_limit_active{false};
   bool approach_limit_active{false};
   bool lift_complete{false};
+  bool pusher_closed_commanded{false};
   bool rear_line_available{false};
   bool rear_left_black{false};
   bool rear_right_black{false};
@@ -165,6 +168,7 @@ struct HabitatPiecesUpdate {
   bool should_rotate_clockwise{false};
   bool should_rotate_counter_clockwise{false};
   bool should_reverse{false};
+  bool should_close_pusher{false};
   bool should_distance_strafe{false};
   bool should_wait_after_distance_count{false};
   bool should_exit_strafe_pulse{false};
@@ -207,6 +211,7 @@ const char* habitatPiecesStateName(HabitatPiecesState state);
 const char* habitatPiecesStopReasonName(HabitatPiecesStopReason reason);
 const char* habitatPiecesStrafeDirectionName(
     HabitatPiecesStrafeDirection direction);
+bool habitatPiecesStateRequiresImuStrafe(HabitatPiecesState state);
 bool habitatPiecesConfigValid(const HabitatPiecesConfig& config,
                               float maximum_duty,
                               Milliseconds maximum_distance_strafe_timeout_ms);

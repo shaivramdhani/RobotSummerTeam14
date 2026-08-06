@@ -22,6 +22,8 @@ const char* pegFinderStateName(const PegFinderState state) {
       return "FUNNEL_FORWARD";
     case PegFinderState::PostFunnelLimitDelay:
       return "POST_FUNNEL_LIMIT_DELAY";
+    case PegFinderState::WaitForTowerHandoff:
+      return "WAIT_FOR_TOWER_HANDOFF";
     case PegFinderState::OpenClaw1:
       return "OPEN_FIRST_CLAW";
     case PegFinderState::PostClaw1OpenDelay:
@@ -46,6 +48,12 @@ const char* pegFinderStateName(const PegFinderState state) {
       return "OPEN_THIRD_CLAW";
     case PegFinderState::PostClawsOpenDelay:
       return "POST_CLAWS_OPEN_DELAY";
+    case PegFinderState::ShakeLeftAfterClaw3:
+      return "SHAKE_LEFT_AFTER_THIRD_CLAW";
+    case PegFinderState::ShakeRightAfterClaw3:
+      return "SHAKE_RIGHT_AFTER_THIRD_CLAW";
+    case PegFinderState::PostShakeAfterClaw3Delay:
+      return "POST_SHAKE_DELAY_AFTER_THIRD_CLAW";
     case PegFinderState::FunnelReverse:
       return "FUNNEL_REVERSE";
     case PegFinderState::Complete:
@@ -78,6 +86,14 @@ const char* pegFinderFaultReasonName(const PegFinderFaultReason reason) {
       return "IMU_TURN_FAILED";
     case PegFinderFaultReason::ImuTurnTimeout:
       return "IMU_TURN_TIMEOUT";
+    case PegFinderFaultReason::StepperCommandFailed:
+      return "STEPPER_COMMAND_FAILED";
+    case PegFinderFaultReason::StepperLimitSearchFailed:
+      return "STEPPER_LIMIT_SEARCH_FAILED";
+    case PegFinderFaultReason::StepperTopInterlockLost:
+      return "STEPPER_TOP_INTERLOCK_LOST";
+    case PegFinderFaultReason::ConflictingLimitSwitches:
+      return "CONFLICTING_LIMIT_SWITCHES";
   }
   return "NONE";
 }
@@ -225,6 +241,14 @@ PegFinderUpdate updatePegFinderAutonomy(PegFinderAutonomy& autonomy,
       break;
     case PegFinderState::PostFunnelLimitDelay:
       if (elapsed_ms >= config.post_funnel_limit_delay_ms) {
+        autonomy.state = inputs.tower_handoff_complete
+                             ? PegFinderState::OpenClaw1
+                             : PegFinderState::WaitForTowerHandoff;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+    case PegFinderState::WaitForTowerHandoff:
+      if (inputs.tower_handoff_complete) {
         autonomy.state = PegFinderState::OpenClaw1;
         autonomy.state_entered_at_ms = now_ms;
       }
@@ -296,6 +320,26 @@ PegFinderUpdate updatePegFinderAutonomy(PegFinderAutonomy& autonomy,
       break;
     case PegFinderState::PostClawsOpenDelay:
       if (elapsed_ms >= config.post_claws_open_delay_ms) {
+        autonomy.state = config.shake_duty > 0.0F
+                             ? PegFinderState::ShakeLeftAfterClaw3
+                             : PegFinderState::FunnelReverse;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+    case PegFinderState::ShakeLeftAfterClaw3:
+      if (elapsed_ms >= config.shake_left_duration_ms) {
+        autonomy.state = PegFinderState::ShakeRightAfterClaw3;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+    case PegFinderState::ShakeRightAfterClaw3:
+      if (elapsed_ms >= config.shake_right_duration_ms) {
+        autonomy.state = PegFinderState::PostShakeAfterClaw3Delay;
+        autonomy.state_entered_at_ms = now_ms;
+      }
+      break;
+    case PegFinderState::PostShakeAfterClaw3Delay:
+      if (elapsed_ms >= config.post_shake_delay_ms) {
         autonomy.state = PegFinderState::FunnelReverse;
         autonomy.state_entered_at_ms = now_ms;
       }
@@ -326,16 +370,22 @@ PegFinderUpdate updatePegFinderAutonomy(PegFinderAutonomy& autonomy,
       autonomy.state == PegFinderState::FunnelReverse;
   update.should_shake_left =
       autonomy.state == PegFinderState::ShakeLeftAfterClaw1 ||
-      autonomy.state == PegFinderState::ShakeLeftAfterClaw2;
+      autonomy.state == PegFinderState::ShakeLeftAfterClaw2 ||
+      autonomy.state == PegFinderState::ShakeLeftAfterClaw3;
   update.should_shake_right =
       autonomy.state == PegFinderState::ShakeRightAfterClaw1 ||
-      autonomy.state == PegFinderState::ShakeRightAfterClaw2;
+      autonomy.state == PegFinderState::ShakeRightAfterClaw2 ||
+      autonomy.state == PegFinderState::ShakeRightAfterClaw3;
   update.funnel_limit_detected = inputs.funnel_limit_active;
   const std::uint8_t claw_to_open =
       clawForOpenStage(config, autonomy.state);
   update.should_open_claw_1 = claw_to_open == 1U;
   update.should_open_claw_2 = claw_to_open == 2U;
   update.should_open_claw_3 = claw_to_open == 3U;
+  const bool selecting_claw = claw_to_open >= 1U && claw_to_open <= 3U;
+  update.should_close_claw_1 = selecting_claw && claw_to_open != 1U;
+  update.should_close_claw_2 = selecting_claw && claw_to_open != 2U;
+  update.should_close_claw_3 = selecting_claw && claw_to_open != 3U;
   return update;
 }
 

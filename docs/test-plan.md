@@ -26,6 +26,9 @@ Native tests cover pure, hardware-independent logic:
 - Rear-drive laser/IR acquisition request round-trip and stale-command disable
   behavior, with the selected laser profile retained independently.
 - Rear/side line-sensor packet round-trip for LSBL, LSBR, LSS, LSS2, and LSS3.
+- Solar contact branching: both switches complete contact, front-only contact
+  starts one retry, and no-front or retry timeout continues into the
+  post-contact forward phase without entering the Solar fault state.
 - VL53L0X snapshot packet round-trip, corruption rejection, and the
   standalone habitat-distance gate's locked configuration, invalid/stale-data,
   threshold latching, reset, and millisecond-wrap behavior.
@@ -86,6 +89,21 @@ raised:
    cleared. Let the rear command become stale and confirm ESP1 also disables
    acquisition locally.
 
+With the wheels raised, verify the Solar completion overlap:
+
+1. Enter the final left line-return phase and confirm the IMU-held left strafe
+   and signed funnel-open command start while the Solar Hook remains closed.
+2. Keep both front sensors off tape and confirm the funnel stops at its own
+   configured duration while the strafe continues only up to the independently
+   configured line-reacquire timeout.
+3. Repeat and present tape to either front sensor before the timeout. Confirm
+   all four wheels stop for the handoff, the Solar Hook then raises, and
+   forward line following starts on the next control update without waiting
+   for either timeout or the remaining funnel duration.
+4. Complete Solar into Final Competition and confirm the Solar Hook PWM remains
+   enabled at the open/up angle throughout the Habitat and Tower handoffs.
+   Confirm explicit Stop still detaches the hook output.
+
 Keep the wheels raised for the first `HABITAT_PIECES` gate test:
 
 1. Verify ESP1 LSS2 GPIO11 and LSS3 GPIO12. Confirm telemetry shows both
@@ -141,8 +159,11 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
     decision is made until a new measurement sequence arrives. Supply
     at-or-below and confirm another pulse; supply above and confirm
     `DISTANCE_EXIT_REACHED` and `LOWER_SLIDE`. Repeat without completing the
-    distance phases and confirm `DISTANCE_STRAFE_TIMEOUT`, `FAULT`, and
-    all-wheel stop.
+    target count and confirm `DISTANCE_STRAFE_TIMEOUT`, an all-wheel stop, and
+    a non-faulting transition through `POST_COUNT_STOP_DELAY` into the normal
+    exit pulse/check sequence. Let the renewed exit bound expire and confirm it
+    then advances to `APPROACH_PIECE` if the slide is down or `LOWER_SLIDE`
+    otherwise.
 15. Confirm the slide moves down only at the configured limit-search speed and
     stops at the debounced bottom switch. Confirm a missing bottom input reaches
     `SLIDE_DOWN_TIMEOUT` and stops both the chassis and slide.
@@ -151,7 +172,9 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
     and confirm an immediate all-wheel stop before the configured pre-lift
     reverse. Confirm that reverse uses the pickup reverse duty, ends at its
     independent duration, and stops before the lift begins. Leave the switch
-    released and confirm `APPROACH_LIMIT_TIMEOUT` faults and stops all wheels.
+    released and confirm `APPROACH_LIMIT_TIMEOUT` stops the forward approach
+    without entering `FAULT`, then continues through the same pre-lift reverse,
+    lift, post-pickup reverse, rear-line reacquisition, and placement handoff.
 17. Confirm the slide starts lifting by the configured steps while every wheel
     remains stopped for the configured lift-start delay. After that delay,
     confirm the lift continues while the chassis performs the configured timed
@@ -163,6 +186,12 @@ Keep the wheels raised for the first `HABITAT_PIECES` gate test:
     until the lift completes. Test stale rear data and reacquisition timeout.
 19. With Habitat Placement fully configured, confirm completion automatically
     enters `HABITAT_PLACEMENT` and begins its rear-line-follow start sequence.
+20. During each Habitat Pieces IMU strafe and each Habitat Placement IMU turn
+    and strafe, interrupt IMU samples both immediately before phase entry and
+    after motion has begun. Confirm all wheel outputs disable, the route remains
+    in the same phase without consuming its timeout, and motion resumes only
+    after three new fresh samples. Repeat with the telemetry dashboard open and
+    confirm web refreshes do not produce `IMU_UNAVAILABLE`.
 
 For the read-only IMU soak test:
 
@@ -280,7 +309,8 @@ For Stage 3, keep the wheels raised for initial tests:
    pusher target, or link is absent. For each pickup profile, confirm the slide
    begins lowering with the first front-line-follow step, reaches the bottom
    safely while the chassis route continues, and faults/stops if its timeout
-   expires.
+   expires. Confirm the chassis stops after the pickup reverse, commands the
+   pusher closed, and only then starts the distance strafe.
 3. Exercise the route one phase at a time with conservative settings. Confirm
    the initial heading is captured before rear-line motion begins, LSS1 stops
    reverse line-following, and each delay holds all wheels stopped.
@@ -318,26 +348,49 @@ For Stage 3, keep the wheels raised for initial tests:
    and signed funnel-open duty/duration, all six Habitat profiles, Tower's
    start-ignore window, and PegFinder shake.
    Confirm Start is rejected unless Placement 3 returns to the rear line.
-2. Stage the slider up, funnel closed, and Solar Hook down/closed. Confirm boot
+2. With GPIO10 LOW, confirm the robot remains disabled. Flip it HIGH and
+   confirm Final Competition starts once. Hold it HIGH through several control
+   cycles and confirm the route does not restart. During motion, flip it LOW
+   and confirm chassis, rear motors, funnel, stepper, every claw, winch, and
+   Solar Hook stop. Reboot with GPIO10 already HIGH and confirm no route starts
+   until the switch is returned LOW and flipped HIGH again.
+3. Stage the slider up, funnel closed, and Solar Hook down/closed. Confirm boot
    still leaves all actuator outputs disabled, then Solar Start commands the
    hook's configured closed angle.
-3. Confirm Solar's final strafe stops on a front sensor and its forward PID
-   runs for the configured duration. Verify the hook then moves to its open
-   angle and the funnel runs in the calibrated physical opening direction for
-   exactly the configured duration before Habitat Pickup 1 begins.
-4. Present LSS2/LSS3 HIGH during each Habitat start-ignore window and confirm
+4. During Solar's initial panel-contact strafe, confirm front-only contact at
+   timeout starts one correction retry. Repeat with the front contact released
+   and confirm the timeout advances into the configured post-contact forward
+   drive. Let the one retry expire and confirm it also continues forward
+   without entering `SOLAR_SEARCH_FAULT`.
+5. Confirm Solar's final strafe starts concurrently with the funnel opening
+   while the hook remains closed, stops on a front sensor, then raises the
+   hook and advances immediately into its forward PID. Verify the funnel
+   completes its independent duration and the hook remains open before Habitat
+   Pickup 1 begins.
+6. Present LSS2/LSS3 HIGH during each Habitat start-ignore window and confirm
    neither reading changes the route until its profile's gate opens.
-5. After Placement 3 finds the rear line, confirm the chassis stops for the
+7. After Placement 3 finds the rear line, confirm the chassis stops for the
    ownership handoff and Tower begins backward rear-line following. Hold LSS
    HIGH through Tower's ignore window; verify it must return LOW before a new
    HIGH can count.
-6. In PegFinder, confirm a left pulse followed by a right pulse occurs between
-   claw openings 1/2 and 2/3, with stopped transitions and the configured duty
-   and durations. Confirm the configured stopped post-shake delay completes
-   before the next claw opens. Confirm all-zero shake values skip both shake
-   and post-shake-delay states.
-7. Force one included-mode timeout at a time and confirm Final Competition
+8. At the Tower-to-PegFinder handoff, confirm the claw-close settling delay
+   completes before both the upper-limit search and PegFinder turn begin.
+   Confirm PegFinder can turn, translate, and align the funnel while the
+   stepper is still rising. Withhold the top limit and confirm PegFinder waits
+   after funnel alignment without opening a claw, closing the winch, or
+   reversing the funnel. Activate the top limit and confirm the winch closes
+   before the first claw selection. Release the top limit or force the search
+   to fail in separate runs and confirm Final Competition faults with chassis,
+   funnel, and stepper stopped.
+9. In PegFinder, confirm a left pulse followed by a right pulse occurs after
+   each of the three claw selections, with stopped transitions and the configured
+   duty and durations. For every selection, confirm exactly the selected claw
+   is open and the other two are closed. Confirm the configured stopped
+   post-shake delay completes before the next claw is selected or, after the
+   third claw, before the funnel reverses. Confirm all-zero shake values skip
+   all shake and post-shake-delay states.
+10. Force one included-mode timeout at a time and confirm Final Competition
    enters `FAULT`, stops chassis/funnel/stepper outputs, and does not advance.
-8. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
+11. In separate trials, withhold LSS1, the bottom limit, IMU data, ESP1 status,
     or the configured return line. Each condition must stop or time out without
     advancing to the next motion phase or profile.

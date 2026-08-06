@@ -36,10 +36,12 @@ counter-clockwise until LSS2 sees black. The alignment rotation uses the
 profile's line-follow duty and the chassis mixer's physical yaw convention. Detecting the
 opposite sensor stops all four wheels for one update before `REVERSING` drives
 straight backward at an explicitly configured duty and duration, then enters
-`DISTANCE_STRAFING`.
+`CLOSE_PUSHER_BEFORE_DISTANCE_STRAFE` before `DISTANCE_STRAFING`.
 That pickup step moves in the configured left/right direction through IMU
 heading hold and counts distinct fresh laser-measurement entries at or below
-the configured threshold. Its per-profile initial count-ignore window keeps the
+the configured threshold. After the timed reverse, the chassis stops and ESP2
+commands the Habitat Pusher closed before entering the distance strafe. Its
+per-profile initial count-ignore window keeps the
 count at zero while still tracking zone occupancy; a target held near through
 the window must leave and re-enter before counting. Consecutive in-zone values count once; an
 above-threshold value rearms the next count. Reaching the configured count
@@ -48,11 +50,17 @@ enters `POST_COUNT_STOP_DELAY`. It then alternates `EXIT_STRAFE_PULSE` and
 requires a new measurement sequence, above threshold advances to
 `APPROACH_PIECE` when the slide is already down (or to `LOWER_SLIDE` as a
 stopped wait), and at-or-below repeats the pulse. The distance-strafe timeout
-bounds the complete count/delay/pulse/check sequence. The slide has been
+bounds the counting strafe. Expiry before the target count stops that motion,
+records `DISTANCE_STRAFE_TIMEOUT`, enters `POST_COUNT_STOP_DELAY`, and gives the
+normal exit pulse/check sequence a fresh timeout window. If that exit sequence
+also exhausts the bound, it advances to `APPROACH_PIECE` if the slide is down or
+the stopped `LOWER_SLIDE` wait otherwise. The slide has been
 seeking its bottom limit concurrently since the pickup profile began;
 `APPROACH_PIECE` drives forward until the active-high ESP2 GPIO48
-habitat-piece limit switch is pressed, and the stopped transition starts a bounded
-`PRE_LIFT_REVERSE` using the pickup reverse duty. Its stopped completion starts
+habitat-piece limit switch is pressed. If the approach times out first, it
+records `APPROACH_LIMIT_TIMEOUT` without faulting the autonomous run. Both the
+switch and timeout paths stop the forward command for one update, then start a
+bounded `PRE_LIFT_REVERSE` using the pickup reverse duty. Its stopped completion starts
 the step-counted lift. `LIFT_START_DELAY` holds every wheel stopped for its
 adjustable duration while the lift continues. `REVERSE_AFTER_PICKUP` and
 `REAR_LINE_REACQUIRE` then run while that lift continues. Rear-line
@@ -61,7 +69,8 @@ opposite direction from the original distance strafe and stops when either
 rear sensor sees black. If necessary, the chassis waits stopped for the lift;
 once both conditions are complete, the route automatically requests
 `HABITAT_PLACEMENT`. Every search and mechanism motion has an independent
-timeout. A separate overall timeout stops the mode if the first side line or
+timeout; the distance-strafe and approach timeouts are recoverable pickup-tail
+fallbacks. A separate overall timeout stops the mode if the first side line or
 the opposite alignment line is not acquired. Both side sensors must be
 configured and their shared snapshot must remain fresh until both latch. The
 VL53L0X is not a start gate; a fresh N/A/no-target result is
@@ -94,12 +103,23 @@ motion/search has an adjustable bound; configuration, stale
 communication, sensor, turn, stepper, servo, and timeout failures stop the
 chassis.
 
+The Tower-to-PegFinder transition is an intentional overlap in Time Trial and
+Final Competition. After the Tower claw-close settling delay, Tower starts the
+upper-limit search and hands chassis/funnel ownership to PegFinder. PegFinder
+may turn, translate, and align the funnel while the stepper rises. It waits in
+`WAIT_FOR_TOWER_HANDOFF` before the first claw selection until the debounced top
+limit is active and the winch-close command has been accepted. The live top
+interlock is retained through the final funnel-reverse command. Standalone
+Tower and PegFinder modes retain their independent completion behavior.
+
 Final Competition is staged with the slider up, funnel closed, and Solar Hook
 down/closed. Outputs remain disabled at boot. Solar commands the hook closed
-when its route starts, then commands it open and runs the funnel at the
-configured signed duty for the configured duration after the forward-line
-exit. Only after that bounded mechanism phase reports complete does Habitat
-Pickup 1 start.
+when its route starts. At the final left line-return strafe it starts the
+bounded funnel opening while leaving the hook closed. Finding either front
+line sensor stops the strafe, commands the hook open, and advances immediately
+into the forward-line exit; the funnel finishes on its independent timer.
+Habitat Pickup 1 starts only after both the route and funnel action finish,
+with the hook servo still held open for the Habitat and Tower stages.
 
 ## Transition TODOs
 

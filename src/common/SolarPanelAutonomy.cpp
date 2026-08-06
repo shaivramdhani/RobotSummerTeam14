@@ -89,6 +89,8 @@ const char* solarPanelFaultReasonName(
       return "SOLAR_HOOK_COMMAND_FAILED";
     case SolarPanelFaultReason::FunnelCommandFailed:
       return "FUNNEL_COMMAND_FAILED";
+    case SolarPanelFaultReason::LineReacquireTimeout:
+      return "LINE_REACQUIRE_TIMEOUT";
   }
   return "NONE";
 }
@@ -122,6 +124,7 @@ bool solarPanelContactRouteConfigValid(
          std::isfinite(config.line_reacquire_strafe_duty) &&
          config.line_reacquire_strafe_duty > 0.0F &&
          config.line_reacquire_strafe_duty <= 1.0F &&
+         config.line_reacquire_strafe_timeout_ms > 0U &&
          config.front_line_follow_duration_ms > 0U &&
          std::isfinite(config.front_line_follow_duty) &&
          config.front_line_follow_duty > 0.0F &&
@@ -168,7 +171,8 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
                  ? SolarPanelContactSequenceUpdate{
                        SolarPanelAutonomyState::StrafeLeftForSolarRetry, true}
                  : SolarPanelContactSequenceUpdate{
-                       SolarPanelAutonomyState::SolarSearchFault, true};
+                       SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+                       true};
 
     case SolarPanelAutonomyState::StrafeLeftForSolarRetry:
       return time_in_state_ms >= config.retry_strafe_left_duration_ms
@@ -186,7 +190,8 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
     case SolarPanelAutonomyState::RetryStrafeRightToSolarPanel:
       return time_in_state_ms >= config.retry_strafe_timeout_ms
                  ? SolarPanelContactSequenceUpdate{
-                       SolarPanelAutonomyState::SolarSearchFault, true}
+                       SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+                       true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
     case SolarPanelAutonomyState::SolarPanelContacted:
@@ -227,11 +232,15 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
     case SolarPanelAutonomyState::StrafeLeftToFrontLine:
-      return reacquisition_line_detected
+      if (reacquisition_line_detected) {
+        return {SolarPanelAutonomyState::
+                    ForwardLineFollowAfterFrontDetection,
+                true};
+      }
+      return time_in_state_ms >=
+                     config.line_reacquire_strafe_timeout_ms
                  ? SolarPanelContactSequenceUpdate{
-                       SolarPanelAutonomyState::
-                           ForwardLineFollowAfterFrontDetection,
-                       true}
+                       SolarPanelAutonomyState::SolarSearchFault, true}
                  : SolarPanelContactSequenceUpdate{current_state, false};
 
     case SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection:
@@ -258,6 +267,13 @@ SolarPanelContactSequenceUpdate updateSolarPanelContactSequence(
   }
 
   return {current_state, false};
+}
+
+bool shouldOpenSolarHookAfterLineDetection(
+    const SolarPanelContactSequenceUpdate& update) {
+  return update.transitioned &&
+         update.next_state ==
+             SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection;
 }
 
 void resetSolarBeaconDetectorState(SolarBeaconDetectorState& state) {

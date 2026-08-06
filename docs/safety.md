@@ -58,7 +58,8 @@ disabled and line following refuses to start.
 - Habitat Pieces requires configured LSS2 and LSS3 inputs, fresh shared ESP1 sensor
   snapshot, valid shared IMU heading-hold tuning, and a healthy IMU at Start.
   Missing configuration, stale side-sensor data before alignment completes,
-  rear-command failure, or timeout stops all four wheels. No detection delay,
+  rear-command failure, or side-line search/alignment timeout stops all four
+  wheels and faults the route. No detection delay,
   search timeout, reverse duty/duration, distance direction,
   threshold, count, duty, post-count delay, exit-pulse duty/duration, or
   distance timeout is compiled in; all must be explicitly configured. The
@@ -75,9 +76,12 @@ disabled and line following refuses to start.
   result is substituted with 65536 mm and satisfies the exit check, while an
   unavailable or stale stream supplies no sample. Repeated sequences cannot
   increment the count or satisfy a post-pulse check, and the configured timeout
-  bounds the full count/delay/pulse/check sequence. A bounded bottom-limit
-  search begins when each pickup profile starts and runs concurrently with the
-  early chassis route. Clearing the final zone begins the separately bounded
+  bounds the counting strafe. Expiry stops the distance motion and continues
+  through the post-count delay and exit pulse/check sequence with a fresh
+  bound. If that exit bound expires, the route continues to the slide/approach
+  pickup-tail gate without faulting.
+  A bounded bottom-limit search begins when each pickup profile starts and runs
+  concurrently with the early chassis route. Clearing the final zone begins the separately bounded
   active-high GPIO48 limit-switch approach immediately if the slide is already
   down, or holds the chassis stopped until that search finishes. A
   duration-bounded pre-lift reverse stops before the step-counted lift begins.
@@ -86,9 +90,11 @@ disabled and line following refuses to start.
   opposite-direction IMU rear-line strafe at its independent duty. Either rear
   sensor stops chassis
   motion; the route waits stopped for an unfinished lift before handing off to
-  Habitat Placement. Stepper-command failure, conflicting limits, stale rear
-  line data, or any slide/approach/lift/reacquisition timeout stops both the
-  chassis and slide.
+  Habitat Placement. An approach timeout stops the forward command, records
+  `APPROACH_LIMIT_TIMEOUT`, and continues through the bounded reverse/lift
+  pickup tail. Stepper-command failure, conflicting limits, stale rear line
+  data, or a slide, lift, or reacquisition timeout stops both the chassis and
+  slide.
 - Habitat Pieces Start validates all three pickup profiles and all three
   matching placement profiles before any motion. They alternate strictly in
   numeric order, with an explicit all-wheel stop at each handoff. Each
@@ -103,7 +109,15 @@ disabled and line following refuses to start.
   commands the hook closed/down, and rejects an unset final funnel duty or
   duration. The final signed funnel command is capped, refreshed before its
   communication timeout, stopped at the configured duration, and stopped on
-  any link or mode fault.
+  any link or mode fault. The initial panel-contact strafe remains bounded;
+  front-only contact enters one bounded retry, while no-front contact continues
+  into the bounded post-contact forward drive. An expired retry also continues
+  forward without permitting another retry. Stale communication, unavailable
+  hardware, IMU failure, and rear-command failure remain terminal.
+- ESP2 GPIO10 is an externally driven Final Competition run switch. A
+  LOW-to-HIGH transition requests the route; LOW while the parent mode is
+  active invokes the same full emergency-stop path as the dashboard STOP.
+  Booting with the input already HIGH does not start motion.
 - `FINAL_COMPETITION` validates all included modes before Solar moves and
   requires Placement 3 to use the rear return-line source. Each ownership
   handoff commands stopped outputs. Tower ignores side-line HIGH only for its
@@ -114,6 +128,12 @@ disabled and line following refuses to start.
   relative lift that exceeds the remaining configured stepper travel. The
   finite jog runs concurrently with the chassis, faults if it stops before its
   tracked target, and must complete before the later bottom-limit search starts.
+  In Time Trial and Final Competition, the later top-limit search overlaps only
+  with PegFinder chassis/funnel alignment after the Tower claws have received
+  their full settling delay. The transition owner monitors the bounded limit
+  search, commands the winch closed only with the debounced top limit active,
+  blocks the first PegFinder claw selection until that command is accepted, and
+  faults if the top interlock is lost before the final funnel reverse.
   PegFinder shake remains disabled while any shake field is only partially
   configured; when enabled, both directional pulses and the stopped post-shake
   delay are duration-bounded.
@@ -136,13 +156,20 @@ disabled and line following refuses to start.
 - Maximum strafe duty plus maximum yaw-correction duty must fit within the
   verified hardware duty cap.
 - Autonomous IMU motion requires the same valid shared tuning, fresh healthy
-  IMU, configured motors, and fresh rear link as its manual test. An IMU I2C
+  IMU, configured motors, and fresh rear link as its manual test. Every
+  autonomous IMU start, update, and recovery gate re-peeks the acquisition
+  queue immediately before evaluating freshness so synchronous web work cannot
+  make an older cached copy appear disconnected. An IMU I2C
   outage during an autonomous turn or strafe immediately disables all four
   wheels and freezes the owning mission and controller timers. The saved
   heading and controller target are retained. Motion resumes only after three
   new consecutive fresh samples; the pause is bounded by the existing
   30-second timed-motion cap. Expiry becomes the owning mode's terminal
   `IMU_UNAVAILABLE` fault. Manual IMU test modes remain terminal-on-loss.
+- Habitat Pieces gates the first iteration of distance strafing, exit pulses,
+  and rear-line reacquisition. Habitat Placement does the same for every IMU
+  turn and strafe. A transition into one of these phases therefore pauses on
+  an unavailable IMU instead of bypassing recovery and faulting immediately.
 - After a failed runtime read, the MPU driver verifies `WHO_AM_I`, wake,
   filter, gyro-range, and accelerometer-range registers before accepting a
   recovery sample. A sensor power cycle therefore cannot resume autonomous

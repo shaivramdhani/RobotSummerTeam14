@@ -21,6 +21,10 @@ calibration values.
   set only after raised-wheel and field-path testing. Distance strafing also
   requires calibrated shared IMU heading-hold tuning. Calibrate the short
   exit-pulse strafe duty independently from the long counting-strafe duty.
+  Verify counting-strafe expiry stops lateral motion, runs the configured
+  post-count delay, and starts the exit pulse/check sequence. Verify a later
+  exit-sequence expiry continues to the slide/approach pickup tail without a
+  route fault.
   Verify that an LSS2-first alignment is physically clockwise and an LSS3-first
   alignment is counter-clockwise under the configured wheel inversions.
 - For each Habitat Pieces pickup profile, calibrate slide-down speed/timeout,
@@ -32,16 +36,25 @@ calibration values.
   both rear sensors, and the
   automatic Habitat Placement handoff with wheels raised first. Verify each
   profile starts lowering the slide at pickup start and that the mechanism can
-  reach the bottom safely while the chassis route is still running.
+  reach the bottom safely while the chassis route is still running. With the
+  approach switch deliberately left released, verify the configured timeout
+  stops forward motion and safely continues through the reverse/lift tail.
 - Calibrate the Solar exit front-line reacquisition strafe duty, forward PID
-  duty, and forward PID duration independently. Verify that either front sensor
-  finding tape produces a stopped handoff before the PID begins.
+  duty, strafe timeout, forward PID duty, and forward PID duration
+  independently. Verify that either front sensor finding tape overrides the
+  timeout and produces a stopped handoff before the PID begins.
+- Calibrate Solar's initial and retry contact timeouts with the wheels raised.
+  Verify front-only contact starts exactly one left/forward/right retry, while
+  no-front contact or an expired retry continues through the configured
+  post-contact forward duty and duration without latching a Solar fault.
 - Calibrate Solar's final signed funnel-open duty and duration with the chassis
   raised/secured. Positive uses the existing Forward convention; negative uses
   Reverse. Confirm the physical opening direction before saving a nonzero
   value. Verify the Solar Hook's adjustable `0°` open/up and `148°`
-  closed/down positions, and confirm the hook reaches open during the bounded
-  funnel phase.
+  closed/down positions. Confirm the funnel starts with the final left strafe,
+  the hook stays closed until either front sensor finds the line, the funnel
+  runs for its full independent duration as the route continues, and the hook
+  remains powered open through Habitat and Tower.
 - Calibrate the Tower Pieces side-line HIGH-ignore window so it spans the
   Habitat-to-Tower handoff but remains shorter than the side-line timeout.
   Verify that a sensor held HIGH through the window must go LOW before the next
@@ -54,25 +67,6 @@ calibration values.
 - `FREQ` GPIO2 selects 1 kHz when HIGH and 10 kHz when LOW.
 - Confirm IR acquisition reports active only during Solar and stops after Solar
   completion, fault, Stop, or stale ESP2 commands.
-
-## Ultrasonic Sensors
-
-- Ultrasonic 1 trigger/echo GPIOs are unassigned because its previous GPIO12
-  and GPIO11 assignments now belong to LSS3 and LSS2. It remains disabled until
-  two non-conflicting pins are assigned and verified.
-
-- Ultrasonic 1 is an HC-SR04 on ESP1, but its replacement trigger/echo GPIOs
-  are TODO.
-- Echo is divided to 3.3 V in hardware.
-- Trigger pulse: 10 us HIGH, from the HC-SR04 data sheet.
-- Valid data-sheet range: 20-4000 mm.
-- Distance conversion uses the data-sheet 340 m/s sound velocity and divides
-  round-trip time by two.
-- Echo timeout: 23530 us, derived from the 4000 mm maximum range. A timeout or
-  a converted value outside the valid range is reported as no valid echo.
-- Bench-check distance accuracy and environmental sensitivity before using this
-  reading for autonomous decisions.
-- Ultrasonic 2 model, pins, level shifting, and timing: TODO.
 
 ## VL53L0X Distance Sensor
 
@@ -130,8 +124,10 @@ calibration values.
   All three default to zero, which disables shaking. Tune with the robot raised
   and confirm each left/right pulse is small enough to preserve funnel and line
   alignment before enabling it in Final Competition.
-- PegFinder stopped delay after each completed shake and before the next claw:
-  TODO. Tune it independently from the claw-open interval.
+- PegFinder stopped delay after each completed shake and before the next claw
+  or the post-third-claw funnel reverse: TODO. Tune it independently from the
+  claw-open interval. At each selection, verify the chosen claw reaches its
+  open angle and both non-selected claws return to their closed angles.
 - Tower shimmy initial direction, full left/right durations, and stopped delays
   before/after shimmy: TODO. Remember that firmware automatically applies 50%
   of the selected direction's duration to the first pulse.

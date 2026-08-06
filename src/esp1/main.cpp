@@ -15,7 +15,6 @@
 #include "common/RearDriveCommand.h"
 #include "common/RearLineSensor.h"
 #include "common/SolarHookServo.h"
-#include "common/Ultrasonic.h"
 #include "common/UartProtocol.h"
 #include "esp1/MissionStateMachine.h"
 #include "esp1/PinConfig.h"
@@ -50,10 +49,6 @@ constexpr int kRearLineSensorLeftGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_back_left;
 constexpr int kRearLineSensorRightGpio =
     robot::esp1::kHardwareConfig.pins.line_sensor_back_right;
-constexpr int kUltrasonic1TriggerGpio =
-    robot::esp1::kHardwareConfig.pins.ultrasonic_trigger_1;
-constexpr int kUltrasonic1EchoGpio =
-    robot::esp1::kHardwareConfig.pins.ultrasonic_echo_1;
 constexpr std::uint8_t kIrAdcResolutionBits = 12U;
 constexpr std::uint16_t kIrAdcMaximumSample =
     (static_cast<std::uint16_t>(1U) << kIrAdcResolutionBits) - 1U;
@@ -105,11 +100,6 @@ static_assert(IR_THRESHOLD_1KHZ_OFF <= IR_THRESHOLD_1KHZ,
               "1 kHz IR off threshold must be <= on threshold");
 static_assert(IR_THRESHOLD_10KHZ_OFF <= IR_THRESHOLD_10KHZ,
               "10 kHz IR off threshold must be <= on threshold");
-static_assert(robot::kHcSr04EchoTimeoutUs > 0U,
-              "HC-SR04 echo timeout must be nonzero");
-static_assert(robot::kHcSr04EchoTimeoutUs < 100000U,
-              "HC-SR04 echo timeout must remain bounded");
-
 struct IrAdcWindowResult {
   std::uint16_t average{0};
   std::uint16_t minimum{0};
@@ -159,18 +149,9 @@ struct SolarPanelLimitSwitchReading {
   bool front_right_high{false};
 };
 
-struct UltrasonicReading {
-  std::uint16_t distance_mm{0};
-  std::uint32_t echo_duration_us{0};
-  bool configured{false};
-  bool echo_valid{false};
-};
-
 portMUX_TYPE g_ir_adc_result_mux = portMUX_INITIALIZER_UNLOCKED;
 IrAdcWindowResult g_latest_ir_adc_result{};
 std::uint16_t g_ir_adc_samples[kIrAdcSamplesPerWindow]{};
-portMUX_TYPE g_ultrasonic_result_mux = portMUX_INITIALIZER_UNLOCKED;
-UltrasonicReading g_latest_ultrasonic_1_reading{};
 StaticQueue_t g_laser_snapshot_queue_buffer{};
 std::uint8_t g_laser_snapshot_queue_storage[
     sizeof(robot::LaserDistanceSnapshot)]{};
@@ -249,34 +230,6 @@ bool rearLineSensorsConfigComplete() {
          gpioAssigned(kRearLineSensorRightGpio);
 }
 
-bool ultrasonic1ConfigComplete() {
-  return gpioAssigned(kUltrasonic1TriggerGpio) &&
-         gpioAssigned(kUltrasonic1EchoGpio) &&
-         kUltrasonic1TriggerGpio != kUltrasonic1EchoGpio;
-}
-
-void initializeUltrasonic1() {
-  if (!ultrasonic1ConfigComplete()) {
-    return;
-  }
-  digitalWrite(kUltrasonic1TriggerGpio, LOW);
-  pinMode(kUltrasonic1TriggerGpio, OUTPUT);
-  pinMode(kUltrasonic1EchoGpio, INPUT);
-}
-
-void storeUltrasonic1Reading(const UltrasonicReading& reading) {
-  portENTER_CRITICAL(&g_ultrasonic_result_mux);
-  g_latest_ultrasonic_1_reading = reading;
-  portEXIT_CRITICAL(&g_ultrasonic_result_mux);
-}
-
-UltrasonicReading latestUltrasonic1Reading() {
-  portENTER_CRITICAL(&g_ultrasonic_result_mux);
-  const UltrasonicReading reading = g_latest_ultrasonic_1_reading;
-  portEXIT_CRITICAL(&g_ultrasonic_result_mux);
-  return reading;
-}
-
 bool initializeLaserSnapshotMailbox() {
   if (g_laser_snapshot_queue != nullptr) {
     return false;
@@ -326,33 +279,6 @@ bool latestLaserDistanceSnapshot(
     return false;
   }
   return xQueuePeek(g_laser_snapshot_queue, &snapshot, 0U) == pdPASS;
-}
-
-UltrasonicReading readUltrasonic1() {
-  UltrasonicReading reading{};
-  reading.configured = ultrasonic1ConfigComplete();
-  if (!reading.configured) {
-    return reading;
-  }
-
-  // The trigger remains LOW between samples. HC-SR04 requires a minimum 10 us
-  // HIGH pulse; pulseIn is confined to this low-priority sensor task and has a
-  // timeout derived from the data-sheet 4 m maximum range.
-  digitalWrite(kUltrasonic1TriggerGpio, HIGH);
-  delayMicroseconds(robot::kHcSr04TriggerPulseUs);
-  digitalWrite(kUltrasonic1TriggerGpio, LOW);
-
-  reading.echo_duration_us = static_cast<std::uint32_t>(
-      pulseIn(kUltrasonic1EchoGpio, HIGH, robot::kHcSr04EchoTimeoutUs));
-  if (reading.echo_duration_us == 0U) {
-    return reading;
-  }
-
-  reading.distance_mm =
-      robot::hcSr04DistanceMmFromEchoUs(reading.echo_duration_us);
-  reading.echo_valid =
-      robot::hcSr04DistanceMmIsValid(reading.distance_mm);
-  return reading;
 }
 
 void initializeSolarPanelLimitSwitches() {
@@ -855,14 +781,15 @@ void publishEsp1Status(RearCommandLink& link,
                        const robot::RearLineSensorSnapshot& line_sensors,
                        const robot::Milliseconds now_ms) {
   static robot::Milliseconds last_publish_ms = 0U;
-  static std::uint16_t sequence = 0U;
+  static robot::Milliseconds last_diagnostics_publish_ms = 0U;
+  static std::uint16_t operational_sequence = 0U;
+  static std::uint16_t diagnostics_sequence = 0U;
   if (now_ms - last_publish_ms < kEsp1StatusPeriodMs) {
     return;
   }
   last_publish_ms = now_ms;
 
   const IrAdcWindowResult ir = latestIrAdcResult();
-  const UltrasonicReading ultrasonic_1 = latestUltrasonic1Reading();
   robot::Esp1StatusReport report{};
   report.uptime_ms = now_ms;
   report.mode = robot::RobotTestMode::Disabled;
@@ -897,11 +824,6 @@ void publishEsp1Status(RearCommandLink& link,
       solar_limits.front_right_high;
   report.side_line_sensor_configured = line_sensors.side_configured;
   report.side_line_sensor_high = line_sensors.side_electrical_high;
-  report.ultrasonic_1_configured = ultrasonic_1.configured;
-  report.ultrasonic_1_echo_valid = ultrasonic_1.echo_valid;
-  report.ultrasonic_1_distance_mm = ultrasonic_1.distance_mm;
-  report.ultrasonic_1_echo_duration_us =
-      ultrasonic_1.echo_duration_us;
   report.ir_adc_average = ir.average;
   report.ir_adc_min = ir.minimum;
   report.ir_adc_max = ir.maximum;
@@ -918,27 +840,47 @@ void publishEsp1Status(RearCommandLink& link,
   report.ir_consecutive_detection_count = ir.consecutive_detection_count;
   report.ir_adc_sample_rate_hz = ir.achieved_sample_rate_hz;
   report.ir_acquisition_enabled = ir.acquisition_enabled;
-  link.send(robot::makeEsp1StatusPacket(report, sequence++));
+  link.send(robot::makeEsp1OperationalStatusPacket(
+      report, operational_sequence++));
+  if (now_ms - last_diagnostics_publish_ms >=
+      robot::kEsp1DiagnosticsPeriodMs) {
+    if (link.send(robot::makeEsp1DiagnosticsPacket(
+            report, diagnostics_sequence++))) {
+      last_diagnostics_publish_ms = now_ms;
+    }
+  }
 }
 
 void publishRearLineSensors(
     RearCommandLink& link,
-    const robot::RearLineSensorSnapshot& snapshot) {
+    const robot::RearLineSensorSnapshot& snapshot,
+    const bool acquisition_enabled) {
+  if (!acquisition_enabled) {
+    return;
+  }
   static std::uint16_t sequence = 0U;
   link.send(robot::makeRearLineSensorPacket(snapshot, sequence++));
 }
 
 void publishLaserDistance(RearCommandLink& link,
-                          const robot::Milliseconds now_ms) {
+                          const robot::Milliseconds now_ms,
+                          const bool acquisition_enabled) {
   static robot::Milliseconds last_publish_ms = 0U;
   static std::uint16_t packet_sequence = 0U;
   static std::uint16_t last_measurement_sequence = 0U;
   static robot::LaserDistanceProfile last_profile =
       robot::kOperationalLaserDistanceProfile;
+  static bool last_published_ranging = false;
   static bool published_once = false;
 
   robot::LaserDistanceSnapshot snapshot{};
   if (!latestLaserDistanceSnapshot(snapshot)) {
+    return;
+  }
+  const bool stopped_state_transition =
+      published_once && last_published_ranging && !snapshot.ranging;
+  if (!acquisition_enabled && published_once &&
+      !stopped_state_transition) {
     return;
   }
   const bool new_measurement =
@@ -957,6 +899,7 @@ void publishLaserDistance(RearCommandLink& link,
     published_once = true;
     last_measurement_sequence = snapshot.measurement_sequence;
     last_profile = snapshot.profile;
+    last_published_ranging = snapshot.ranging;
     last_publish_ms = now_ms;
   }
 }
@@ -1054,9 +997,6 @@ void sensorAcquisitionTask(void* parameters) {
     analogReadResolution(kIrAdcResolutionBits);
     analogSetPinAttenuation(kIrAdcGpio, ADC_11db);
   }
-  initializeUltrasonic1();
-  storeUltrasonic1Reading(
-      UltrasonicReading{0U, 0U, ultrasonic1ConfigComplete(), false});
   (void)laser_distance_sensor.initialize(
       Wire, robot::esp1::kHardwareConfig.laser_distance_sensor);
   storeLaserDistanceSnapshot(laser_distance_sensor.snapshot());
@@ -1112,7 +1052,6 @@ void sensorAcquisitionTask(void* parameters) {
                               clear_count);
         storeIrAdcResult(result);
       }
-      storeUltrasonic1Reading(readUltrasonic1());
     }
 
     const TickType_t period_ticks =
@@ -1226,8 +1165,11 @@ void rearDriveTask(void* parameters) {
     publishEsp1Status(link, back_left_motor, back_right_motor, funnel_motor,
                       solar_hook, rear_status, funnel_status, line_sensors,
                       now_ms);
-    publishRearLineSensors(link, line_sensors);
-    publishLaserDistance(link, now_ms);
+    publishRearLineSensors(
+        link, line_sensors,
+        receiver.rearLineAcquisitionEnabled(now_ms));
+    publishLaserDistance(link, now_ms,
+                         requested_sensors.laser_enabled);
     printRearStatus(rear_status, back_left_motor, back_right_motor, link,
                     now_ms);
     printIrDebugLine(back_left_motor, back_right_motor, now_ms);

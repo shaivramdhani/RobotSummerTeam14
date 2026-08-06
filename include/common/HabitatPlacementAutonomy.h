@@ -148,6 +148,8 @@ const char* habitatPlacementFaultReasonName(
     HabitatPlacementFaultReason reason);
 const char* habitatPlacementReturnLineSourceName(
     HabitatPlacementReturnLineSource source);
+bool habitatPlacementStateRequiresImuTurn(HabitatPlacementState state);
+bool habitatPlacementStateRequiresImuStrafe(HabitatPlacementState state);
 bool habitatPlacementConfigValid(
     const HabitatPlacementConfig& config, float maximum_allowed_duty,
     std::uint32_t maximum_stepper_speed_steps_per_second);

@@ -56,6 +56,9 @@ UartPacket makeRearDriveCommandPacket(const RearDriveCommand& command,
   packet.payload[0] |= command.ir_acquisition_enabled
                            ? kRearDriveIrAcquisitionEnabledFlag
                            : 0U;
+  packet.payload[0] |= command.rear_line_acquisition_enabled
+                           ? kRearDriveLineSensorAcquisitionEnabledFlag
+                           : 0U;
   putI16(&packet.payload[1], clampCommandMilli(command.back_left_command_milli));
   putI16(&packet.payload[3],
          clampCommandMilli(command.back_right_command_milli));
@@ -83,6 +86,9 @@ bool decodeRearDriveCommandPacket(const UartPacket& packet,
       (packet.payload[0] & kRearDriveLaserAcquisitionEnabledFlag) != 0U;
   command.ir_acquisition_enabled =
       (packet.payload[0] & kRearDriveIrAcquisitionEnabledFlag) != 0U;
+  command.rear_line_acquisition_enabled =
+      (packet.payload[0] &
+       kRearDriveLineSensorAcquisitionEnabledFlag) != 0U;
   command.back_left_command_milli =
       clampCommandMilli(getI16(&packet.payload[1]));
   command.back_right_command_milli =
@@ -166,6 +172,12 @@ bool RearDriveCommandReceiver::laserAcquisitionEnabled(
 bool RearDriveCommandReceiver::irAcquisitionEnabled(
     const Milliseconds now_ms) const {
   return commandIsFresh(now_ms) && last_command_.ir_acquisition_enabled;
+}
+
+bool RearDriveCommandReceiver::rearLineAcquisitionEnabled(
+    const Milliseconds now_ms) const {
+  return commandIsFresh(now_ms) &&
+         last_command_.rear_line_acquisition_enabled;
 }
 
 LaserDistanceProfile RearDriveCommandReceiver::laserProfile(

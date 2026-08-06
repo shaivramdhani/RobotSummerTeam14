@@ -14,6 +14,7 @@ constexpr std::uint8_t kRearDriveEnabledFlag = 0x01U;
 constexpr std::uint8_t kRearDriveLaserHighAccuracyFlag = 0x02U;
 constexpr std::uint8_t kRearDriveLaserAcquisitionEnabledFlag = 0x04U;
 constexpr std::uint8_t kRearDriveIrAcquisitionEnabledFlag = 0x08U;
+constexpr std::uint8_t kRearDriveLineSensorAcquisitionEnabledFlag = 0x10U;
 constexpr std::uint32_t kMaxInvalidRearPacketsBeforeStop = 3U;
 
 struct RearDriveCommand {
@@ -24,6 +25,7 @@ struct RearDriveCommand {
   Milliseconds timeout_ms{kDefaultCommunicationTimeoutMs};
   bool laser_acquisition_enabled{false};
   bool ir_acquisition_enabled{false};
+  bool rear_line_acquisition_enabled{false};
   LaserDistanceProfile laser_profile{kOperationalLaserDistanceProfile};
 };
 
@@ -48,6 +50,7 @@ class RearDriveCommandReceiver {
   MotorCommand backRightCommand(Milliseconds now_ms) const;
   bool laserAcquisitionEnabled(Milliseconds now_ms) const;
   bool irAcquisitionEnabled(Milliseconds now_ms) const;
+  bool rearLineAcquisitionEnabled(Milliseconds now_ms) const;
   LaserDistanceProfile laserProfile(Milliseconds now_ms) const;
   RearDriveStatus status(Milliseconds now_ms) const;
 

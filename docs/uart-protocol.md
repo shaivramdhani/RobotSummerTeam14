@@ -30,6 +30,7 @@ accuracy.
 - `MechanismCommand`
 - `SensorSnapshot`
 - `HealthReport`
+- `DiagnosticReport`
 - `Fault`
 - `LaserDistanceSnapshot`
 
@@ -57,7 +58,7 @@ does not include the magic bytes or CRC field.
 
 | Byte(s) | Field |
 | --- | --- |
-| 0 | flags: bit 0 rear wheels enabled, bit 1 request VL53L0X high-accuracy profile, bit 2 enable VL53L0X acquisition, bit 3 enable IR acquisition |
+| 0 | flags: bit 0 rear wheels enabled, bit 1 request VL53L0X high-accuracy profile, bit 2 enable VL53L0X acquisition, bit 3 enable IR acquisition, bit 4 enable rear-line acquisition |
 | 1-2 | signed back-left command milli-units |
 | 3-4 | signed back-right command milli-units |
 | 5-8 | sender timestamp in ms |
@@ -67,7 +68,8 @@ Signed motor commands are normalized milli-units from `-1000` to `1000`.
 
 ## Line Sensor Snapshot Payload
 
-ESP1 publishes `SensorSnapshot` every `10 ms` using a 6-byte payload:
+ESP1 publishes `SensorSnapshot` at the sensor/control rate only while ESP2
+requests rear-line acquisition, using a 6-byte payload:
 
 | Byte(s) | Field |
 | --- | --- |
@@ -175,14 +177,14 @@ current output.
 - ESP1 boots with the Solar Hook servo PWM detached and disabled.
 - ESP2 boots with both front motors disabled.
 
-## ESP1 Compact Status Payload
+## ESP1 Status Payloads
 
-ESP1 publishes a compact `HealthReport` frame periodically on the same UART
-link. ESP2 parses this frame and exposes the latest remote ESP1 status through
-the dashboard telemetry.
+ESP1 publishes a 19-byte operational `HealthReport` every 100 ms and a 22-byte
+`DiagnosticReport` every 250 ms. ESP2 merges both into its latest remote ESP1
+status. The control-safety freshness timer is updated only by the operational
+report.
 
-Payload size is 47 bytes. ESP2 also accepts the prior 45-byte payload during a
-rolling firmware update.
+### Operational HealthReport
 
 | Byte(s) | Field |
 | --- | --- |
@@ -191,25 +193,28 @@ rolling firmware update.
 | 5 | `FaultCode` numeric value |
 | 6-7 | back-left applied command milli-units |
 | 8-9 | back-right applied command milli-units |
-| 10 | flags: bit 0 fault active, bit 1 BL inverted, bit 2 BR inverted, bit 3 IR beacon detected, bit 4 IR switch raw high, bit 5 IR switch debounced high, bit 6 funnel configured, bit 7 IR acquisition enabled |
-| 11-12 | IR ADC average |
-| 13-14 | IR ADC minimum |
-| 15-16 | IR ADC maximum |
-| 17-18 | IR peak-to-peak amplitude |
-| 19-20 | selected IR frequency in Hz |
-| 21-22 | latest IR ADC sample |
-| 23-24 | 1 kHz Goertzel amplitude |
-| 25-26 | 10 kHz Goertzel amplitude |
-| 27-28 | selected-frequency amplitude |
-| 29-30 | active IR threshold |
-| 31-34 | IR ADC sample rate in Hz |
-| 35 | IR consecutive detection count |
-| 36-37 | funnel applied command milli-units |
-| 38 | flags: bit 0 solar limit switches configured, bit 1 back-right solar limit raw high, bit 2 front-right solar limit raw high, bit 3 side line sensor configured, bit 4 side line sensor raw high, bit 5 ultrasonic 1 configured, bit 6 ultrasonic 1 echo valid |
-| 39-40 | ultrasonic 1 distance in mm |
-| 41-44 | ultrasonic 1 echo pulse duration in us |
-| 45 | Solar Hook flags: bit 0 hardware configured, bit 1 PWM output enabled |
-| 46 | Solar Hook commanded angle in degrees, or `255` when disabled/unset |
+| 10-11 | funnel applied command milli-units |
+| 12 | flags: bit 0 fault active, bit 1 funnel configured, bit 2 solar limit switches configured, bit 3 back-right solar limit raw high, bit 4 front-right solar limit raw high, bit 5 Solar Hook configured, bit 6 Solar Hook output enabled, bit 7 IR acquisition enabled |
+| 13 | Solar Hook commanded angle in degrees, or `255` when disabled/unset |
+| 14-15 | selected IR frequency in Hz |
+| 16-17 | selected-frequency IR amplitude |
+| 18 | flags: bit 0 IR beacon detected, bit 1 BL inverted, bit 2 BR inverted, bit 3 side line sensor configured, bit 4 side line sensor raw high |
+
+### DiagnosticReport
+
+| Byte(s) | Field |
+| --- | --- |
+| 0 | flags: bit 0 IR switch raw high, bit 1 IR switch debounced high |
+| 1-2 | IR ADC average |
+| 3-4 | IR ADC minimum |
+| 5-6 | IR ADC maximum |
+| 7-8 | IR peak-to-peak amplitude |
+| 9-10 | latest IR ADC sample |
+| 11-12 | 1 kHz Goertzel amplitude |
+| 13-14 | 10 kHz Goertzel amplitude |
+| 15-16 | active IR threshold |
+| 17 | IR consecutive detection count |
+| 18-21 | IR ADC sample rate in Hz |
 
 ## TODO
 

@@ -366,3 +366,58 @@ Start validates that the requested travel fits above the current stepper
 position and rejects an active top limit. Runtime tracks the exact jog target,
 faults and stops all outputs if the software motion stops early, and gates the
 later down command on successful completion.
+
+## 2026-08-05: Recover Habitat Pickup After Approach Timeout
+
+Decision: Supersede the terminal GPIO48 approach-timeout behavior. If the
+Habitat Pieces forward approach reaches its configured timeout before the
+limit switch is pressed, stop the forward command, retain
+`APPROACH_LIMIT_TIMEOUT` as the diagnostic reason, and continue through the
+existing bounded pre-lift reverse, slider lift, post-pickup reverse, rear-line
+reacquisition, and placement handoff.
+
+Safety note: The timeout update commands an all-wheel stop before any reverse
+output. The approach duration remains bounded, and all existing command-expiry,
+lift-timeout, rear-line-timeout, stale-communication, and actuator-fault stops
+remain terminal.
+
+## 2026-08-05: Recover Solar After Panel-Contact Timeout
+
+Decision: Keep the existing single Solar correction when only the front-right
+contact switch is hit at the initial right-strafe timeout. If the front switch
+is not hit, advance immediately into the configured post-contact forward phase
+instead of entering `SOLAR_SEARCH_FAULT`. If the single right-strafe retry
+expires without both switches, advance into the same forward phase without
+starting another retry.
+
+Safety note: Both contact strafes remain independently bounded and a timeout
+transition resets the bounded post-contact-forward timer. Contact hardware and
+rear-link availability are still required throughout the phase, and stale
+communication, IMU failure, or command failure remains terminal.
+
+## 2026-08-05: Recover Habitat After Distance-Strafe Timeout
+
+Decision: Supersede the terminal Habitat distance-strafe timeout behavior. If
+the counting strafe expires before reaching its target count, stop lateral
+motion, retain `DISTANCE_STRAFE_TIMEOUT` as the diagnostic reason, and enter the
+normal `POST_COUNT_STOP_DELAY` and exit pulse/check sequence with a fresh bound.
+If that renewed exit bound expires, advance into `APPROACH_PIECE` when the
+concurrent slide search is complete or the stopped `LOWER_SLIDE` wait otherwise.
+
+Safety note: The timeout remains bounded and its transition emits stopped
+chassis outputs before the approach can drive on the next control update.
+Slide, lift, rear-line, communication, IMU, and actuator faults remain
+terminal.
+
+## 2026-08-05: Open Solar Hook After Front-Line Reacquisition
+
+Decision: Supersede the concurrent final-strafe hook raise. Start the bounded
+funnel opening with the final left line-return strafe, but keep the Solar Hook
+closed until either front sensor detects tape. Stop the strafe first, then
+command the hook open and begin the forward line-follow exit. Keep the hook
+powered open through the Habitat and Tower handoffs as before.
+
+Safety note: The hook-open command is gated on the same fresh ESP1 status and
+configured hook hardware checks used by Solar start. A missing or failed hook
+command remains terminal, the line-reacquisition strafe remains bounded, and
+all chassis outputs are stopped before the servo command is issued.

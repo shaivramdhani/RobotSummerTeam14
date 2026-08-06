@@ -102,6 +102,7 @@ struct Esp2Pins {
   int imu_scl{17};
   int line_sensor_front_left{8};     // Digital comparator, HIGH = black tape
   int line_sensor_front_right{7};    // Digital comparator, HIGH = black tape                  // GPIO, active level TODO
+  int final_competition_start_switch{10};  // LOW = stop, LOW-to-HIGH = start
   int pwm_front_left_0{15};           // TODO: GPIO, PWM resource
   int pwm_front_left_1{16};           // TODO: GPIO, PWM resource
   int pwm_front_right_0{41};          // TODO: GPIO, PWM resource
@@ -162,6 +163,39 @@ inline constexpr Esp2HardwareConfig kHardwareConfig{
 
 static_assert(kPins.servo_habitat_pusher != kPins.servo_winch,
               "Habitat Pusher and winch must use distinct GPIOs");
+static_assert(kPins.final_competition_start_switch == 10,
+              "Final Competition start switch must use ESP2 GPIO10");
+static_assert(
+    kPins.final_competition_start_switch != kPins.imu_sda &&
+        kPins.final_competition_start_switch != kPins.imu_scl &&
+        kPins.final_competition_start_switch !=
+            kPins.line_sensor_front_left &&
+        kPins.final_competition_start_switch !=
+            kPins.line_sensor_front_right &&
+        kPins.final_competition_start_switch != kPins.pwm_front_left_0 &&
+        kPins.final_competition_start_switch != kPins.pwm_front_left_1 &&
+        kPins.final_competition_start_switch != kPins.pwm_front_right_0 &&
+        kPins.final_competition_start_switch != kPins.pwm_front_right_1 &&
+        kPins.final_competition_start_switch != kPins.stepper_step &&
+        kPins.final_competition_start_switch != kPins.stepper_dir &&
+        kPins.final_competition_start_switch != kPins.stepper_sleep &&
+        kPins.final_competition_start_switch != kPins.servo_claw_1 &&
+        kPins.final_competition_start_switch != kPins.servo_claw_2 &&
+        kPins.final_competition_start_switch != kPins.servo_claw_3 &&
+        kPins.final_competition_start_switch !=
+            kPins.servo_habitat_pusher &&
+        kPins.final_competition_start_switch != kPins.servo_winch &&
+        kPins.final_competition_start_switch !=
+            kPins.limit_switch_habitat_piece &&
+        kPins.final_competition_start_switch !=
+            kPins.limit_switch_stepper_bottom &&
+        kPins.final_competition_start_switch !=
+            kPins.limit_switch_stepper_top &&
+        kPins.final_competition_start_switch !=
+            kPins.limit_switch_funnel_left &&
+        kPins.final_competition_start_switch != kPins.uart_tx_to_esp1 &&
+        kPins.final_competition_start_switch != kPins.uart_rx_from_esp1,
+    "Final Competition start switch GPIO must have one software owner");
 static_assert(kPins.limit_switch_habitat_piece != kPins.servo_habitat_pusher &&
                   kPins.limit_switch_habitat_piece != kPins.servo_winch,
               "Habitat-piece limit switch must not share a servo GPIO");

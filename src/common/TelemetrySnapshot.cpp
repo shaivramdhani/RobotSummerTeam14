@@ -658,6 +658,7 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"opening_hook_and_funnel\":%s,"
                 "\"post_contact_forward_start_delay_ms\":%u,"
                 "\"line_reacquire_strafe_start_delay_ms\":%u,"
+                "\"line_reacquire_strafe_timeout_ms\":%u,"
                 "\"post_contact_forward_duty\":%.5f,"
                 "\"limit_switches\":{\"configured\":%s,"
                 "\"back_right_high\":%s,\"front_right_high\":%s,"
@@ -727,6 +728,8 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                     snapshot.solar_post_contact_forward_start_delay_ms),
                 static_cast<unsigned>(
                     snapshot.solar_line_reacquire_strafe_start_delay_ms),
+                static_cast<unsigned>(
+                    snapshot.solar_line_reacquire_strafe_timeout_ms),
                 snapshot.solar_post_contact_forward_duty,
                 jsonBool(
                     snapshot.solar_panel_limit_switches_configured),
@@ -1339,10 +1342,6 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 "\"solar_limit_front_right_high\":%s,"
                 "\"side_line_sensor_configured\":%s,"
                 "\"side_line_sensor_high\":%s,"
-                "\"ultrasonic_1_configured\":%s,"
-                "\"ultrasonic_1_echo_valid\":%s,"
-                "\"ultrasonic_1_distance_mm\":%u,"
-                "\"ultrasonic_1_echo_duration_us\":%u,"
                 "\"solar_hook_configured\":%s,"
                 "\"solar_hook_output_enabled\":%s,"
                 "\"solar_hook_commanded_angle_deg\":%d,"
@@ -1364,27 +1363,10 @@ bool writeTelemetryJson(const TelemetrySnapshot& snapshot, char* output,
                 jsonBool(snapshot.esp1.solar_limit_front_right_high),
                 jsonBool(snapshot.esp1.side_line_sensor_configured),
                 jsonBool(snapshot.esp1.side_line_sensor_high),
-                jsonBool(snapshot.esp1.ultrasonic_1_configured),
-                jsonBool(snapshot.esp1.ultrasonic_1_echo_valid),
-                static_cast<unsigned>(
-                    snapshot.esp1.ultrasonic_1_distance_mm),
-                static_cast<unsigned>(
-                    snapshot.esp1.ultrasonic_1_echo_duration_us),
                 jsonBool(snapshot.esp1.solar_hook_configured),
                 jsonBool(snapshot.esp1.solar_hook_output_enabled),
                 snapshot.esp1.solar_hook_commanded_angle_deg,
                 jsonBool(snapshot.esp1.ir_acquisition_enabled));
-
-  writer.append(
-      ",\"ultrasonic_1\":{\"configured\":%s,\"data_fresh\":%s,"
-      "\"echo_valid\":%s,\"distance_mm\":%u,\"echo_duration_us\":%u,"
-      "\"sample_age_ms\":%u}",
-      jsonBool(snapshot.ultrasonic_1.configured),
-      jsonBool(snapshot.ultrasonic_1.data_fresh),
-      jsonBool(snapshot.ultrasonic_1.echo_valid),
-      static_cast<unsigned>(snapshot.ultrasonic_1.distance_mm),
-      static_cast<unsigned>(snapshot.ultrasonic_1.echo_duration_us),
-      static_cast<unsigned>(snapshot.ultrasonic_1.sample_age_ms));
 
   writer.append(
       ",\"laser_distance\":{\"available\":%s,\"configured\":%s,"

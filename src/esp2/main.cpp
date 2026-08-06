@@ -17,9 +17,11 @@
 #include <type_traits>
 
 #include "common/ChassisMixer.h"
+#include "common/CommandTransmissionPolicy.h"
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
 #include "common/FinalCompetitionAutonomy.h"
+#include "common/FinalCompetitionStartSwitch.h"
 #include "common/FunnelCommand.h"
 #include "common/HabitatCycleAutonomy.h"
 #include "common/HabitatPiecesAutonomy.h"
@@ -207,6 +209,8 @@ constexpr robot::Milliseconds SOLAR_RETRY_STRAFE_TIMEOUT_MS =
 constexpr robot::Milliseconds SOLAR_POST_CONTACT_FORWARD_DURATION_MS = 1300U;
 constexpr robot::Milliseconds SOLAR_POST_CONTACT_FORWARD_START_DELAY_MS = 500U;
 constexpr robot::Milliseconds SOLAR_LINE_REACQUIRE_STRAFE_START_DELAY_MS = 500U;
+constexpr robot::Milliseconds SOLAR_LINE_REACQUIRE_STRAFE_TIMEOUT_MS =
+    SOLAR_CONTACT_TIMEOUT_MS;
 constexpr float SOLAR_POST_CONTACT_FORWARD_DUTY = SOLAR_RETRY_FORWARD_DUTY;
 // Team wiring report: raw HIGH means the solar side switch has been hit.
 constexpr bool SOLAR_LIMIT_SWITCH_HIT_WHEN_HIGH = true;
@@ -232,7 +236,8 @@ constexpr robot::SolarPanelContactConfig kSolarPanelContactConfig{
     0U,    // TODO(team): tune the forward PID duration in telemetry.
     0.0F,  // TODO(team): tune the forward PID duty in telemetry.
     0.0F,  // TODO(team): calibrate signed funnel-open duty in telemetry.
-    0U};   // TODO(team): calibrate funnel-open duration in telemetry.
+    0U,    // TODO(team): calibrate funnel-open duration in telemetry.
+    SOLAR_LINE_REACQUIRE_STRAFE_TIMEOUT_MS};
 
 static_assert(IR_BEACON_RELEASE_THRESHOLD_1KHZ <=
                   IR_BEACON_DETECT_THRESHOLD_1KHZ,
@@ -258,6 +263,8 @@ static_assert(SOLAR_STRAFE_START_DELAY_MS > 0U,
               "solar strafe start delay must be nonzero");
 static_assert(SOLAR_RETRY_STRAFE_TIMEOUT_MS > 0U,
               "solar retry strafe timeout must be nonzero");
+static_assert(SOLAR_LINE_REACQUIRE_STRAFE_TIMEOUT_MS > 0U,
+              "solar line-reacquire strafe timeout must be nonzero");
 static_assert(SOLAR_POST_CONTACT_FORWARD_DUTY >= 0.0F &&
                   SOLAR_POST_CONTACT_FORWARD_DUTY <= 1.0F,
               "solar post-contact forward duty must be in [0, 1]");
@@ -667,12 +674,39 @@ class RearCommandLink {
       return false;
     }
 
+    const bool semantic_change =
+        !last_rear_command_available_ ||
+        !sameRearCommandState(command, last_rear_command_);
+    if (!robot::commandTransmissionDue(
+            rear_transmission_state_, semantic_change, command.enabled,
+            command.sender_timestamp_ms,
+            robot::commandRefreshPeriodMs(command.timeout_ms))) {
+      return true;
+    }
+
     const std::uint16_t sequence = next_sequence_++;
     const robot::UartPacket packet =
         robot::makeRearDriveCommandPacket(command, sequence);
     const bool sent = sendPacket(packet);
-    last_rear_sequence_sent_ = sequence;
-    last_rear_sent_at_ms_ = command.sender_timestamp_ms;
+    if (sent) {
+      const bool rear_line_request_changed =
+          !last_rear_command_available_ ||
+          command.rear_line_acquisition_enabled !=
+              last_rear_command_.rear_line_acquisition_enabled;
+      if (rear_line_request_changed) {
+        rear_line_acquisition_requested_ =
+            command.rear_line_acquisition_enabled;
+        rear_line_snapshot_received_for_request_ = false;
+        rear_line_request_started_at_ms_ = command.sender_timestamp_ms;
+      }
+      last_rear_command_ = command;
+      last_rear_command_available_ = true;
+      robot::noteCommandTransmitted(rear_transmission_state_,
+                                    semantic_change,
+                                    command.sender_timestamp_ms);
+      last_rear_sequence_sent_ = sequence;
+      last_rear_sent_at_ms_ = command.sender_timestamp_ms;
+    }
     return sent;
   }
 
@@ -682,10 +716,28 @@ class RearCommandLink {
       return false;
     }
 
+    const bool semantic_change =
+        !last_funnel_command_available_ ||
+        !sameFunnelCommandState(command, last_funnel_command_);
+    if (!robot::commandTransmissionDue(
+            funnel_transmission_state_, semantic_change, command.enabled,
+            command.sender_timestamp_ms,
+            robot::commandRefreshPeriodMs(command.timeout_ms))) {
+      return true;
+    }
+
     const std::uint16_t sequence = next_sequence_++;
     const robot::UartPacket packet =
         robot::makeFunnelCommandPacket(command, sequence);
-    return sendPacket(packet);
+    const bool sent = sendPacket(packet);
+    if (sent) {
+      last_funnel_command_ = command;
+      last_funnel_command_available_ = true;
+      robot::noteCommandTransmitted(funnel_transmission_state_,
+                                    semantic_change,
+                                    command.sender_timestamp_ms);
+    }
+    return sent;
   }
 
   bool send(const robot::SolarHookCommand& command) {
@@ -694,13 +746,60 @@ class RearCommandLink {
       return false;
     }
 
+    const robot::Milliseconds now_ms =
+        static_cast<robot::Milliseconds>(millis());
+    const bool semantic_change =
+        !last_solar_hook_command_available_ ||
+        !sameSolarHookCommandState(command, last_solar_hook_command_);
+    if (!robot::commandTransmissionDue(
+            solar_hook_transmission_state_, semantic_change, false, now_ms,
+            robot::commandRefreshPeriodMs(
+                robot::kDefaultCommunicationTimeoutMs))) {
+      return true;
+    }
+
     const std::uint16_t sequence = next_sequence_++;
     const robot::UartPacket packet =
         robot::makeSolarHookCommandPacket(command, sequence);
-    return sendPacket(packet);
+    const bool sent = sendPacket(packet);
+    if (sent) {
+      last_solar_hook_command_ = command;
+      last_solar_hook_command_available_ = true;
+      robot::noteCommandTransmitted(solar_hook_transmission_state_,
+                                    semantic_change, now_ms);
+    }
+    return sent;
   }
 
  private:
+  static bool sameRearCommandState(
+      const robot::RearDriveCommand& lhs,
+      const robot::RearDriveCommand& rhs) {
+    return lhs.enabled == rhs.enabled &&
+           lhs.back_left_command_milli == rhs.back_left_command_milli &&
+           lhs.back_right_command_milli == rhs.back_right_command_milli &&
+           lhs.timeout_ms == rhs.timeout_ms &&
+           lhs.laser_acquisition_enabled == rhs.laser_acquisition_enabled &&
+           lhs.ir_acquisition_enabled == rhs.ir_acquisition_enabled &&
+           lhs.rear_line_acquisition_enabled ==
+               rhs.rear_line_acquisition_enabled &&
+           lhs.laser_profile == rhs.laser_profile;
+  }
+
+  static bool sameFunnelCommandState(
+      const robot::FunnelCommand& lhs,
+      const robot::FunnelCommand& rhs) {
+    return lhs.enabled == rhs.enabled &&
+           lhs.command_milli == rhs.command_milli &&
+           lhs.timeout_ms == rhs.timeout_ms;
+  }
+
+  static bool sameSolarHookCommandState(
+      const robot::SolarHookCommand& lhs,
+      const robot::SolarHookCommand& rhs) {
+    return lhs.enabled == rhs.enabled && lhs.angle_deg == rhs.angle_deg;
+  }
+
   bool sendPacket(const robot::UartPacket& packet) {
     std::uint8_t frame[robot::kUartFrameOverheadSize +
                        robot::kUartMaxPayloadSize]{};
@@ -732,11 +831,19 @@ class RearCommandLink {
       if (status == robot::UartFrameParserStatus::PacketReady) {
         if (packet.header.message_type ==
             robot::UartMessageType::HealthReport) {
-          robot::Esp1StatusReport report{};
+          robot::Esp1StatusReport report = latest_status_;
           if (robot::decodeEsp1StatusPacket(packet, report)) {
             latest_status_ = report;
             last_status_received_at_ms_ = now_ms;
             status_available_ = true;
+          } else {
+            ++packet_error_count_;
+          }
+        } else if (packet.header.message_type ==
+                   robot::UartMessageType::DiagnosticReport) {
+          robot::Esp1StatusReport report = latest_status_;
+          if (robot::decodeEsp1DiagnosticsPacket(packet, report)) {
+            latest_status_ = report;
           } else {
             ++packet_error_count_;
           }
@@ -752,6 +859,9 @@ class RearCommandLink {
               last_rear_line_sequence_ = packet.header.sequence;
               last_rear_line_received_at_ms_ = now_ms;
               rear_line_snapshot_available_ = true;
+              if (rear_line_acquisition_requested_) {
+                rear_line_snapshot_received_for_request_ = true;
+              }
             }
           } else {
             ++packet_error_count_;
@@ -826,6 +936,16 @@ class RearCommandLink {
   std::uint16_t lastRearLineSequence() const {
     return last_rear_line_sequence_;
   }
+  bool rearLineAcquisitionRequested() const {
+    return rear_line_acquisition_requested_;
+  }
+  bool rearLineStreamWarming() const {
+    return rear_line_acquisition_requested_ &&
+           !rear_line_snapshot_received_for_request_;
+  }
+  robot::Milliseconds rearLineRequestStartedAtMs() const {
+    return rear_line_request_started_at_ms_;
+  }
   bool laserSnapshotAvailable() const {
     return laser_snapshot_available_;
   }
@@ -860,6 +980,18 @@ class RearCommandLink {
   std::uint32_t packet_error_count_{0};
   std::uint16_t last_rear_line_sequence_{0};
   std::uint16_t last_laser_packet_sequence_{0};
+  robot::CommandTransmissionState rear_transmission_state_{};
+  robot::CommandTransmissionState funnel_transmission_state_{};
+  robot::CommandTransmissionState solar_hook_transmission_state_{};
+  robot::RearDriveCommand last_rear_command_{};
+  robot::FunnelCommand last_funnel_command_{};
+  robot::SolarHookCommand last_solar_hook_command_{};
+  bool last_rear_command_available_{false};
+  bool last_funnel_command_available_{false};
+  bool last_solar_hook_command_available_{false};
+  bool rear_line_acquisition_requested_{false};
+  bool rear_line_snapshot_received_for_request_{false};
+  robot::Milliseconds rear_line_request_started_at_ms_{0U};
   robot::Esp1StatusReport latest_status_{};
   robot::RearLineSensorSnapshot latest_rear_line_snapshot_{};
   robot::LaserDistanceSnapshot latest_laser_snapshot_{};
@@ -1011,12 +1143,15 @@ class ClawServoBank {
                kClawServoUnsetAngleDeg;
   }
 
-  bool allClawOpenTargetsConfigured() const {
+  bool allClawTargetsConfigured() const {
     for (std::size_t index = 0U; index < kClawServoCount; ++index) {
       int target_angle_deg = kClawServoUnsetAngleDeg;
       if (targetAngle(index, ClawServoPositionRequest::Open,
                       target_angle_deg) !=
-          ClawServoCommandResult::Accepted) {
+              ClawServoCommandResult::Accepted ||
+          targetAngle(index, ClawServoPositionRequest::Closed,
+                      target_angle_deg) !=
+              ClawServoCommandResult::Accepted) {
         return false;
       }
     }
@@ -1037,6 +1172,36 @@ class ClawServoBank {
       return ClawServoCommandResult::PwmWriteFailed;
     }
     commanded_open_[index] = request == ClawServoPositionRequest::Open;
+    return ClawServoCommandResult::Accepted;
+  }
+
+  ClawServoCommandResult commandExclusiveOpenClaw(
+      const std::size_t open_claw_index) {
+    if (open_claw_index >= kClawServoCount) {
+      return ClawServoCommandResult::InvalidClaw;
+    }
+
+    std::array<int, kClawServoCount> target_angles_deg{
+        {kClawServoUnsetAngleDeg, kClawServoUnsetAngleDeg,
+         kClawServoUnsetAngleDeg}};
+    for (std::size_t index = 0U; index < kClawServoCount; ++index) {
+      const ClawServoPositionRequest request =
+          index == open_claw_index ? ClawServoPositionRequest::Open
+                                   : ClawServoPositionRequest::Closed;
+      const ClawServoCommandResult result =
+          targetAngle(index, request, target_angles_deg[index]);
+      if (result != ClawServoCommandResult::Accepted) {
+        return result;
+      }
+    }
+
+    for (std::size_t index = 0U; index < kClawServoCount; ++index) {
+      if (!writeAngle(index, target_angles_deg[index])) {
+        disableOutput(index);
+        return ClawServoCommandResult::PwmWriteFailed;
+      }
+      commanded_open_[index] = index == open_claw_index;
+    }
     return ClawServoCommandResult::Accepted;
   }
 
@@ -1385,6 +1550,7 @@ struct RuntimeContext {
   ImuTurnAvailabilityFaultCapture imu_turn_availability_fault{};
   std::uint32_t imu_heading_reset_pending_sequence{0U};
   robot::Milliseconds autonomous_state_entered_at_ms{0};
+  robot::Milliseconds solar_funnel_open_started_at_ms{0U};
   char command_buffer[kSerialCommandBufferSize]{};
   std::size_t command_length{0};
   robot::Milliseconds last_telemetry_at_ms{0};
@@ -1399,13 +1565,19 @@ struct RuntimeContext {
   std::int8_t rear_line_sensor_last_known_side{0};
   bool command_deadman_armed{false};
   bool solar_start_requested{false};
+  bool solar_completion_mechanisms_started{false};
+  bool solar_funnel_open_complete{false};
   bool habitat_pieces_start_requested{false};
   bool habitat_placement_start_requested{false};
   bool tower_pieces_start_requested{false};
   bool peg_finder_start_requested{false};
+  bool peg_finder_tower_handoff_active{false};
+  bool peg_finder_tower_handoff_winch_closed{false};
   bool time_trial_start_requested{false};
   bool final_competition_start_requested{false};
+  robot::FinalCompetitionStartSwitchState final_competition_start_switch{};
   bool solar_hook_commanded_open{false};
+  bool solar_hook_hold_open_for_mission{false};
   bool fault_active{false};
   bool imu_disconnect_active{false};
   bool imu_disconnect_observed{false};
@@ -1439,6 +1611,32 @@ struct RuntimeBindings {
 };
 
 RuntimeBindings g_runtime{};
+
+bool refreshSharedImuSnapshot(RuntimeContext& context) {
+  if (g_runtime.imu_acquisition == nullptr) {
+    context.imu_shared_snapshot_available = false;
+    context.imu_shared_snapshot_fetched_at_us = micros();
+    return false;
+  }
+
+  context.imu_shared_snapshot_available =
+      g_runtime.imu_acquisition->latest(context.latest_imu_snapshot);
+  context.imu_shared_snapshot_fetched_at_us = micros();
+  if (context.imu_shared_snapshot_available &&
+      context.latest_imu_snapshot
+              .last_successful_sample_published_at_us != 0U) {
+    const std::uint32_t observed_publication_gap_us =
+        context.imu_shared_snapshot_fetched_at_us -
+        context.latest_imu_snapshot
+            .last_successful_sample_published_at_us;
+    if (observed_publication_gap_us >
+        context.maximum_observed_imu_publication_gap_us) {
+      context.maximum_observed_imu_publication_gap_us =
+          observed_publication_gap_us;
+    }
+  }
+  return context.imu_shared_snapshot_available;
+}
 
 float hardwareDutyCap() {
   return clampFloat(robot::esp2::kHardwareConfig.maximum_safe_test_duty, 0.0F,
@@ -1540,6 +1738,35 @@ bool habitatLaserAcquisitionRequested(const RuntimeContext& context) {
          (context.habitat_cycle.phase ==
               robot::HabitatCyclePhase::Placement &&
           placement_active);
+}
+
+bool rearLineAcquisitionRequested(const RuntimeContext& context) {
+  switch (context.modes.currentMode()) {
+    case robot::RobotTestMode::RearLineSensorTest:
+    case robot::RobotTestMode::RearLineFollowTest:
+    case robot::RobotTestMode::HabitatPieces:
+    case robot::RobotTestMode::HabitatPlacement:
+    case robot::RobotTestMode::AutonomousTowerPieces:
+      return true;
+    case robot::RobotTestMode::TimeTrial:
+      return context.time_trial.state ==
+                 robot::TimeTrialState::WaitForStart ||
+             context.time_trial.state ==
+                 robot::TimeTrialState::PostSolarDelay ||
+             context.time_trial.state ==
+                 robot::TimeTrialState::SolarToTowerStrafeRight ||
+             context.time_trial.state ==
+                 robot::TimeTrialState::TowerPieces;
+    case robot::RobotTestMode::FinalCompetition:
+      return context.final_competition.state ==
+                 robot::FinalCompetitionState::WaitForStart ||
+             context.final_competition.state ==
+                 robot::FinalCompetitionState::HabitatCycle ||
+             context.final_competition.state ==
+                 robot::FinalCompetitionState::TowerPieces;
+    default:
+      return false;
+  }
 }
 
 robot::LineFollowerConfig habitatPiecesLineFollowerConfig(
@@ -1709,6 +1936,9 @@ void resetSolarPanelAutonomy(RuntimeContext& context,
   context.autonomous_fault_reason = robot::SolarPanelFaultReason::None;
   context.autonomous_state_entered_at_ms = now_ms;
   context.solar_start_requested = false;
+  context.solar_funnel_open_started_at_ms = 0U;
+  context.solar_completion_mechanisms_started = false;
+  context.solar_funnel_open_complete = false;
   robot::resetImuHeadingHoldController(context.imu_heading_hold_state);
   context.last_imu_heading_hold_update = {};
   robot::cancelImuRecovery(context.imu_strafe_recovery);
@@ -1781,6 +2011,8 @@ void resetPegFinder(RuntimeContext& context,
                     const robot::Milliseconds now_ms) {
   robot::resetPegFinderAutonomy(context.peg_finder, now_ms);
   context.peg_finder_start_requested = false;
+  context.peg_finder_tower_handoff_active = false;
+  context.peg_finder_tower_handoff_winch_closed = false;
   robot::resetImuTurnController(context.imu_turn_state);
   context.last_imu_turn_update = {};
   robot::cancelImuRecovery(context.imu_turn_recovery);
@@ -1974,7 +2206,8 @@ bool sendStoppedRearCommand(RearCommandLink& rear_link,
                             const robot::LaserDistanceProfile laser_profile =
                                 robot::kOperationalLaserDistanceProfile,
                             const bool laser_acquisition_enabled = false,
-                            const bool ir_acquisition_enabled = false) {
+                            const bool ir_acquisition_enabled = false,
+                            const bool rear_line_acquisition_enabled = false) {
   robot::RearDriveCommand command{};
   command.enabled = false;
   command.sender_timestamp_ms = now_ms;
@@ -1982,6 +2215,8 @@ bool sendStoppedRearCommand(RearCommandLink& rear_link,
   command.laser_profile = laser_profile;
   command.laser_acquisition_enabled = laser_acquisition_enabled;
   command.ir_acquisition_enabled = ir_acquisition_enabled;
+  command.rear_line_acquisition_enabled =
+      rear_line_acquisition_enabled;
   return rear_link.send(command);
 }
 
@@ -2036,6 +2271,101 @@ bool sendSolarHookPosition(RuntimeContext& context,
   return true;
 }
 
+enum class SolarCompletionMechanismResult : std::uint8_t {
+  Running = 0,
+  Complete = 1,
+  HardwareUnavailable = 2,
+  SolarHookCommandFailed = 3,
+  FunnelCommandFailed = 4,
+};
+
+SolarCompletionMechanismResult startSolarFunnelOpening(
+    RuntimeContext& context, RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms) {
+  if (context.solar_completion_mechanisms_started) {
+    return context.solar_funnel_open_complete
+               ? SolarCompletionMechanismResult::Complete
+               : SolarCompletionMechanismResult::Running;
+  }
+  if (!rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config)) ||
+      !rear_link.latestStatus().solar_hook_configured ||
+      !rear_link.latestStatus().funnel_configured) {
+    return SolarCompletionMechanismResult::HardwareUnavailable;
+  }
+
+  context.solar_funnel_open_started_at_ms = now_ms;
+  context.solar_completion_mechanisms_started = true;
+  context.solar_funnel_open_complete = false;
+  context.requested_funnel_command = makeTimedMotorCommand(
+      context.solar_contact_config.funnel_open_duty, now_ms,
+      context.config.remoteCommandTimeoutMs);
+  if (!sendFunnelMotorCommand(rear_link,
+                              context.requested_funnel_command,
+                              context.config, now_ms)) {
+    context.requested_funnel_command = robot::disabledMotorCommand();
+    context.solar_completion_mechanisms_started = false;
+    return SolarCompletionMechanismResult::FunnelCommandFailed;
+  }
+  context.last_command_ms = now_ms;
+  return SolarCompletionMechanismResult::Running;
+}
+
+SolarCompletionMechanismResult openSolarHookForMission(
+    RuntimeContext& context, RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms) {
+  if (!rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config)) ||
+      !rear_link.latestStatus().solar_hook_configured) {
+    return SolarCompletionMechanismResult::HardwareUnavailable;
+  }
+  if (!sendSolarHookPosition(context, rear_link, true)) {
+    return SolarCompletionMechanismResult::SolarHookCommandFailed;
+  }
+  context.solar_hook_hold_open_for_mission = true;
+  return SolarCompletionMechanismResult::Complete;
+}
+
+SolarCompletionMechanismResult serviceSolarCompletionMechanisms(
+    RuntimeContext& context, RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms) {
+  if (!context.solar_completion_mechanisms_started) {
+    return SolarCompletionMechanismResult::HardwareUnavailable;
+  }
+  if (context.solar_funnel_open_complete) {
+    return SolarCompletionMechanismResult::Complete;
+  }
+  if (!rear_link.remoteStatusFresh(
+          now_ms, remoteStatusTimeoutMs(context.config)) ||
+      !rear_link.latestStatus().solar_hook_configured ||
+      !rear_link.latestStatus().funnel_configured) {
+    return SolarCompletionMechanismResult::HardwareUnavailable;
+  }
+
+  const robot::Milliseconds funnel_elapsed_ms = elapsedSince(
+      now_ms, context.solar_funnel_open_started_at_ms);
+  if (funnel_elapsed_ms >=
+      context.solar_contact_config.funnel_open_duration_ms) {
+    context.requested_funnel_command = robot::disabledMotorCommand();
+    if (!sendStoppedFunnelCommand(rear_link, context.config, now_ms)) {
+      return SolarCompletionMechanismResult::FunnelCommandFailed;
+    }
+    context.solar_funnel_open_complete = true;
+    return SolarCompletionMechanismResult::Complete;
+  }
+
+  context.requested_funnel_command = makeTimedMotorCommand(
+      context.solar_contact_config.funnel_open_duty, now_ms,
+      context.config.remoteCommandTimeoutMs);
+  if (!sendFunnelMotorCommand(rear_link,
+                              context.requested_funnel_command,
+                              context.config, now_ms)) {
+    return SolarCompletionMechanismResult::FunnelCommandFailed;
+  }
+  context.last_command_ms = now_ms;
+  return SolarCompletionMechanismResult::Running;
+}
+
 bool disableMotionActuators(RuntimeContext& context,
                             robot::IMotorOutput& front_left,
                             robot::IMotorOutput& front_right,
@@ -2053,7 +2383,8 @@ bool disableMotionActuators(RuntimeContext& context,
   return sendStoppedRearCommand(rear_link, context.config, now_ms,
                                 laser_profile,
                                 habitatLaserAcquisitionRequested(context),
-                                solarIrAcquisitionRequested(context));
+                                solarIrAcquisitionRequested(context),
+                                rearLineAcquisitionRequested(context));
 }
 
 bool stopAutonomyDriveAndFunnel(RuntimeContext& context,
@@ -2078,6 +2409,8 @@ void disableActuators(RuntimeContext& context, robot::IMotorOutput& front_left,
   context.requested_funnel_command = robot::disabledMotorCommand();
   sendStoppedFunnelCommand(rear_link, context.config, now_ms);
   sendStoppedSolarHookCommand(rear_link);
+  context.solar_hook_commanded_open = false;
+  context.solar_hook_hold_open_for_mission = false;
   if (g_runtime.claws != nullptr) {
     g_runtime.claws->disable();
   }
@@ -2321,6 +2654,7 @@ bool habitatPiecesMotionRequirementsMet(
     const DualPwmMotorOutput& front_right,
     const RearCommandLink& rear_link,
     const DigitalActiveHighLimitSwitch& habitat_piece_limit,
+    const ClawServoBank& claws,
     const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
     const RuntimeContext& context) {
@@ -2332,6 +2666,7 @@ bool habitatPiecesMotionRequirementsMet(
          gpioAssigned(robot::esp2::kPins.stepper_step) &&
          gpioAssigned(robot::esp2::kPins.limit_switch_stepper_bottom) &&
          gpioAssigned(robot::esp2::kPins.limit_switch_stepper_top) &&
+         claws.habitatPusherTargetsConfigured() &&
          stepper.maximumPositionSteps() > 0 &&
          habitatPiecesProfileConfigValid(
              context, context.habitat_pieces_config, stepper);
@@ -2343,12 +2678,13 @@ bool habitatPiecesStartRequirementsMet(
     const DualPwmMotorOutput& front_right,
     const RearCommandLink& rear_link,
     const DigitalActiveHighLimitSwitch& habitat_piece_limit,
+    const ClawServoBank& claws,
     const robot::esp2::StepperAxis& stepper,
     const robot::Milliseconds now_ms,
     const RuntimeContext& context) {
   return habitatPiecesMotionRequirementsMet(
              sensors, front_left, front_right, rear_link,
-             habitat_piece_limit, stepper, now_ms, context) &&
+             habitat_piece_limit, claws, stepper, now_ms, context) &&
          imuReadyForAutonomousMotion(context) &&
          rear_link.rearLineSnapshotFresh(
              now_ms, context.config.remoteCommandTimeoutMs) &&
@@ -2546,7 +2882,7 @@ bool habitatSequenceStartRequirementsMet(
          (!any_placement_uses_front_line || sensors.configured()) &&
          habitatPiecesStartRequirementsMet(
              sensors, front_left, front_right, rear_link,
-             habitat_piece_limit, stepper, now_ms, context) &&
+             habitat_piece_limit, claws, stepper, now_ms, context) &&
          habitatPlacementStartRequirementsMet(
              sensors, front_left, front_right, rear_link, claws,
              stepper, now_ms, context);
@@ -2566,7 +2902,7 @@ bool pegFinderStartRequirementsMet(
              now_ms, remoteStatusTimeoutMs(context.rear_config)) &&
          rear_link.latestStatus().funnel_configured &&
          funnel_limit.configured() &&
-         claws.allClawOpenTargetsConfigured() &&
+         claws.allClawTargetsConfigured() &&
          context.imu_heading_reset_pending_sequence == 0U &&
          std::strcmp(robot::esp2::imuDisconnectReason(
                          context.latest_imu_snapshot, micros(),
@@ -2617,6 +2953,8 @@ bool solarPanelStartRequirementsMet(
          std::fabs(context.solar_contact_config.funnel_open_duty) <=
              funnelMotionDutyCap() &&
          context.solar_contact_config.funnel_open_duration_ms <=
+             kMaxTimedTestDurationMs &&
+         context.solar_contact_config.line_reacquire_strafe_timeout_ms <=
              kMaxTimedTestDurationMs;
 }
 
@@ -2671,7 +3009,8 @@ bool sendRearWheelCommand(RearCommandLink& rear_link,
                           const robot::Milliseconds now_ms,
                           const robot::LaserDistanceProfile laser_profile,
                           const bool laser_acquisition_enabled,
-                          const bool ir_acquisition_enabled) {
+                          const bool ir_acquisition_enabled,
+                          const bool rear_line_acquisition_enabled) {
   robot::RearDriveCommand rear{};
   rear.enabled = wheels.back_left.enabled || wheels.back_right.enabled;
   rear.back_left_command_milli = wheels.back_left.duty_command_milli;
@@ -2681,6 +3020,8 @@ bool sendRearWheelCommand(RearCommandLink& rear_link,
   rear.laser_profile = laser_profile;
   rear.laser_acquisition_enabled = laser_acquisition_enabled;
   rear.ir_acquisition_enabled = ir_acquisition_enabled;
+  rear.rear_line_acquisition_enabled =
+      rear_line_acquisition_enabled;
   return rear_link.send(rear);
 }
 
@@ -2699,7 +3040,8 @@ bool applyWheelCommand(RuntimeContext& context,
   return sendRearWheelCommand(rear_link, wheels, command_config, now_ms,
                               laser_profile,
                               habitatLaserAcquisitionRequested(context),
-                              solarIrAcquisitionRequested(context));
+                              solarIrAcquisitionRequested(context),
+                              rearLineAcquisitionRequested(context));
 }
 
 enum class AutonomousImuMotionResult {
@@ -2815,6 +3157,11 @@ AutonomousImuRecoveryUpdate serviceAutonomousImuRecovery(
     const robot::LineFollowerConfig& command_config,
     const robot::Milliseconds now_ms) {
   AutonomousImuRecoveryUpdate service_update{};
+  // WebServer callbacks and other core-1 work run between the loop's initial
+  // snapshot copy and autonomous motion. Re-peek the producer queue at the
+  // safety gate so a healthy current sample cannot be rejected merely because
+  // the earlier cached copy aged while that work completed.
+  (void)refreshSharedImuSnapshot(context);
   const robot::esp2::ImuState& imu_state =
       context.latest_imu_snapshot.state;
   const robot::ImuRecoveryUpdate recovery_update =
@@ -2898,14 +3245,22 @@ AutonomousImuMotionResult runAutonomousImuStrafe(
     DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
     const robot::LineFollowerConfig& command_config,
     const int lateral_direction, const float strafe_duty,
-    const robot::Milliseconds now_ms) {
+    const robot::Milliseconds now_ms,
+    const bool refresh_and_validate_imu = true) {
+  // Habitat passes false only after serviceAutonomousImuRecovery validated the
+  // cached snapshot in the same phase invocation. Reusing that exact snapshot
+  // keeps recovery and control on one coherent availability decision.
+  if (refresh_and_validate_imu) {
+    (void)refreshSharedImuSnapshot(context);
+  }
   robot::ImuHeadingHoldConfig active_config =
       context.imu_heading_hold_config;
   active_config.maximum_strafe_duty = strafe_duty;
   if (!imuHeadingHoldRuntimeConfigValid(active_config)) {
     return AutonomousImuMotionResult::InvalidConfiguration;
   }
-  if (!imuReadyForAutonomousMotion(context)) {
+  if (refresh_and_validate_imu &&
+      !imuReadyForAutonomousMotion(context)) {
     return AutonomousImuMotionResult::ImuUnavailable;
   }
   if (!front_left.configured() || !front_right.configured()) {
@@ -2995,7 +3350,11 @@ AutonomousImuMotionResult runAutonomousImuTurnImpl(
     const float requested_heading_deg,
     const bool target_is_absolute,
     const robot::Milliseconds now_ms,
-    const robot::Milliseconds timeout_override_ms) {
+    const robot::Milliseconds timeout_override_ms,
+    const bool refresh_and_validate_imu) {
+  if (refresh_and_validate_imu) {
+    (void)refreshSharedImuSnapshot(context);
+  }
   robot::ImuTurnConfig active_config = context.imu_turn_config;
   if (timeout_override_ms > 0U) {
     active_config.timeout_ms = timeout_override_ms;
@@ -3003,7 +3362,8 @@ AutonomousImuMotionResult runAutonomousImuTurnImpl(
   if (!imuTurnRuntimeConfigValid(active_config)) {
     return AutonomousImuMotionResult::InvalidConfiguration;
   }
-  if (!imuReadyForAutonomousMotion(context)) {
+  if (refresh_and_validate_imu &&
+      !imuReadyForAutonomousMotion(context)) {
     return AutonomousImuMotionResult::ImuUnavailable;
   }
   if (!front_left.configured() || !front_right.configured()) {
@@ -3113,10 +3473,12 @@ AutonomousImuMotionResult runAutonomousImuTurn(
     DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
     const robot::LineFollowerConfig& command_config,
     const float relative_angle_deg, const robot::Milliseconds now_ms,
-    const robot::Milliseconds timeout_override_ms = 0U) {
+    const robot::Milliseconds timeout_override_ms = 0U,
+    const bool refresh_and_validate_imu = true) {
   return runAutonomousImuTurnImpl(
       context, front_left, front_right, rear_link, command_config,
-      relative_angle_deg, false, now_ms, timeout_override_ms);
+      relative_angle_deg, false, now_ms, timeout_override_ms,
+      refresh_and_validate_imu);
 }
 
 AutonomousImuMotionResult runAutonomousImuTurnToHeading(
@@ -3124,10 +3486,12 @@ AutonomousImuMotionResult runAutonomousImuTurnToHeading(
     DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
     const robot::LineFollowerConfig& command_config,
     const float target_heading_deg, const robot::Milliseconds now_ms,
-    const robot::Milliseconds timeout_override_ms) {
+    const robot::Milliseconds timeout_override_ms,
+    const bool refresh_and_validate_imu = true) {
   return runAutonomousImuTurnImpl(
       context, front_left, front_right, rear_link, command_config,
-      target_heading_deg, true, now_ms, timeout_override_ms);
+      target_heading_deg, true, now_ms, timeout_override_ms,
+      refresh_and_validate_imu);
 }
 
 void enterImuTurnFault(RuntimeContext& context,
@@ -3660,7 +4024,15 @@ void requestHabitatPiecesStart(RuntimeContext& context,
   if (!continue_habitat_cycle) {
     robot::startHabitatCycleAutonomy(context.habitat_cycle);
   }
-  disableActuators(context, front_left, front_right, rear_link, now_ms);
+  if (final_competition_parent ||
+      context.solar_hook_hold_open_for_mission) {
+    // The raised solar hook is needed by the later Habitat/Tower route. Stop
+    // chassis and funnel outputs without detaching the hook servo PWM.
+    (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
+                                     rear_link, now_ms);
+  } else {
+    disableActuators(context, front_left, front_right, rear_link, now_ms);
+  }
   if (!final_competition_parent) {
     context.modes.setMode(robot::RobotTestMode::HabitatPieces, now_ms);
   }
@@ -3814,6 +4186,40 @@ void requestFinalCompetitionStart(
            "Final competition start requested");
 }
 
+void serviceFinalCompetitionStartSwitch(
+    RuntimeContext& context,
+    const DigitalActiveHighLimitSwitch& start_switch,
+    robot::IMotorOutput& front_left, robot::IMotorOutput& front_right,
+    RearCommandLink& rear_link, const robot::Milliseconds now_ms) {
+  if (!start_switch.configured()) {
+    return;
+  }
+
+  const bool final_competition_mode_active =
+      context.modes.currentMode() ==
+      robot::RobotTestMode::FinalCompetition;
+  const robot::FinalCompetitionStartSwitchAction action =
+      robot::updateFinalCompetitionStartSwitch(
+          context.final_competition_start_switch, start_switch.active(),
+          final_competition_mode_active);
+  switch (action) {
+    case robot::FinalCompetitionStartSwitchAction::Start:
+      requestFinalCompetitionStart(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::EventSource::System);
+      return;
+    case robot::FinalCompetitionStartSwitchAction::EmergencyStop:
+      logEvent(context, now_ms, robot::EventSeverity::Warn,
+               robot::EventSource::System,
+               "Final competition stopped: GPIO10 switch LOW");
+      emergencyStop(context, front_left, front_right, rear_link, now_ms,
+                    robot::EventSource::System);
+      return;
+    case robot::FinalCompetitionStartSwitchAction::None:
+      return;
+  }
+}
+
 void enterHabitatPiecesFault(
     RuntimeContext& context, robot::IMotorOutput& front_left,
     robot::IMotorOutput& front_right, RearCommandLink& rear_link,
@@ -3887,6 +4293,25 @@ void enterHabitatPiecesImuStrafeFault(
       now_ms);
 }
 
+AutonomousImuRecoveryUpdate serviceHabitatPiecesImuRecovery(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    const robot::Milliseconds now_ms) {
+  const AutonomousImuRecoveryUpdate recovery_update =
+      serviceAutonomousImuRecovery(
+          context, context.imu_strafe_recovery, false, front_left,
+          front_right, rear_link, context.config, now_ms);
+  context.habitat_pieces.state_entered_at_ms +=
+      recovery_update.timer_adjustment_ms;
+  context.habitat_pieces.distance_strafe_started_at_ms +=
+      recovery_update.timer_adjustment_ms;
+  if (context.habitat_pieces.lift_started_at_ms != 0U) {
+    context.habitat_pieces.lift_started_at_ms +=
+        recovery_update.timer_adjustment_ms;
+  }
+  return recovery_update;
+}
+
 void runHabitatPieces(
     RuntimeContext& context, DigitalFrontLineSensorReader& sensors,
     DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
@@ -3902,6 +4327,7 @@ void runHabitatPieces(
       return;
     }
     context.habitat_pieces_start_requested = false;
+    (void)refreshSharedImuSnapshot(context);
     if (!rear_link.rearLineSnapshotFresh(
             now_ms, context.config.remoteCommandTimeoutMs)) {
       enterHabitatPiecesFault(
@@ -3929,7 +4355,8 @@ void runHabitatPieces(
                   habitat_piece_limit, claws, stepper, now_ms, context)
             : habitatPiecesStartRequirementsMet(
                   sensors, front_left, front_right, rear_link,
-                  habitat_piece_limit, stepper, now_ms, context);
+                  habitat_piece_limit, claws, stepper, now_ms,
+                  context);
     if (!start_ready) {
       enterHabitatPiecesFault(
           context, front_left, front_right, rear_link,
@@ -3977,7 +4404,7 @@ void runHabitatPieces(
 
   if (!habitatPiecesMotionRequirementsMet(
           sensors, front_left, front_right, rear_link,
-          habitat_piece_limit, stepper, now_ms, context)) {
+          habitat_piece_limit, claws, stepper, now_ms, context)) {
     enterHabitatPiecesFault(
         context, front_left, front_right, rear_link,
         robot::HabitatPiecesStopReason::ConfigurationIncomplete,
@@ -3987,24 +4414,11 @@ void runHabitatPieces(
     return;
   }
 
-  if (context.habitat_pieces.state ==
-          robot::HabitatPiecesState::DistanceStrafing ||
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::ExitStrafePulse ||
-      context.habitat_pieces.state ==
-          robot::HabitatPiecesState::RearLineReacquire) {
+  if (robot::habitatPiecesStateRequiresImuStrafe(
+          context.habitat_pieces.state)) {
     const AutonomousImuRecoveryUpdate recovery_update =
-        serviceAutonomousImuRecovery(
-            context, context.imu_strafe_recovery, false, front_left,
-            front_right, rear_link, context.config, now_ms);
-    context.habitat_pieces.state_entered_at_ms +=
-        recovery_update.timer_adjustment_ms;
-    context.habitat_pieces.distance_strafe_started_at_ms +=
-        recovery_update.timer_adjustment_ms;
-    if (context.habitat_pieces.lift_started_at_ms != 0U) {
-      context.habitat_pieces.lift_started_at_ms +=
-          recovery_update.timer_adjustment_ms;
-    }
+        serviceHabitatPiecesImuRecovery(
+            context, front_left, front_right, rear_link, now_ms);
     if (recovery_update.result ==
         AutonomousImuRecoveryResult::Paused) {
       return;
@@ -4170,6 +4584,8 @@ void runHabitatPieces(
   mechanism_inputs.bottom_limit_active = stepper.lowerLimitActive();
   mechanism_inputs.approach_limit_active = habitat_piece_limit.active();
   mechanism_inputs.lift_complete = lift_complete;
+  mechanism_inputs.pusher_closed_commanded =
+      claws.habitatPusherCommandedClosed();
   mechanism_inputs.rear_line_available =
       rear_line_fresh && rear_line.configured;
   mechanism_inputs.rear_left_black =
@@ -4199,6 +4615,60 @@ void runHabitatPieces(
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
              robot::habitatPiecesStateName(habitat_update.state));
+    const bool distance_timeout_fallback =
+        habitat_update.stop_reason ==
+            robot::HabitatPiecesStopReason::DistanceStrafeTimeout &&
+        (previous_state == robot::HabitatPiecesState::DistanceStrafing ||
+         previous_state == robot::HabitatPiecesState::PostCountStopDelay ||
+         previous_state == robot::HabitatPiecesState::ExitStrafePulse ||
+         previous_state == robot::HabitatPiecesState::ExitDistanceCheck);
+    if (distance_timeout_fallback) {
+      const bool counting_strafe_expired =
+          previous_state == robot::HabitatPiecesState::DistanceStrafing;
+      logEvent(
+          context, now_ms, robot::EventSeverity::Warn,
+          robot::EventSource::System,
+          counting_strafe_expired
+              ? "Habitat Pieces distance count strafe timed out; continuing post-count exit sequence"
+              : "Habitat Pieces distance exit sequence timed out; continuing pickup tail");
+    }
+    if (previous_state == robot::HabitatPiecesState::ApproachPiece &&
+        habitat_update.state ==
+            robot::HabitatPiecesState::PreLiftReverse &&
+        habitat_update.stop_reason ==
+            robot::HabitatPiecesStopReason::ApproachLimitTimeout) {
+      logEvent(
+          context, now_ms, robot::EventSeverity::Warn,
+          robot::EventSource::System,
+          "Habitat Pieces approach timed out; continuing pickup lift/reverse fallback");
+    }
+
+    // The state transition happens after the normal per-phase recovery gate.
+    // Gate the first iteration here as well so a temporary IMU outage pauses
+    // the newly entered strafe instead of becoming a terminal route fault.
+    if (robot::habitatPiecesStateRequiresImuStrafe(
+            habitat_update.state)) {
+      const AutonomousImuRecoveryUpdate recovery_update =
+          serviceHabitatPiecesImuRecovery(
+              context, front_left, front_right, rear_link, now_ms);
+      if (recovery_update.result ==
+          AutonomousImuRecoveryResult::Paused) {
+        return;
+      }
+      if (recovery_update.result ==
+              AutonomousImuRecoveryResult::TimedOut ||
+          recovery_update.result ==
+              AutonomousImuRecoveryResult::StopCommandFailed) {
+        enterHabitatPiecesImuStrafeFault(
+            context, front_left, front_right, rear_link,
+            recovery_update.result ==
+                    AutonomousImuRecoveryResult::TimedOut
+                ? AutonomousImuMotionResult::ImuUnavailable
+                : AutonomousImuMotionResult::CommandFailed,
+            now_ms);
+        return;
+      }
+    }
   }
 
   if (habitat_update.should_start_lift) {
@@ -4221,6 +4691,38 @@ void runHabitatPieces(
           robot::EventSource::Motor, now_ms);
       return;
     }
+  }
+
+  if (habitat_update.should_close_pusher) {
+    robot::stopLineFollower(context.follower_state);
+    stopAutonomousImuStrafe(context);
+    if (!disableMotionActuators(context, front_left, front_right,
+                                rear_link, now_ms)) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::RearCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "Habitat Pieces stopped: wheel stop failed before pusher close",
+          robot::EventSource::Uart, now_ms);
+      return;
+    }
+    const ClawServoCommandResult pusher_result = claws.command(
+        kHabitatPusherServoIndex, ClawServoPositionRequest::Closed);
+    if (pusher_result != ClawServoCommandResult::Accepted) {
+      enterHabitatPiecesFault(
+          context, front_left, front_right, rear_link,
+          robot::HabitatPiecesStopReason::PusherCommandFailed,
+          clawFaultCode(pusher_result),
+          "Habitat Pieces stopped: pusher close command failed",
+          robot::EventSource::Motor, now_ms);
+      return;
+    }
+    if (habitat_update.transitioned) {
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Motor,
+               "Habitat Pieces reverse complete; pusher close commanded before distance strafe");
+    }
+    return;
   }
 
   const bool side_line_transition_stop =
@@ -4317,7 +4819,7 @@ void runHabitatPieces(
           robot::EventSource::System,
           context.last_habitat_pieces_update.should_exit_strafe_pulse
               ? "Habitat Pieces distance-exit strafe pulse started"
-              : "Habitat Pieces reverse complete; distance-zone strafe started");
+              : "Habitat Pieces pusher close confirmed; distance-zone strafe started");
     }
     const AutonomousImuMotionResult result =
         runAutonomousImuStrafe(
@@ -4329,7 +4831,7 @@ void runHabitatPieces(
             context.last_habitat_pieces_update.should_exit_strafe_pulse
                 ? context.habitat_pieces_config.exit_strafe_duty
                 : context.habitat_pieces_config.distance_strafe_duty,
-            now_ms);
+            now_ms, false);
     if (result != AutonomousImuMotionResult::Running) {
       enterHabitatPiecesImuStrafeFault(
           context, front_left, front_right, rear_link, result, now_ms);
@@ -4379,6 +4881,7 @@ void runHabitatPieces(
           robot::EventSource::Uart, now_ms);
       return;
     }
+    (void)refreshSharedImuSnapshot(context);
     if (!habitatPlacementStartRequirementsMet(
             sensors, front_left, front_right, rear_link, claws, stepper,
             now_ms, context)) {
@@ -4463,7 +4966,8 @@ void runHabitatPieces(
     const AutonomousImuMotionResult result = runAutonomousImuStrafe(
         context, front_left, front_right, rear_link, context.config,
         -initial_strafe_direction,
-        context.habitat_pieces_config.rear_line_reacquire_duty, now_ms);
+        context.habitat_pieces_config.rear_line_reacquire_duty, now_ms,
+        false);
     if (result != AutonomousImuMotionResult::Running) {
       enterHabitatPiecesImuStrafeFault(
           context, front_left, front_right, rear_link, result, now_ms);
@@ -4508,14 +5012,8 @@ void runHabitatPieces(
       const robot::HabitatPiecesStopReason reason =
           context.habitat_pieces.stop_reason;
       const char* message = "Habitat Pieces stopped: autonomous state fault";
-      if (reason == robot::HabitatPiecesStopReason::DistanceStrafeTimeout) {
-        message = "Habitat Pieces stopped: distance strafe timeout reached";
-      } else if (reason ==
-                 robot::HabitatPiecesStopReason::SlideDownTimeout) {
+      if (reason == robot::HabitatPiecesStopReason::SlideDownTimeout) {
         message = "Habitat Pieces stopped: bottom-limit search timed out";
-      } else if (reason ==
-                 robot::HabitatPiecesStopReason::ApproachLimitTimeout) {
-        message = "Habitat Pieces stopped: approach limit switch timed out";
       } else if (reason == robot::HabitatPiecesStopReason::LiftTimeout) {
         message = "Habitat Pieces stopped: slide lift timed out";
       } else if (reason ==
@@ -4536,20 +5034,9 @@ void runHabitatPieces(
     disableMotionActuators(context, front_left, front_right, rear_link,
                            now_ms);
     if (context.habitat_pieces.stop_reason ==
-               robot::HabitatPiecesStopReason::DistanceStrafeTimeout) {
-      setFault(context, robot::FaultCode::SearchTimeout,
-               "Habitat Pieces stopped: distance strafe timeout reached");
-      logEvent(context, now_ms, robot::EventSeverity::Fault,
-               robot::EventSource::System,
-               "Habitat Pieces stopped: distance strafe timeout reached");
-    } else if (context.habitat_pieces.stop_reason ==
-               robot::HabitatPiecesStopReason::SlideDownTimeout) {
+        robot::HabitatPiecesStopReason::SlideDownTimeout) {
       setFault(context, robot::FaultCode::SearchTimeout,
                "Habitat Pieces stopped: bottom-limit search timed out");
-    } else if (context.habitat_pieces.stop_reason ==
-               robot::HabitatPiecesStopReason::ApproachLimitTimeout) {
-      setFault(context, robot::FaultCode::SearchTimeout,
-               "Habitat Pieces stopped: approach limit switch timed out");
     } else if (context.habitat_pieces.stop_reason ==
                robot::HabitatPiecesStopReason::LiftTimeout) {
       setFault(context, robot::FaultCode::SearchTimeout,
@@ -4663,6 +5150,66 @@ void enterHabitatPlacementImuStrafeFault(
       now_ms);
 }
 
+void enterHabitatPlacementImuTurnFault(
+    RuntimeContext& context, DualPwmMotorOutput& front_left,
+    DualPwmMotorOutput& front_right, RearCommandLink& rear_link,
+    robot::esp2::StepperAxis& stepper,
+    const AutonomousImuMotionResult result,
+    const robot::Milliseconds now_ms) {
+  const bool imu_unavailable =
+      result == AutonomousImuMotionResult::ImuUnavailable;
+  const bool motor_unavailable =
+      result == AutonomousImuMotionResult::MotorUnavailable;
+  const bool timed_out = result == AutonomousImuMotionResult::Timeout;
+  const bool link_failed =
+      result == AutonomousImuMotionResult::RearLinkUnavailable ||
+      result == AutonomousImuMotionResult::CommandFailed;
+  enterHabitatPlacementFault(
+      context, front_left, front_right, rear_link, stepper,
+      imu_unavailable
+          ? robot::HabitatPlacementFaultReason::ImuUnavailable
+          : (timed_out
+                 ? robot::HabitatPlacementFaultReason::ImuTurnTimeout
+                 : robot::HabitatPlacementFaultReason::ImuTurnFailed),
+      imu_unavailable || motor_unavailable
+          ? robot::FaultCode::HardwareNotConfigured
+          : (link_failed ? robot::FaultCode::CommunicationStale
+                         : robot::FaultCode::InvalidCommand),
+      imu_unavailable
+          ? "Habitat Placement stopped: IMU unavailable during turn"
+          : (motor_unavailable
+                 ? "Habitat Placement stopped: front motor unavailable during turn"
+                 : (timed_out
+                        ? "Habitat Placement stopped: IMU turn timed out"
+                        : (link_failed
+                               ? "Habitat Placement stopped: IMU turn command failed"
+                               : "Habitat Placement stopped: IMU turn controller failed"))),
+      link_failed ? robot::EventSource::Uart
+                  : robot::EventSource::System,
+      now_ms);
+}
+
+AutonomousImuRecoveryUpdate serviceHabitatPlacementImuRecovery(
+    RuntimeContext& context,
+    const robot::HabitatPlacementState state,
+    DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
+    RearCommandLink& rear_link, const robot::Milliseconds now_ms) {
+  const bool is_turn =
+      robot::habitatPlacementStateRequiresImuTurn(state);
+  robot::ImuRecoveryState& recovery =
+      is_turn ? context.imu_turn_recovery
+              : context.imu_strafe_recovery;
+  const AutonomousImuRecoveryUpdate recovery_update =
+      serviceAutonomousImuRecovery(
+          context, recovery, is_turn, front_left, front_right,
+          rear_link, context.rear_config, now_ms);
+  context.habitat_placement.state_entered_at_ms +=
+      recovery_update.timer_adjustment_ms;
+  context.habitat_placement.started_at_ms +=
+      recovery_update.timer_adjustment_ms;
+  return recovery_update;
+}
+
 void runHabitatPlacement(
     RuntimeContext& context, DigitalFrontLineSensorReader& sensors,
     DualPwmMotorOutput& front_left, DualPwmMotorOutput& front_right,
@@ -4678,6 +5225,7 @@ void runHabitatPlacement(
       return;
     }
     context.habitat_placement_start_requested = false;
+    (void)refreshSharedImuSnapshot(context);
     if (!habitatPlacementStartRequirementsMet(
             sensors, front_left, front_right, rear_link, claws, stepper,
             now_ms, context)) {
@@ -4729,25 +5277,16 @@ void runHabitatPlacement(
     return;
   }
 
+  const bool imu_turn_phase = robot::habitatPlacementStateRequiresImuTurn(
+      context.habitat_placement.state);
   const bool imu_strafe_phase =
-      context.habitat_placement.state ==
-          robot::HabitatPlacementState::
-              StrafeRightBeforeCounterClockwise ||
-      context.habitat_placement.state ==
-          robot::HabitatPlacementState::StrafeLeftAfterClockwise ||
-      context.habitat_placement.state ==
-          robot::HabitatPlacementState::StrafeRightAfterClockwise ||
-      context.habitat_placement.state ==
-          robot::HabitatPlacementState::StrafeRightToReturnLine;
-  if (imu_strafe_phase) {
+      robot::habitatPlacementStateRequiresImuStrafe(
+      context.habitat_placement.state);
+  if (imu_turn_phase || imu_strafe_phase) {
     const AutonomousImuRecoveryUpdate recovery_update =
-        serviceAutonomousImuRecovery(
-            context, context.imu_strafe_recovery, false, front_left,
-            front_right, rear_link, context.rear_config, now_ms);
-    context.habitat_placement.state_entered_at_ms +=
-        recovery_update.timer_adjustment_ms;
-    context.habitat_placement.started_at_ms +=
-        recovery_update.timer_adjustment_ms;
+        serviceHabitatPlacementImuRecovery(
+            context, context.habitat_placement.state, front_left,
+            front_right, rear_link, now_ms);
     if (recovery_update.result ==
         AutonomousImuRecoveryResult::Paused) {
       return;
@@ -4756,13 +5295,20 @@ void runHabitatPlacement(
             AutonomousImuRecoveryResult::TimedOut ||
         recovery_update.result ==
             AutonomousImuRecoveryResult::StopCommandFailed) {
-      enterHabitatPlacementImuStrafeFault(
-          context, front_left, front_right, rear_link, stepper,
+      const AutonomousImuMotionResult result =
           recovery_update.result ==
                   AutonomousImuRecoveryResult::TimedOut
               ? AutonomousImuMotionResult::ImuUnavailable
-              : AutonomousImuMotionResult::CommandFailed,
-          now_ms);
+              : AutonomousImuMotionResult::CommandFailed;
+      if (imu_turn_phase) {
+        enterHabitatPlacementImuTurnFault(
+            context, front_left, front_right, rear_link, stepper,
+            result, now_ms);
+      } else {
+        enterHabitatPlacementImuStrafeFault(
+            context, front_left, front_right, rear_link, stepper,
+            result, now_ms);
+      }
       return;
     }
   }
@@ -4948,6 +5494,43 @@ void runHabitatPlacement(
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
              robot::habitatPlacementStateName(update.state));
+
+    const bool entered_imu_turn =
+        robot::habitatPlacementStateRequiresImuTurn(update.state);
+    const bool entered_imu_strafe =
+        robot::habitatPlacementStateRequiresImuStrafe(update.state);
+    if (entered_imu_turn || entered_imu_strafe) {
+      // This first-iteration gate closes the handoff window between the state
+      // update above and the next loop's normal per-phase recovery service.
+      const AutonomousImuRecoveryUpdate recovery_update =
+          serviceHabitatPlacementImuRecovery(
+              context, update.state, front_left, front_right, rear_link,
+              now_ms);
+      if (recovery_update.result ==
+          AutonomousImuRecoveryResult::Paused) {
+        return;
+      }
+      if (recovery_update.result ==
+              AutonomousImuRecoveryResult::TimedOut ||
+          recovery_update.result ==
+              AutonomousImuRecoveryResult::StopCommandFailed) {
+        const AutonomousImuMotionResult result =
+            recovery_update.result ==
+                    AutonomousImuRecoveryResult::TimedOut
+                ? AutonomousImuMotionResult::ImuUnavailable
+                : AutonomousImuMotionResult::CommandFailed;
+        if (entered_imu_turn) {
+          enterHabitatPlacementImuTurnFault(
+              context, front_left, front_right, rear_link, stepper,
+              result, now_ms);
+        } else {
+          enterHabitatPlacementImuStrafeFault(
+              context, front_left, front_right, rear_link, stepper,
+              result, now_ms);
+        }
+        return;
+      }
+    }
   }
 
   if (update.should_open_pusher || update.should_close_pusher) {
@@ -5024,7 +5607,8 @@ void runHabitatPlacement(
                     .counter_clockwise_target_heading_deg;
       result = runAutonomousImuTurnToHeading(
           context, front_left, front_right, rear_link,
-          context.rear_config, target_heading_deg, now_ms, timeout_ms);
+          context.rear_config, target_heading_deg, now_ms, timeout_ms,
+          false);
     } else {
       const float relative_angle_deg =
           robot::clockwiseTurnRelativeAngleDeg(
@@ -5032,31 +5616,13 @@ void runHabitatPlacement(
               context.imu_turn_config.yaw_command_polarity);
       result = runAutonomousImuTurn(
           context, front_left, front_right, rear_link,
-          context.rear_config, relative_angle_deg, now_ms, timeout_ms);
+          context.rear_config, relative_angle_deg, now_ms, timeout_ms,
+          false);
     }
     if (result != AutonomousImuMotionResult::Running &&
         result != AutonomousImuMotionResult::Complete) {
-      const bool unavailable =
-          result == AutonomousImuMotionResult::ImuUnavailable ||
-          result == AutonomousImuMotionResult::MotorUnavailable;
-      const bool timed_out = result == AutonomousImuMotionResult::Timeout;
-      const bool link_failed =
-          result == AutonomousImuMotionResult::RearLinkUnavailable ||
-          result == AutonomousImuMotionResult::CommandFailed;
-      enterHabitatPlacementFault(
-          context, front_left, front_right, rear_link, stepper,
-          unavailable
-              ? robot::HabitatPlacementFaultReason::ImuUnavailable
-              : (timed_out
-                     ? robot::HabitatPlacementFaultReason::ImuTurnTimeout
-                     : robot::HabitatPlacementFaultReason::ImuTurnFailed),
-          unavailable
-              ? robot::FaultCode::HardwareNotConfigured
-              : (link_failed ? robot::FaultCode::CommunicationStale
-                             : robot::FaultCode::InvalidCommand),
-          "Habitat Placement stopped: IMU turn failed",
-          link_failed ? robot::EventSource::Uart
-                      : robot::EventSource::System,
+      enterHabitatPlacementImuTurnFault(
+          context, front_left, front_right, rear_link, stepper, result,
           now_ms);
     }
     return;
@@ -5082,7 +5648,7 @@ void runHabitatPlacement(
                    : context.habitat_placement_config.strafe_right_duty);
     const AutonomousImuMotionResult result = runAutonomousImuStrafe(
         context, front_left, front_right, rear_link, context.rear_config,
-        lateral_direction, strafe_duty, now_ms);
+        lateral_direction, strafe_duty, now_ms, false);
     if (result != AutonomousImuMotionResult::Running) {
       enterHabitatPlacementImuStrafeFault(
           context, front_left, front_right, rear_link, stepper, result,
@@ -5295,6 +5861,7 @@ void runTowerPiecesAutonomy(RuntimeContext& context,
             robot::EventSource::Uart);
         return;
       }
+      (void)refreshSharedImuSnapshot(context);
       if (!towerPiecesStartRequirementsMet(front_left, front_right, rear_link,
                                            claws, stepper, now_ms, context)) {
         enterTowerPiecesFault(
@@ -5990,6 +6557,10 @@ void enterPegFinderFault(
     const robot::PegFinderFaultReason reason,
     const robot::FaultCode fault_code, const char* message,
     const robot::EventSource source) {
+  if (context.peg_finder_tower_handoff_active &&
+      g_runtime.stepper != nullptr) {
+    g_runtime.stepper->stop();
+  }
   robot::cancelImuRecovery(context.imu_turn_recovery);
   if (robot::imuTurnActive(context.imu_turn_state)) {
     robot::stopImuTurn(context.imu_turn_state);
@@ -6023,12 +6594,163 @@ bool stopPegFinderOutputsOrFault(RuntimeContext& context,
   return false;
 }
 
+void enterPegFinderTowerHandoffFault(
+    RuntimeContext& context, robot::IMotorOutput& front_left,
+    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
+    robot::esp2::StepperAxis& stepper,
+    const robot::Milliseconds now_ms,
+    const robot::TowerPiecesFaultReason tower_reason,
+    const robot::PegFinderFaultReason peg_finder_reason,
+    const robot::FaultCode fault_code, const char* message,
+    const robot::EventSource source) {
+  stepper.stop();
+  robot::failTowerPiecesAutonomy(context.tower_pieces, tower_reason,
+                                 now_ms);
+  enterPegFinderFault(context, front_left, front_right, rear_link, now_ms,
+                      peg_finder_reason, fault_code, message, source);
+}
+
+bool pegFinderTowerHandoffComplete(
+    const RuntimeContext& context,
+    const robot::esp2::StepperAxis& stepper) {
+  return !context.peg_finder_tower_handoff_active ||
+         (context.peg_finder_tower_handoff_winch_closed &&
+          stepper.upperLimitActive());
+}
+
+bool servicePegFinderTowerHandoff(
+    RuntimeContext& context, robot::IMotorOutput& front_left,
+    robot::IMotorOutput& front_right, RearCommandLink& rear_link,
+    ClawServoBank& claws, robot::esp2::StepperAxis& stepper,
+    const robot::Milliseconds now_ms) {
+  if (!context.peg_finder_tower_handoff_active) {
+    return true;
+  }
+
+  if (stepper.lowerLimitActive() && stepper.upperLimitActive()) {
+    enterPegFinderTowerHandoffFault(
+        context, front_left, front_right, rear_link, stepper, now_ms,
+        robot::TowerPiecesFaultReason::ConflictingLimitSwitches,
+        robot::PegFinderFaultReason::ConflictingLimitSwitches,
+        robot::FaultCode::LimitSwitchConflict,
+        "PegFinder handoff stopped: bottom and top stepper limits are both active",
+        robot::EventSource::Motor);
+    return false;
+  }
+
+  if (context.peg_finder_tower_handoff_winch_closed) {
+    if (!stepper.upperLimitActive()) {
+      enterPegFinderTowerHandoffFault(
+          context, front_left, front_right, rear_link, stepper, now_ms,
+          robot::TowerPiecesFaultReason::StepperCommandFailed,
+          robot::PegFinderFaultReason::StepperTopInterlockLost,
+          robot::FaultCode::InvalidCommand,
+          "PegFinder handoff stopped: stepper top interlock released after winch close",
+          robot::EventSource::Motor);
+      return false;
+    }
+
+    if (context.tower_pieces.state ==
+        robot::TowerPiecesState::WinchClosed) {
+      const robot::TowerPiecesInputs inputs{
+          false, false, false, stepper.lowerLimitActive(),
+          stepper.upperLimitActive(), false, true};
+      context.last_tower_pieces_update =
+          robot::updateTowerPiecesAutonomy(
+              context.tower_pieces, inputs,
+              context.tower_pieces_config, now_ms);
+    }
+    return true;
+  }
+
+  if (stepper.motionState() ==
+      robot::esp2::StepperMotionState::LimitSearchFailed) {
+    enterPegFinderTowerHandoffFault(
+        context, front_left, front_right, rear_link, stepper, now_ms,
+        robot::TowerPiecesFaultReason::StepperLimitSearchFailed,
+        robot::PegFinderFaultReason::StepperLimitSearchFailed,
+        robot::FaultCode::SearchTimeout,
+        "PegFinder handoff stopped: stepper top limit search failed",
+        robot::EventSource::Motor);
+    return false;
+  }
+  if (!stepper.upperLimitActive() &&
+      stepper.motionState() ==
+          robot::esp2::StepperMotionState::Stopped) {
+    enterPegFinderTowerHandoffFault(
+        context, front_left, front_right, rear_link, stepper, now_ms,
+        robot::TowerPiecesFaultReason::StepperCommandFailed,
+        robot::PegFinderFaultReason::StepperCommandFailed,
+        robot::FaultCode::InvalidCommand,
+        "PegFinder handoff stopped: stepper stopped before the top limit",
+        robot::EventSource::Motor);
+    return false;
+  }
+
+  if (context.tower_pieces.state !=
+          robot::TowerPiecesState::MoveStepperTop &&
+      context.tower_pieces.state !=
+          robot::TowerPiecesState::WinchClosed) {
+    enterPegFinderTowerHandoffFault(
+        context, front_left, front_right, rear_link, stepper, now_ms,
+        robot::TowerPiecesFaultReason::StepperCommandFailed,
+        robot::PegFinderFaultReason::StepperCommandFailed,
+        robot::FaultCode::InvalidCommand,
+        "PegFinder handoff stopped: Tower mechanism state is invalid",
+        robot::EventSource::System);
+    return false;
+  }
+
+  const robot::TowerPiecesState previous_tower_state =
+      context.tower_pieces.state;
+  const robot::TowerPiecesInputs inputs{
+      false, false, false, stepper.lowerLimitActive(),
+      stepper.upperLimitActive(), false, true};
+  context.last_tower_pieces_update =
+      robot::updateTowerPiecesAutonomy(
+          context.tower_pieces, inputs, context.tower_pieces_config,
+          now_ms);
+  if (context.tower_pieces.state == robot::TowerPiecesState::Fault) {
+    enterPegFinderTowerHandoffFault(
+        context, front_left, front_right, rear_link, stepper, now_ms,
+        context.tower_pieces.fault_reason,
+        robot::PegFinderFaultReason::ConflictingLimitSwitches,
+        robot::FaultCode::LimitSwitchConflict,
+        "PegFinder handoff stopped: conflicting stepper limits",
+        robot::EventSource::Motor);
+    return false;
+  }
+
+  if (previous_tower_state == robot::TowerPiecesState::MoveStepperTop &&
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::WinchClosed) {
+    stepper.stop();
+    const ClawServoCommandResult result = claws.command(
+        kWinchServoIndex, ClawServoPositionRequest::Closed);
+    if (result != ClawServoCommandResult::Accepted) {
+      enterPegFinderTowerHandoffFault(
+          context, front_left, front_right, rear_link, stepper, now_ms,
+          robot::TowerPiecesFaultReason::ServoCommandFailed,
+          robot::PegFinderFaultReason::ServoCommandFailed,
+          clawFaultCode(result), clawServoResultReason(result),
+          robot::EventSource::Motor);
+      return false;
+    }
+    context.peg_finder_tower_handoff_winch_closed = true;
+    logEvent(context, now_ms, robot::EventSeverity::Info,
+             robot::EventSource::Motor,
+             "Tower stepper reached top; winch closed while PegFinder continues");
+  }
+  return true;
+}
+
 void runPegFinder(RuntimeContext& context,
                   DualPwmMotorOutput& front_left,
                   DualPwmMotorOutput& front_right,
                   RearCommandLink& rear_link,
                   ClawServoBank& claws,
                   const DigitalActiveHighLimitSwitch& funnel_limit,
+                  robot::esp2::StepperAxis& stepper,
                   const robot::Milliseconds now_ms) {
   switch (context.peg_finder.state) {
     case robot::PegFinderState::WaitForStart: {
@@ -6047,6 +6769,7 @@ void runPegFinder(RuntimeContext& context,
             robot::EventSource::Uart);
         return;
       }
+      (void)refreshSharedImuSnapshot(context);
       if (!pegFinderStartRequirementsMet(front_left, front_right, rear_link,
                                          claws, funnel_limit, now_ms,
                                          context)) {
@@ -6054,7 +6777,7 @@ void runPegFinder(RuntimeContext& context,
             context, front_left, front_right, rear_link, now_ms,
             robot::PegFinderFaultReason::HardwareNotReady,
             robot::FaultCode::HardwareNotConfigured,
-            "PegFinder start rejected: configure drive, funnel, IMU turn tuning, clockwise angle, GPIO 47 limit, claw open angles, timings, and ESP1 link",
+            "PegFinder start rejected: configure drive, funnel, IMU turn tuning, clockwise angle, GPIO 47 limit, all claw open/closed angles, timings, and ESP1 link",
             robot::EventSource::System);
         return;
       }
@@ -6078,6 +6801,7 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::Forward:
     case robot::PegFinderState::FunnelForward:
     case robot::PegFinderState::PostFunnelLimitDelay:
+    case robot::PegFinderState::WaitForTowerHandoff:
     case robot::PegFinderState::OpenClaw1:
     case robot::PegFinderState::PostClaw1OpenDelay:
     case robot::PegFinderState::ShakeLeftAfterClaw1:
@@ -6090,6 +6814,9 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::PostShakeAfterClaw2Delay:
     case robot::PegFinderState::OpenClaw3:
     case robot::PegFinderState::PostClawsOpenDelay:
+    case robot::PegFinderState::ShakeLeftAfterClaw3:
+    case robot::PegFinderState::ShakeRightAfterClaw3:
+    case robot::PegFinderState::PostShakeAfterClaw3Delay:
     case robot::PegFinderState::FunnelReverse:
       break;
     case robot::PegFinderState::Complete:
@@ -6167,6 +6894,12 @@ void runPegFinder(RuntimeContext& context,
     return;
   }
 
+  if (!servicePegFinderTowerHandoff(
+          context, front_left, front_right, rear_link, claws, stepper,
+          now_ms)) {
+    return;
+  }
+
   bool clockwise_turn_complete = false;
   if (context.peg_finder.state ==
       robot::PegFinderState::RotateClockwise) {
@@ -6221,7 +6954,8 @@ void runPegFinder(RuntimeContext& context,
 
   const robot::PegFinderState previous_state = context.peg_finder.state;
   const robot::PegFinderInputs inputs{
-      funnel_limit.active(), clockwise_turn_complete};
+      funnel_limit.active(), clockwise_turn_complete,
+      pegFinderTowerHandoffComplete(context, stepper)};
   const robot::PegFinderUpdate update = robot::updatePegFinderAutonomy(
       context.peg_finder, inputs, context.peg_finder_config, now_ms);
   if (update.state == robot::PegFinderState::Fault &&
@@ -6245,8 +6979,7 @@ void runPegFinder(RuntimeContext& context,
             update.should_open_claw_1
                 ? 0U
                 : (update.should_open_claw_2 ? 1U : 2U);
-        servo_result =
-            claws.command(claw_index, ClawServoPositionRequest::Open);
+        servo_result = claws.commandExclusiveOpenClaw(claw_index);
         break;
       }
       case robot::PegFinderState::WaitForStart:
@@ -6257,6 +6990,7 @@ void runPegFinder(RuntimeContext& context,
       case robot::PegFinderState::Forward:
       case robot::PegFinderState::FunnelForward:
       case robot::PegFinderState::PostFunnelLimitDelay:
+      case robot::PegFinderState::WaitForTowerHandoff:
       case robot::PegFinderState::PostClaw1OpenDelay:
       case robot::PegFinderState::ShakeLeftAfterClaw1:
       case robot::PegFinderState::ShakeRightAfterClaw1:
@@ -6266,6 +7000,9 @@ void runPegFinder(RuntimeContext& context,
       case robot::PegFinderState::ShakeRightAfterClaw2:
       case robot::PegFinderState::PostShakeAfterClaw2Delay:
       case robot::PegFinderState::PostClawsOpenDelay:
+      case robot::PegFinderState::ShakeLeftAfterClaw3:
+      case robot::PegFinderState::ShakeRightAfterClaw3:
+      case robot::PegFinderState::PostShakeAfterClaw3Delay:
       case robot::PegFinderState::FunnelReverse:
       case robot::PegFinderState::Complete:
       case robot::PegFinderState::Fault:
@@ -6301,33 +7038,41 @@ void runPegFinder(RuntimeContext& context,
         message =
             "PegFinder funnel limit pressed; funnel stopped and delay started";
         break;
+      case robot::PegFinderState::WaitForTowerHandoff:
+        message =
+            "PegFinder funnel aligned; waiting for stepper top and winch close";
+        break;
       case robot::PegFinderState::OpenClaw1:
       case robot::PegFinderState::OpenClaw2:
       case robot::PegFinderState::OpenClaw3:
         message = update.should_open_claw_1
-                      ? "PegFinder claw 1 opened"
+                      ? "PegFinder claw 1 opened; claws 2 and 3 closed"
                       : (update.should_open_claw_2
-                             ? "PegFinder claw 2 opened"
-                             : "PegFinder claw 3 opened");
+                             ? "PegFinder claw 2 opened; claws 1 and 3 closed"
+                             : "PegFinder claw 3 opened; claws 1 and 2 closed");
         break;
       case robot::PegFinderState::PostClaw1OpenDelay:
       case robot::PegFinderState::PostClaw2OpenDelay:
         break;
       case robot::PegFinderState::ShakeLeftAfterClaw1:
       case robot::PegFinderState::ShakeLeftAfterClaw2:
+      case robot::PegFinderState::ShakeLeftAfterClaw3:
         message = "PegFinder left shake pulse started";
         break;
       case robot::PegFinderState::ShakeRightAfterClaw1:
       case robot::PegFinderState::ShakeRightAfterClaw2:
+      case robot::PegFinderState::ShakeRightAfterClaw3:
         message = "PegFinder right shake pulse started";
         break;
       case robot::PegFinderState::PostShakeAfterClaw1Delay:
       case robot::PegFinderState::PostShakeAfterClaw2Delay:
+      case robot::PegFinderState::PostShakeAfterClaw3Delay:
         message = "PegFinder post-shake delay started";
         break;
       case robot::PegFinderState::PostClawsOpenDelay:
-        message =
-            "PegFinder all claws open; funnel reverse delay started";
+        message = context.peg_finder_config.shake_duty > 0.0F
+                      ? "PegFinder third exclusive claw selection complete; pre-shake delay started"
+                      : "PegFinder third exclusive claw selection complete; funnel reverse delay started";
         break;
       case robot::PegFinderState::FunnelReverse:
         message = "PegFinder funnel reverse started";
@@ -6352,7 +7097,9 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::ShakeLeftAfterClaw1:
     case robot::PegFinderState::ShakeRightAfterClaw1:
     case robot::PegFinderState::ShakeLeftAfterClaw2:
-    case robot::PegFinderState::ShakeRightAfterClaw2: {
+    case robot::PegFinderState::ShakeRightAfterClaw2:
+    case robot::PegFinderState::ShakeLeftAfterClaw3:
+    case robot::PegFinderState::ShakeRightAfterClaw3: {
       context.requested_funnel_command = robot::disabledMotorCommand();
       if (!sendStoppedFunnelCommand(rear_link, context.rear_config,
                                     now_ms)) {
@@ -6403,6 +7150,7 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::PostRotationPause:
     case robot::PegFinderState::PostReversePause:
     case robot::PegFinderState::PostFunnelLimitDelay:
+    case robot::PegFinderState::WaitForTowerHandoff:
     case robot::PegFinderState::OpenClaw1:
     case robot::PegFinderState::PostClaw1OpenDelay:
     case robot::PegFinderState::PostShakeAfterClaw1Delay:
@@ -6411,6 +7159,7 @@ void runPegFinder(RuntimeContext& context,
     case robot::PegFinderState::PostShakeAfterClaw2Delay:
     case robot::PegFinderState::OpenClaw3:
     case robot::PegFinderState::PostClawsOpenDelay:
+    case robot::PegFinderState::PostShakeAfterClaw3Delay:
       if (!stopPegFinderOutputsOrFault(
               context, front_left, front_right, rear_link, now_ms)) {
         return;
@@ -6430,6 +7179,17 @@ void runPegFinder(RuntimeContext& context,
         return;
       }
       const bool reversing = update.should_run_funnel_reverse;
+      if (reversing &&
+          !pegFinderTowerHandoffComplete(context, stepper)) {
+        enterPegFinderTowerHandoffFault(
+            context, front_left, front_right, rear_link, stepper, now_ms,
+            robot::TowerPiecesFaultReason::StepperCommandFailed,
+            robot::PegFinderFaultReason::StepperTopInterlockLost,
+            robot::FaultCode::InvalidCommand,
+            "PegFinder stopped: funnel close blocked because the stepper top interlock is not active",
+            robot::EventSource::Motor);
+        return;
+      }
       const float duty_magnitude =
           clampFloat(reversing
                          ? context.peg_finder_config.funnel_reverse_duty
@@ -6530,6 +7290,9 @@ void enterSolarPanelSearchFault(
       reason);
   (void)stopAutonomyDriveAndFunnel(
       context, front_left, front_right, rear_link, now_ms);
+  context.solar_completion_mechanisms_started = false;
+  context.solar_funnel_open_complete = false;
+  context.solar_hook_hold_open_for_mission = false;
   setFault(context, fault_code, message);
   logEvent(context, now_ms, robot::EventSeverity::Fault, source, message);
 }
@@ -6571,6 +7334,44 @@ void runSolarPanelAutonomy(RuntimeContext& context,
                            DualPwmMotorOutput& front_right,
                            RearCommandLink& rear_link,
                            const robot::Milliseconds now_ms) {
+  // The funnel has its own timeline. Service it before the chassis
+  // IMU-recovery gate so a paused strafe cannot let its command heartbeat
+  // expire while its configured opening duration keeps advancing.
+  if (context.solar_completion_mechanisms_started &&
+      !context.solar_funnel_open_complete &&
+      context.autonomous_state !=
+          robot::SolarPanelAutonomyState::SolarSearchFault) {
+    const SolarCompletionMechanismResult mechanism_result =
+        serviceSolarCompletionMechanisms(context, rear_link, now_ms);
+    if (mechanism_result ==
+        SolarCompletionMechanismResult::HardwareUnavailable) {
+      enterSolarPanelSearchFault(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::SolarPanelFaultReason::RearLinkStale,
+          robot::FaultCode::CommunicationStale,
+          "solar completion mechanisms stopped: ESP1 status stale or mechanism hardware unavailable",
+          robot::EventSource::Uart);
+      return;
+    }
+    if (mechanism_result ==
+        SolarCompletionMechanismResult::FunnelCommandFailed) {
+      enterSolarPanelSearchFault(
+          context, front_left, front_right, rear_link, now_ms,
+          robot::SolarPanelFaultReason::FunnelCommandFailed,
+          robot::FaultCode::CommunicationStale,
+          "solar completion mechanisms stopped: funnel command failed",
+          robot::EventSource::Uart);
+      return;
+    }
+    if (mechanism_result == SolarCompletionMechanismResult::Complete) {
+      logEvent(context, now_ms, robot::EventSeverity::Info,
+               robot::EventSource::Motor,
+               context.solar_hook_commanded_open
+                   ? "solar funnel opening complete; hook remains raised/open"
+                   : "solar funnel opening complete; hook remains closed until front tape detection");
+    }
+  }
+
   const bool imu_strafe_phase =
       context.autonomous_state ==
           robot::SolarPanelAutonomyState::StrafeRightToSolarPanel ||
@@ -6615,6 +7416,7 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       context.solar_start_requested = false;
       robot::resetSolarBeaconDetectorState(context.solar_detector);
       context.last_solar_detector_update = {};
+      (void)refreshSharedImuSnapshot(context);
       if (!solarPanelStartRequirementsMet(sensors, front_left, front_right,
                                           rear_link, now_ms, context)) {
         enterSolarPanelSearchFault(
@@ -6827,6 +7629,17 @@ void runSolarPanelAutonomy(RuntimeContext& context,
               context.last_line_observation.left_black ||
                   context.last_line_observation.right_black,
               time_in_state_ms, context.solar_contact_config);
+      const bool contact_timeout_fallback =
+          sequence_update.transitioned &&
+          sequence_update.next_state ==
+              robot::SolarPanelAutonomyState::
+                  MoveForwardAfterSolarContact &&
+          (context.autonomous_state ==
+               robot::SolarPanelAutonomyState::
+                   StrafeRightToSolarPanel ||
+           context.autonomous_state ==
+               robot::SolarPanelAutonomyState::
+                   RetryStrafeRightToSolarPanel);
       if (sequence_update.next_state ==
               robot::SolarPanelAutonomyState::SolarPanelContacted &&
           context.autonomous_state !=
@@ -6843,23 +7656,86 @@ void runSolarPanelAutonomy(RuntimeContext& context,
       }
       if (sequence_update.next_state ==
           robot::SolarPanelAutonomyState::SolarSearchFault) {
-        const char* timeout_message =
-            context.autonomous_state ==
-                    robot::SolarPanelAutonomyState::
-                        RetryStrafeRightToSolarPanel
-                ? "solar contact retry timeout before both limit switches hit"
-                : "solar contact timeout before both limit switches hit";
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
-            robot::SolarPanelFaultReason::LimitSwitchTimeout,
-            robot::FaultCode::SearchTimeout, timeout_message,
+            robot::SolarPanelFaultReason::LineReacquireTimeout,
+            robot::FaultCode::SearchTimeout,
+            "solar left strafe timed out before the front line was found",
             robot::EventSource::System);
         return;
       }
       if (sequence_update.transitioned) {
         stopAutonomousImuStrafe(context);
-        disableMotionActuators(context, front_left, front_right, rear_link,
-                               now_ms);
+        const bool motion_stopped = disableMotionActuators(
+            context, front_left, front_right, rear_link, now_ms);
+        const bool funnel_opening_starting =
+            !context.solar_completion_mechanisms_started &&
+            (sequence_update.next_state ==
+                 robot::SolarPanelAutonomyState::StrafeLeftToFrontLine ||
+             sequence_update.next_state ==
+                 robot::SolarPanelAutonomyState::
+                     ForwardLineFollowAfterFrontDetection);
+        if (funnel_opening_starting) {
+          const SolarCompletionMechanismResult mechanism_result =
+              startSolarFunnelOpening(context, rear_link, now_ms);
+          if (mechanism_result ==
+              SolarCompletionMechanismResult::HardwareUnavailable) {
+            enterSolarPanelSearchFault(
+                context, front_left, front_right, rear_link, now_ms,
+                robot::SolarPanelFaultReason::HardwareNotReady,
+                robot::FaultCode::HardwareNotConfigured,
+                "solar line return stopped: solar hook or funnel unavailable",
+                robot::EventSource::System);
+            return;
+          }
+          if (mechanism_result ==
+              SolarCompletionMechanismResult::FunnelCommandFailed) {
+            enterSolarPanelSearchFault(
+                context, front_left, front_right, rear_link, now_ms,
+                robot::SolarPanelFaultReason::FunnelCommandFailed,
+                robot::FaultCode::CommunicationStale,
+                "solar line return stopped: funnel-open command failed",
+                robot::EventSource::Uart);
+            return;
+          }
+          logEvent(
+              context, now_ms, robot::EventSeverity::Info,
+              robot::EventSource::Motor,
+              "timed solar funnel opening started with the line return; hook remains closed until front tape detection");
+        }
+        if (robot::shouldOpenSolarHookAfterLineDetection(sequence_update)) {
+          if (!motion_stopped) {
+            enterSolarPanelSearchFault(
+                context, front_left, front_right, rear_link, now_ms,
+                robot::SolarPanelFaultReason::RearLinkStale,
+                robot::FaultCode::CommunicationStale,
+                "solar front-line handoff stopped: failed to stop chassis before opening hook",
+                robot::EventSource::Uart);
+            return;
+          }
+          const SolarCompletionMechanismResult hook_result =
+              openSolarHookForMission(context, rear_link, now_ms);
+          if (hook_result ==
+              SolarCompletionMechanismResult::HardwareUnavailable) {
+            enterSolarPanelSearchFault(
+                context, front_left, front_right, rear_link, now_ms,
+                robot::SolarPanelFaultReason::HardwareNotReady,
+                robot::FaultCode::HardwareNotConfigured,
+                "solar front-line handoff stopped: solar hook unavailable",
+                robot::EventSource::System);
+            return;
+          }
+          if (hook_result ==
+              SolarCompletionMechanismResult::SolarHookCommandFailed) {
+            enterSolarPanelSearchFault(
+                context, front_left, front_right, rear_link, now_ms,
+                robot::SolarPanelFaultReason::SolarHookCommandFailed,
+                robot::FaultCode::CommunicationStale,
+                "solar front-line handoff stopped: failed to raise/open solar hook",
+                robot::EventSource::Uart);
+            return;
+          }
+        }
         enterSolarPanelAutonomyState(context, sequence_update.next_state,
                                      now_ms);
         if (sequence_update.next_state ==
@@ -6868,13 +7744,17 @@ void runSolarPanelAutonomy(RuntimeContext& context,
           robot::startLineFollower(context.follower_state, now_ms);
           logEvent(context, now_ms, robot::EventSeverity::Info,
                    robot::EventSource::Line,
-                   "solar front tape detected; forward line-follow PID started");
+                   "solar front tape detected; strafe stopped, hook raised/open, and forward line-follow PID started");
           printTelemetry(context, sensors, rear_link, now_ms);
           return;
         }
         const char* message = "solar contact adjustment state changed";
-        if (sequence_update.next_state ==
-            robot::SolarPanelAutonomyState::StrafeLeftForSolarRetry) {
+        if (contact_timeout_fallback) {
+          message =
+              "solar contact timeout; continuing post-contact forward motion";
+        } else if (sequence_update.next_state ==
+                   robot::SolarPanelAutonomyState::
+                       StrafeLeftForSolarRetry) {
           message = "solar contact front-only: left adjustment started";
         } else if (sequence_update.next_state ==
                    robot::SolarPanelAutonomyState::
@@ -6900,7 +7780,10 @@ void runSolarPanelAutonomy(RuntimeContext& context,
                        ForwardLineFollowAfterFrontDetection) {
           message = "solar front tape detected; forward line following started";
         }
-        logEvent(context, now_ms, robot::EventSeverity::Info,
+        logEvent(context, now_ms,
+                 contact_timeout_fallback
+                     ? robot::EventSeverity::Warn
+                     : robot::EventSeverity::Info,
                  robot::EventSource::System, message);
         const bool zero_duration_adjustment =
             (context.autonomous_state ==
@@ -7034,75 +7917,55 @@ void runSolarPanelAutonomy(RuntimeContext& context,
     }
 
     case robot::SolarPanelAutonomyState::FrontLineFollowComplete: {
-      if (!stopAutonomyDriveAndFunnel(
+      if (!disableMotionActuators(
               context, front_left, front_right, rear_link, now_ms)) {
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
-            robot::SolarPanelFaultReason::FunnelCommandFailed,
+            robot::SolarPanelFaultReason::RearLinkStale,
             robot::FaultCode::CommunicationStale,
-            "solar completion stopped: failed to hold chassis/funnel stopped",
+            "solar completion stopped: failed to hold chassis stopped",
             robot::EventSource::Uart);
         return;
       }
-      if (!rear_link.remoteStatusFresh(
-              now_ms, remoteStatusTimeoutMs(context.config)) ||
-          !rear_link.latestStatus().solar_hook_configured ||
-          !rear_link.latestStatus().funnel_configured) {
+      if (!context.solar_completion_mechanisms_started) {
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::HardwareNotReady,
-            robot::FaultCode::HardwareNotConfigured,
-            "solar completion stopped: solar hook or funnel unavailable",
+            robot::FaultCode::InvalidCommand,
+            "solar completion stopped: funnel opening was not started",
             robot::EventSource::System);
         return;
       }
-      if (!sendSolarHookPosition(context, rear_link, true)) {
+      if (!context.solar_hook_commanded_open ||
+          !context.solar_hook_hold_open_for_mission) {
         enterSolarPanelSearchFault(
             context, front_left, front_right, rear_link, now_ms,
             robot::SolarPanelFaultReason::SolarHookCommandFailed,
-            robot::FaultCode::CommunicationStale,
-            "solar completion stopped: failed to raise/open solar hook",
-            robot::EventSource::Uart);
+            robot::FaultCode::InvalidCommand,
+            "solar completion stopped: hook was not opened after front-line detection",
+            robot::EventSource::System);
+        return;
+      }
+      if (context.solar_funnel_open_complete) {
+        enterSolarPanelAutonomyState(
+            context, robot::SolarPanelAutonomyState::Complete, now_ms);
+        clearFault(context);
+        logEvent(context, now_ms, robot::EventSeverity::Info,
+                 robot::EventSource::System,
+                 "solar run complete: line return and funnel opening finished; hook remains raised/open");
         return;
       }
       enterSolarPanelAutonomyState(
           context,
           robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel,
           now_ms);
-      context.requested_funnel_command = makeTimedMotorCommand(
-          context.solar_contact_config.funnel_open_duty, now_ms,
-          context.config.remoteCommandTimeoutMs);
-      if (!sendFunnelMotorCommand(
-              rear_link, context.requested_funnel_command,
-              context.config, now_ms)) {
-        enterSolarPanelSearchFault(
-            context, front_left, front_right, rear_link, now_ms,
-            robot::SolarPanelFaultReason::FunnelCommandFailed,
-            robot::FaultCode::CommunicationStale,
-            "solar completion stopped: funnel-open command failed",
-            robot::EventSource::Uart);
-        return;
-      }
-      context.last_command_ms = now_ms;
       logEvent(context, now_ms, robot::EventSeverity::Info,
-               robot::EventSource::Motor,
-               "solar hook raised/open; timed funnel opening started");
+               robot::EventSource::System,
+               "solar route complete; hook held open while waiting for funnel opening");
       return;
     }
 
     case robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel: {
-      if (!rear_link.remoteStatusFresh(
-              now_ms, remoteStatusTimeoutMs(context.config)) ||
-          !rear_link.latestStatus().solar_hook_configured ||
-          !rear_link.latestStatus().funnel_configured) {
-        enterSolarPanelSearchFault(
-            context, front_left, front_right, rear_link, now_ms,
-            robot::SolarPanelFaultReason::RearLinkStale,
-            robot::FaultCode::CommunicationStale,
-            "solar funnel opening stopped: ESP1 status became stale or mechanism hardware unavailable",
-            robot::EventSource::Uart);
-        return;
-      }
       if (!disableMotionActuators(
               context, front_left, front_right, rear_link, now_ms)) {
         enterSolarPanelSearchFault(
@@ -7113,46 +7976,15 @@ void runSolarPanelAutonomy(RuntimeContext& context,
             robot::EventSource::Uart);
         return;
       }
-      const robot::SolarPanelContactSequenceUpdate sequence_update =
-          robot::updateSolarPanelContactSequence(
-              context.autonomous_state, false, false, false,
-              time_in_state_ms, context.solar_contact_config);
-      if (sequence_update.next_state ==
-          robot::SolarPanelAutonomyState::Complete) {
-        context.requested_funnel_command = robot::disabledMotorCommand();
-        if (!sendStoppedFunnelCommand(
-                rear_link, context.config, now_ms)) {
-          enterSolarPanelSearchFault(
-              context, front_left, front_right, rear_link, now_ms,
-              robot::SolarPanelFaultReason::FunnelCommandFailed,
-              robot::FaultCode::CommunicationStale,
-              "solar completion stopped: funnel stop command failed",
-              robot::EventSource::Uart);
-          return;
-        }
+      if (context.solar_funnel_open_complete) {
         enterSolarPanelAutonomyState(
             context, robot::SolarPanelAutonomyState::Complete, now_ms);
         clearFault(context);
         logEvent(context, now_ms, robot::EventSeverity::Info,
                  robot::EventSource::System,
-                 "solar run complete: hook open and funnel opening finished");
+                 "solar run complete: line return and funnel opening finished; hook remains raised/open");
         return;
       }
-      context.requested_funnel_command = makeTimedMotorCommand(
-          context.solar_contact_config.funnel_open_duty, now_ms,
-          context.config.remoteCommandTimeoutMs);
-      if (!sendFunnelMotorCommand(
-              rear_link, context.requested_funnel_command,
-              context.config, now_ms)) {
-        enterSolarPanelSearchFault(
-            context, front_left, front_right, rear_link, now_ms,
-            robot::SolarPanelFaultReason::FunnelCommandFailed,
-            robot::FaultCode::CommunicationStale,
-            "solar funnel opening stopped: command failed",
-            robot::EventSource::Uart);
-        return;
-      }
-      context.last_command_ms = now_ms;
       return;
     }
 
@@ -7176,6 +8008,10 @@ void enterTimeTrialFault(RuntimeContext& context,
                          const robot::FaultCode fault_code,
                          const char* message,
                          const robot::EventSource source) {
+  if (context.peg_finder_tower_handoff_active &&
+      g_runtime.stepper != nullptr) {
+    g_runtime.stepper->stop();
+  }
   stopAutonomousImuStrafe(context);
   (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
                                    rear_link, now_ms);
@@ -7218,6 +8054,7 @@ void runTimeTrial(RuntimeContext& context,
       return;
     }
     context.time_trial_start_requested = false;
+    (void)refreshSharedImuSnapshot(context);
     if (!timeTrialStartRequirementsMet(
             sensors, front_left, front_right, rear_link, claws,
             funnel_limit, stepper, now_ms, context)) {
@@ -7280,13 +8117,21 @@ void runTimeTrial(RuntimeContext& context,
   } else if (context.time_trial.state ==
              robot::TimeTrialState::PegFinder) {
     runPegFinder(context, front_left, front_right, rear_link, claws,
-                 funnel_limit, now_ms);
+                 funnel_limit, stepper, now_ms);
   } else if (context.time_trial.state ==
                  robot::TimeTrialState::PostSolarDelay ||
              context.time_trial.state ==
                  robot::TimeTrialState::PostTowerDelay) {
     if (!stopTimeTrialOutputsOrFault(context, front_left, front_right,
                                      rear_link, now_ms)) {
+      return;
+    }
+    if (context.time_trial.state ==
+            robot::TimeTrialState::PostTowerDelay &&
+        !servicePegFinderTowerHandoff(
+            context, front_left, front_right, rear_link, claws, stepper,
+            now_ms)) {
+      robot::failTimeTrialAutonomy(context.time_trial, now_ms);
       return;
     }
   }
@@ -7301,6 +8146,9 @@ void runTimeTrial(RuntimeContext& context,
       robot::SolarPanelAutonomyState::SolarSearchFault;
   inputs.tower_pieces_complete =
       context.tower_pieces.state == robot::TowerPiecesState::Complete;
+  inputs.tower_pieces_ready_for_peg_finder =
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::MoveStepperTop;
   inputs.tower_pieces_fault =
       context.tower_pieces.state == robot::TowerPiecesState::Fault;
   inputs.peg_finder_complete =
@@ -7309,6 +8157,13 @@ void runTimeTrial(RuntimeContext& context,
       context.peg_finder.state == robot::PegFinderState::Fault;
   const robot::TimeTrialUpdate update = robot::updateTimeTrialAutonomy(
       context.time_trial, inputs, context.time_trial_config, now_ms);
+
+  if (previous_state == robot::TimeTrialState::TowerPieces &&
+      update.state == robot::TimeTrialState::PostTowerDelay &&
+      context.tower_pieces.state != robot::TowerPiecesState::Complete) {
+    context.peg_finder_tower_handoff_active = true;
+    context.peg_finder_tower_handoff_winch_closed = false;
+  }
 
   if (update.state == robot::TimeTrialState::Fault) {
     (void)stopAutonomyDriveAndFunnel(context, front_left, front_right,
@@ -7328,27 +8183,30 @@ void runTimeTrial(RuntimeContext& context,
              "Time Trial tower pieces started");
   }
   if (update.should_start_peg_finder) {
+    const bool tower_handoff_winch_already_closed =
+        context.peg_finder_tower_handoff_winch_closed;
+    const bool tower_handoff_required =
+        context.peg_finder_tower_handoff_active ||
+        context.tower_pieces.state != robot::TowerPiecesState::Complete;
+    resetPegFinder(context, now_ms);
+    context.peg_finder_tower_handoff_active = tower_handoff_required;
+    context.peg_finder_tower_handoff_winch_closed =
+        tower_handoff_winch_already_closed || !tower_handoff_required;
     const ClawServoCommandResult claws_result =
         claws.commandAll(ClawServoPositionRequest::Closed);
-    const ClawServoCommandResult winch_result =
-        claws.command(kWinchServoIndex, ClawServoPositionRequest::Closed);
-    if (claws_result != ClawServoCommandResult::Accepted ||
-        winch_result != ClawServoCommandResult::Accepted) {
-      const ClawServoCommandResult failed_result =
-          claws_result != ClawServoCommandResult::Accepted
-              ? claws_result
-              : winch_result;
+    if (claws_result != ClawServoCommandResult::Accepted) {
       enterTimeTrialFault(
           context, front_left, front_right, rear_link, now_ms,
-          clawFaultCode(failed_result), clawServoResultReason(failed_result),
+          clawFaultCode(claws_result), clawServoResultReason(claws_result),
           robot::EventSource::Motor);
       return;
     }
-    // Keep the closed servo PWM outputs enabled across this handoff.
     context.peg_finder_start_requested = true;
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
-             "Time Trial PegFinder started with servos held closed");
+             context.peg_finder_tower_handoff_active
+                 ? "Time Trial PegFinder started with the Tower top/winch interlock active"
+                 : "Time Trial PegFinder started after Tower completion");
   }
 
   if (update.state == robot::TimeTrialState::SolarToTowerStrafeRight) {
@@ -7408,7 +8266,8 @@ void runTimeTrial(RuntimeContext& context,
                robot::TimeTrialState::SolarToTowerStrafeRight) {
       message = "Time Trial solar-to-tower right strafe started";
     } else if (update.state == robot::TimeTrialState::PostTowerDelay) {
-      message = "Time Trial tower pieces complete; PegFinder delay started";
+      message =
+          "Time Trial Tower claws settled and top search started; PegFinder delay started";
     } else if (update.state == robot::TimeTrialState::Complete) {
       message = "Time Trial complete";
       clearFault(context);
@@ -7465,6 +8324,7 @@ void runFinalCompetition(
       return;
     }
     context.final_competition_start_requested = false;
+    (void)refreshSharedImuSnapshot(context);
     if (!finalCompetitionStartRequirementsMet(
             sensors, front_left, front_right, rear_link, claws,
             habitat_piece_limit, funnel_limit, stepper, now_ms, context)) {
@@ -7506,7 +8366,7 @@ void runFinalCompetition(
       break;
     case robot::FinalCompetitionState::PegFinder:
       runPegFinder(context, front_left, front_right, rear_link, claws,
-                   funnel_limit, now_ms);
+                   funnel_limit, stepper, now_ms);
       break;
     case robot::FinalCompetitionState::Complete:
       stepper.stop();
@@ -7537,6 +8397,9 @@ void runFinalCompetition(
       context.habitat_cycle.phase == robot::HabitatCyclePhase::Fault;
   inputs.tower_complete =
       context.tower_pieces.state == robot::TowerPiecesState::Complete;
+  inputs.tower_ready_for_peg_finder =
+      context.tower_pieces.state ==
+          robot::TowerPiecesState::MoveStepperTop;
   inputs.tower_fault =
       context.tower_pieces.state == robot::TowerPiecesState::Fault;
   inputs.peg_finder_complete =
@@ -7578,22 +8441,29 @@ void runFinalCompetition(
   }
 
   if (update.should_start_peg_finder) {
+    const bool tower_handoff_winch_already_closed =
+        context.peg_finder_tower_handoff_winch_closed;
+    const bool tower_handoff_required =
+        context.peg_finder_tower_handoff_active ||
+        context.tower_pieces.state != robot::TowerPiecesState::Complete;
+    resetPegFinder(context, now_ms);
+    context.peg_finder_tower_handoff_active = tower_handoff_required;
+    context.peg_finder_tower_handoff_winch_closed =
+        tower_handoff_winch_already_closed || !tower_handoff_required;
     const ClawServoCommandResult claws_result =
         claws.commandAll(ClawServoPositionRequest::Closed);
-    const ClawServoCommandResult winch_result =
-        claws.command(kWinchServoIndex, ClawServoPositionRequest::Closed);
-    if (claws_result != ClawServoCommandResult::Accepted ||
-        winch_result != ClawServoCommandResult::Accepted) {
+    if (claws_result != ClawServoCommandResult::Accepted) {
       enterFinalCompetitionFault(
           context, front_left, front_right, rear_link, stepper, now_ms,
           "Final competition PegFinder handoff failed: servo command rejected");
       return;
     }
-    resetPegFinder(context, now_ms);
     context.peg_finder_start_requested = true;
     logEvent(context, now_ms, robot::EventSeverity::Info,
              robot::EventSource::System,
-             "Final competition Tower Pieces complete; PegFinder started");
+             context.peg_finder_tower_handoff_active
+                 ? "Final competition Tower claws settled; PegFinder started while the stepper continues toward the top limit"
+                 : "Final competition Tower Pieces complete; PegFinder started");
     return;
   }
 
@@ -8222,16 +9092,24 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
   snapshot.solar_funnel_open_duration_ms =
       context.solar_contact_config.funnel_open_duration_ms;
   snapshot.solar_opening_hook_and_funnel =
-      context.autonomous_state ==
-      robot::SolarPanelAutonomyState::OpenSolarHookAndFunnel;
+      context.solar_completion_mechanisms_started &&
+      !context.solar_funnel_open_complete;
   snapshot.solar_funnel_open_elapsed_ms =
-      snapshot.solar_opening_hook_and_funnel
-          ? snapshot.autonomous_time_in_state_ms
+      context.solar_completion_mechanisms_started
+          ? elapsedSince(now_ms,
+                         context.solar_funnel_open_started_at_ms)
           : 0U;
+  if (snapshot.solar_funnel_open_elapsed_ms >
+      snapshot.solar_funnel_open_duration_ms) {
+    snapshot.solar_funnel_open_elapsed_ms =
+        snapshot.solar_funnel_open_duration_ms;
+  }
   snapshot.solar_post_contact_forward_start_delay_ms =
       context.solar_contact_config.post_contact_forward_start_delay_ms;
   snapshot.solar_line_reacquire_strafe_start_delay_ms =
       context.solar_contact_config.line_reacquire_strafe_start_delay_ms;
+  snapshot.solar_line_reacquire_strafe_timeout_ms =
+      context.solar_contact_config.line_reacquire_strafe_timeout_ms;
   snapshot.solar_post_contact_forward_duty =
       context.solar_contact_config.post_contact_forward_duty;
 
@@ -8788,13 +9666,17 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
       (context.peg_finder.state ==
            robot::PegFinderState::ShakeLeftAfterClaw1 ||
        context.peg_finder.state ==
-           robot::PegFinderState::ShakeLeftAfterClaw2);
+           robot::PegFinderState::ShakeLeftAfterClaw2 ||
+       context.peg_finder.state ==
+           robot::PegFinderState::ShakeLeftAfterClaw3);
   snapshot.peg_finder_shaking_right =
       peg_finder_mode_active &&
       (context.peg_finder.state ==
            robot::PegFinderState::ShakeRightAfterClaw1 ||
        context.peg_finder.state ==
-           robot::PegFinderState::ShakeRightAfterClaw2);
+           robot::PegFinderState::ShakeRightAfterClaw2 ||
+       context.peg_finder.state ==
+           robot::PegFinderState::ShakeRightAfterClaw3);
   const bool opening_first_claw =
       context.peg_finder.state == robot::PegFinderState::OpenClaw1;
   const bool opening_second_claw =
@@ -8919,14 +9801,6 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
         esp1.side_line_sensor_configured;
     snapshot.esp1.side_line_sensor_high =
         esp1.side_line_sensor_high;
-    snapshot.esp1.ultrasonic_1_configured =
-        esp1.ultrasonic_1_configured;
-    snapshot.esp1.ultrasonic_1_echo_valid =
-        esp1.ultrasonic_1_echo_valid;
-    snapshot.esp1.ultrasonic_1_distance_mm =
-        esp1.ultrasonic_1_distance_mm;
-    snapshot.esp1.ultrasonic_1_echo_duration_us =
-        esp1.ultrasonic_1_echo_duration_us;
     snapshot.esp1.solar_hook_configured =
         esp1.solar_hook_configured;
     snapshot.esp1.solar_hook_output_enabled =
@@ -8941,22 +9815,6 @@ void fillTelemetrySnapshot(const RuntimeContext& context,
         esp1.solar_hook_output_enabled;
     snapshot.solar_hook.commanded_angle_deg =
         esp1.solar_hook_commanded_angle_deg;
-    snapshot.ultrasonic_1.configured =
-        esp1.ultrasonic_1_configured;
-    snapshot.ultrasonic_1.data_fresh =
-        snapshot.rear.esp1_link_healthy;
-    snapshot.ultrasonic_1.echo_valid =
-        esp1.ultrasonic_1_echo_valid;
-    snapshot.ultrasonic_1.distance_mm =
-        esp1.ultrasonic_1_distance_mm;
-    snapshot.ultrasonic_1.echo_duration_us =
-        esp1.ultrasonic_1_echo_duration_us;
-    snapshot.ultrasonic_1.sample_age_ms =
-        snapshot.rear.esp1_last_packet_age_ms;
-    snapshot.ultrasonic_1_distance_mm =
-        esp1.ultrasonic_1_echo_valid
-            ? static_cast<int>(esp1.ultrasonic_1_distance_mm)
-            : -1;
     snapshot.solar_panel_limit_switches_configured =
         esp1.solar_panel_limit_switches_configured;
     snapshot.solar_limit_back_right_high =
@@ -9351,14 +10209,14 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Distance-zone target count <input id="habitatDistanceCountTarget" type="number" min="1" max="65535" step="1"></label>
       <label>Distance strafe duty <input id="habitatDistanceDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Ignore distance-zone counts after strafe starts (ms) <input id="habitatDistanceCountIgnore" type="number" min="0" max="30000" step="100"></label>
-      <label>Distance strafe timeout (ms) <input id="habitatDistanceTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Distance strafe timeout, then run exit sequence (ms) <input id="habitatDistanceTimeout" type="number" min="1" max="30000" step="100"></label>
       <label>Stop delay after target count (ms) <input id="habitatPostCountDelay" type="number" min="1" max="30000" step="10"></label>
       <label>Exit pulse strafe duty <input id="habitatExitDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Exit strafe pulse (ms) <input id="habitatExitPulse" type="number" min="1" max="30000" step="10"></label>
       <label>Slide-down speed (steps/s) <input id="habitatSlideDownSpeed" type="number" min="1" step="1"></label>
       <label>Slide-down timeout (ms) <input id="habitatSlideDownTimeout" type="number" min="1" max="30000" step="100"></label>
       <label>Approach forward duty <input id="habitatApproachDuty" type="number" min="0.001" max="1" step="0.01"></label>
-      <label>Approach timeout (ms) <input id="habitatApproachTimeout" type="number" min="1" max="30000" step="100"></label>
+      <label>Approach timeout, then continue pickup (ms) <input id="habitatApproachTimeout" type="number" min="1" max="30000" step="100"></label>
       <label>Pre-lift reverse duration (ms) <input id="habitatPreLiftReverseDuration" type="number" min="1" max="30000" step="10"></label>
       <label>Lift distance (steps) <input id="habitatLiftSteps" type="number" min="1" step="1"></label>
       <label>Lift speed (steps/s) <input id="habitatLiftSpeed" type="number" min="1" step="1"></label>
@@ -9544,7 +10402,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>Autonomous Solar</h2>
-    <div class="muted">Stage the robot with the slider up, funnel mechanically closed, and solar hook down/closed. Solar explicitly holds the hook closed at its start. After the final forward front-line follow, it raises the hook and runs the funnel at the signed duty for the configured duration.</div>
+    <div class="muted">Stage the robot with the slider up, funnel mechanically closed, and solar hook down/closed. Solar explicitly holds the hook closed at its start. Front-only panel contact starts one retry; no-front contact or an expired retry continues into the post-contact forward drive. During the final left strafe Solar opens the funnel while keeping the hook closed. Front-line detection stops the strafe, then raises and holds the hook before advancing immediately; that timeout only bounds a failed line search.</div>
     <div class="kv">
       <span>State</span><span id="autoState" class="mono"></span>
       <span>Fault</span><span id="autoFault" class="mono"></span>
@@ -9569,7 +10427,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Start duty <input id="solarStartDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Slow after ms <input id="solarSlowAfterMs" type="number" min="0" step="500"></label>
       <label>Slow duty <input id="solarSlowDuty" type="number" min="0" max="1" step="0.01"></label>
-      <label>Contact timeout ms <input id="solarContactTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Contact timeout, then continue forward (ms) <input id="solarContactTimeoutMs" type="number" min="1" step="500"></label>
       <label>Initial right strafe duty <input id="solarInitialStrafeDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Retry left strafe duty <input id="solarRetryLeftDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Retry right strafe duty <input id="solarRetryRightDuty" type="number" min="0.001" max="1" step="0.01"></label>
@@ -9577,12 +10435,13 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Retry forward duty <input id="solarStrafeDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Retry left strafe ms <input id="solarRetryLeftMs" type="number" min="0" step="50"></label>
       <label>Retry forward ms <input id="solarRetryForwardMs" type="number" min="0" step="50"></label>
-      <label>Retry right timeout ms <input id="solarRetryStrafeTimeoutMs" type="number" min="1" step="500"></label>
+      <label>Retry right timeout, then continue forward (ms) <input id="solarRetryStrafeTimeoutMs" type="number" min="1" step="500"></label>
       <label>Post-contact forward ms <input id="solarPostContactForwardMs" type="number" min="0" step="50"></label>
       <label>Post-contact forward duty <input id="solarPostContactForwardDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Post-contact forward delay ms <input id="solarPostContactForwardDelayMs" type="number" min="0" step="50"></label>
       <label>Post-forward front-line delay ms <input id="solarPostForwardStrafeDelayMs" type="number" min="0" step="50"></label>
       <label>Front-line reacquire strafe duty <input id="solarLineReacquireDuty" type="number" min="0.001" max="1" step="0.01"></label>
+      <label>Front-line reacquire timeout ms <input id="solarLineReacquireTimeoutMs" type="number" min="1" max="30000" step="100"></label>
       <label>Forward front-line PID duty <input id="solarFrontLineFollowDuty" type="number" min="0.001" max="1" step="0.01"></label>
       <label>Forward front-line PID duration ms <input id="solarFrontLineFollowDurationMs" type="number" min="1" step="100"></label>
       <label>Funnel-open signed duty (+ forward / − reverse) <input id="solarFunnelOpenDuty" type="number" min="-1" max="1" step="0.01"></label>
@@ -9654,7 +10513,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
   <section>
     <h2>PegFinder</h2>
-    <div class="muted">IMU-controlled clockwise turn, then timed backward and forward chassis movements, followed by funnel forward until the active-high GPIO 47 limit is pressed. The turn uses the shared IMU Turn tuning and the angle below. After a delay, the claws open in the selected order using the shared Servo Control panel angles. Once all three are open, PegFinder waits, then reverses the funnel for the configured duration.</div>
+    <div class="muted">IMU-controlled clockwise turn, then timed backward and forward chassis movements, followed by funnel forward until the active-high GPIO 47 limit is pressed. The turn uses the shared IMU Turn tuning and the angle below. After a delay, PegFinder selects claws in the configured order using the shared Servo Control panel angles: the selected claw opens while the other two close. After the third selection, PegFinder waits, then reverses the funnel for the configured duration.</div>
     <div class="kv">
       <span>State</span><span id="pegFinderState" class="mono"></span>
       <span>Fault</span><span id="pegFinderFault" class="mono"></span>
@@ -9678,11 +10537,11 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <label>Shake duty (0 disables all shake) <input id="pegFinderShakeDuty" type="number" min="0" max="1" step="0.01"></label>
       <label>Shake left pulse ms <input id="pegFinderShakeLeftMs" type="number" min="0" step="10"></label>
       <label>Shake right pulse ms <input id="pegFinderShakeRightMs" type="number" min="0" step="10"></label>
-      <label>Delay after shake before next claw (ms) <input id="pegFinderPostShakeDelayMs" type="number" min="0" max="30000" step="10"></label>
+      <label>Delay after shake before next claw/funnel (ms) <input id="pegFinderPostShakeDelayMs" type="number" min="0" max="30000" step="10"></label>
       <label>First claw to open <select id="pegFinderClawOrder1"><option value="1">Claw 1</option><option value="2">Claw 2</option><option value="3">Claw 3</option></select></label>
       <label>Second claw to open <select id="pegFinderClawOrder2"><option value="1">Claw 1</option><option value="2">Claw 2</option><option value="3">Claw 3</option></select></label>
       <label>Third claw to open <select id="pegFinderClawOrder3"><option value="1">Claw 1</option><option value="2">Claw 2</option><option value="3">Claw 3</option></select></label>
-      <label>Delay after all claws open ms <input id="pegFinderPostClawsOpenDelayMs" type="number" min="1" step="100"></label>
+      <label>Delay after third claw selection ms <input id="pegFinderPostClawsOpenDelayMs" type="number" min="1" step="100"></label>
       <label>Funnel reverse duty cycle <input id="pegFinderFunnelReverseDuty" type="number" min="0.01" max="1" step="0.01"></label>
       <label>Funnel reverse duration ms <input id="pegFinderFunnelReverseDurationMs" type="number" min="1" step="100"></label>
     </div>
@@ -10775,6 +11634,7 @@ function loadSolarControls(j){
   setLfValue('solarPostContactForwardDelayMs', a.post_contact_forward_start_delay_ms);
   setLfValue('solarPostForwardStrafeDelayMs', a.line_reacquire_strafe_start_delay_ms);
   setLfValue('solarLineReacquireDuty', speeds.front_line_strafe_duty);
+  setLfValue('solarLineReacquireTimeoutMs', a.line_reacquire_strafe_timeout_ms);
   setLfValue('solarFrontLineFollowDuty', speeds.forward_pid_duty);
   setLfValue('solarFrontLineFollowDurationMs', speeds.forward_pid_duration_ms);
   setLfValue('solarFunnelOpenDuty', a.funnel_open_duty);
@@ -10809,6 +11669,7 @@ function solarParams(){
   add('post-contact-forward-delay-ms', 'solarPostContactForwardDelayMs');
   add('post-forward-strafe-delay-ms', 'solarPostForwardStrafeDelayMs');
   add('line-reacquire-strafe-duty', 'solarLineReacquireDuty');
+  add('line-reacquire-timeout-ms', 'solarLineReacquireTimeoutMs');
   add('front-line-follow-duty', 'solarFrontLineFollowDuty');
   add('front-line-follow-duration-ms', 'solarFrontLineFollowDurationMs');
   add('funnel-open-duty', 'solarFunnelOpenDuty');
@@ -11176,7 +12037,7 @@ function update(){
     const hookOutput = solarHook.outputEnabled
       ? '' : ' (output disabled; last request/staging)';
     qs('autoMechanisms').textContent =
-      `hook=${solarHook.commandedOpen ? 'OPEN/UP' : 'CLOSED/DOWN'}${hookOutput} · funnel ${funnelDirection} duty=${funnelOpenDuty.toFixed(3)} · ${a.funnel_open_elapsed_ms ?? 0} / ${a.funnel_open_duration_ms ?? 0} ms · active=${yn(a.opening_hook_and_funnel)}`;
+      `hook=${solarHook.commandedOpen ? 'OPEN/UP' : 'CLOSED/DOWN'}${hookOutput} · funnel ${funnelDirection} duty=${funnelOpenDuty.toFixed(3)} · ${a.funnel_open_elapsed_ms ?? 0} / ${a.funnel_open_duration_ms ?? 0} ms · funnel active=${yn(a.opening_hook_and_funnel)}`;
     const limits = j.solarLimitSwitches || a.limit_switches || {};
     const backRightHigh = limits.backRightHigh ?? limits.back_right_high;
     const backRightHit = limits.backRightHit ?? limits.back_right_hit;
@@ -12567,6 +13428,15 @@ void handleAutonomousSolarConfig() {
     sendErrorJson(400, "malformed line-reacquire-strafe-duty");
     return;
   }
+  if (g_server.hasArg("line-reacquire-timeout-ms")) {
+    if (!argUnsigned(
+            "line-reacquire-timeout-ms", milliseconds_value,
+            next_contact.line_reacquire_strafe_timeout_ms, true)) {
+      sendErrorJson(400, "malformed line-reacquire-timeout-ms");
+      return;
+    }
+    next_contact.line_reacquire_strafe_timeout_ms = milliseconds_value;
+  }
   if (g_server.hasArg("front-line-follow-duration-ms")) {
     if (!argUnsigned("front-line-follow-duration-ms", milliseconds_value,
                      next_contact.front_line_follow_duration_ms, true)) {
@@ -12697,9 +13567,11 @@ void handleAutonomousSolarConfig() {
       std::fabs(next_contact.funnel_open_duty) >
           funnelMotionDutyCap() ||
       next_contact.funnel_open_duration_ms >
+          kMaxTimedTestDurationMs ||
+      next_contact.line_reacquire_strafe_timeout_ms >
           kMaxTimedTestDurationMs) {
     sendErrorJson(409,
-                  "solar config requires release <= detect, alpha [0,1), contact timeouts > 0, route duties within their caps, and a nonzero signed funnel-open duty/duration within the funnel cap and 30000 ms");
+                  "solar config requires release <= detect, alpha [0,1), contact/line-reacquire timeouts > 0 and <= 30000 ms, route duties within their caps, and a nonzero signed funnel-open duty/duration within the funnel cap and 30000 ms");
     return;
   }
 
@@ -14486,6 +15358,7 @@ void handleRearLineFollowStart() {
 
   const robot::Milliseconds now_ms =
       static_cast<robot::Milliseconds>(millis());
+  bool stream_warming = false;
   if (context.modes.currentMode() !=
       robot::RobotTestMode::RearLineFollowTest) {
     resetTowerPieces(context, now_ms);
@@ -14495,7 +15368,17 @@ void handleRearLineFollowStart() {
                      *g_runtime.rear_link, now_ms);
     context.modes.setMode(robot::RobotTestMode::RearLineFollowTest, now_ms);
   }
-  if (!rearLineStartRequirementsMet(
+  stream_warming = g_runtime.rear_link->rearLineStreamWarming();
+  if (!g_runtime.rear_link->rearLineAcquisitionRequested()) {
+    const bool request_sent = sendStoppedRearCommand(
+        *g_runtime.rear_link, context.rear_config, now_ms,
+        robot::kOperationalLaserDistanceProfile,
+        habitatLaserAcquisitionRequested(context),
+        solarIrAcquisitionRequested(context), true);
+    stream_warming =
+        request_sent && g_runtime.rear_link->rearLineStreamWarming();
+  }
+  if (!stream_warming && !rearLineStartRequirementsMet(
           *g_runtime.front_left, *g_runtime.front_right,
           *g_runtime.rear_link, now_ms, context)) {
     setFault(context, robot::FaultCode::HardwareNotConfigured,
@@ -15102,6 +15985,9 @@ void handleConfigSave() {
   g_runtime.preferences->putFloat(
       "slstrd", context.solar_contact_config.line_reacquire_strafe_duty);
   g_runtime.preferences->putUInt(
+      "slstrtmo",
+      context.solar_contact_config.line_reacquire_strafe_timeout_ms);
+  g_runtime.preferences->putUInt(
       "slpidms", context.solar_contact_config.front_line_follow_duration_ms);
   g_runtime.preferences->putFloat(
       "slpidd", context.solar_contact_config.front_line_follow_duty);
@@ -15382,6 +16268,9 @@ void printStatus(const RuntimeContext& context, const RearCommandLink& rear_link
   Serial.print(", solar-post-forward-strafe-delay-ms=");
   Serial.print(
       context.solar_contact_config.line_reacquire_strafe_start_delay_ms);
+  Serial.print(", solar-line-reacquire-timeout-ms=");
+  Serial.print(
+      context.solar_contact_config.line_reacquire_strafe_timeout_ms);
   Serial.print(", solar-funnel-open-duty=");
   Serial.print(context.solar_contact_config.funnel_open_duty, 4);
   Serial.print(", solar-funnel-open-duration-ms=");
@@ -16110,10 +16999,23 @@ void processCommand(RuntimeContext& context, char* line,
         disableActuators(context, front_left, front_right, rear_link, now_ms);
         context.modes.setMode(requested_mode, now_ms);
       }
+      bool rear_line_stream_warming =
+          rear_line_command && rear_link.rearLineStreamWarming();
+      if (rear_line_command &&
+          !rear_link.rearLineAcquisitionRequested()) {
+        const bool request_sent = sendStoppedRearCommand(
+            rear_link, context.rear_config, now_ms,
+            robot::kOperationalLaserDistanceProfile,
+            habitatLaserAcquisitionRequested(context),
+            solarIrAcquisitionRequested(context), true);
+        rear_line_stream_warming =
+            request_sent && rear_link.rearLineStreamWarming();
+      }
       const bool requirements_met =
           rear_line_command
-              ? rearLineStartRequirementsMet(front_left, front_right,
-                                             rear_link, now_ms, context)
+              ? rear_line_stream_warming ||
+                    rearLineStartRequirementsMet(
+                        front_left, front_right, rear_link, now_ms, context)
               : startRequirementsMet(sensors, front_left, front_right,
                                      rear_link, now_ms, context);
       if (!requirements_met) {
@@ -17149,6 +18051,10 @@ void loadPreferences(Preferences& preferences, RuntimeContext& context,
           preferences.getFloat(
               "slapp",
               context.imu_heading_hold_config.maximum_strafe_duty));
+  context.solar_contact_config.line_reacquire_strafe_timeout_ms =
+      preferences.getUInt(
+          "slstrtmo",
+          context.solar_contact_config.line_reacquire_strafe_timeout_ms);
   context.solar_contact_config.front_line_follow_duration_ms =
       preferences.getUInt(
           "slpidms",
@@ -17293,6 +18199,8 @@ void motionControlTask(void* parameters) {
       robot::esp2::kPins.limit_switch_habitat_piece};
   static DigitalActiveHighLimitSwitch peg_finder_funnel_limit{
       robot::esp2::kPins.limit_switch_funnel_left};
+  static DigitalActiveHighLimitSwitch final_competition_start_switch{
+      robot::esp2::kPins.final_competition_start_switch};
   static DualPwmMotorOutput front_left_motor{
       robot::esp2::kHardwareConfig.front_left_motor};
   static DualPwmMotorOutput front_right_motor{
@@ -17317,6 +18225,7 @@ void motionControlTask(void* parameters) {
   line_sensor_reader.initialize();
   habitat_piece_limit.initialize();
   peg_finder_funnel_limit.initialize();
+  final_competition_start_switch.initialize();
   front_left_motor.initializeDisabled();
   front_right_motor.initializeDisabled();
   rear_link.initialize();
@@ -17436,22 +18345,11 @@ void motionControlTask(void* parameters) {
     previous_loop_started_us = loop_started_us;
     const robot::Milliseconds now_ms =
         static_cast<robot::Milliseconds>(millis());
-    context.imu_shared_snapshot_available =
-        imu_acquisition.latest(context.latest_imu_snapshot);
-    context.imu_shared_snapshot_fetched_at_us = micros();
-    if (context.imu_shared_snapshot_available &&
-        context.latest_imu_snapshot
-                .last_successful_sample_published_at_us != 0U) {
-      const std::uint32_t observed_publication_gap_us =
-          context.imu_shared_snapshot_fetched_at_us -
-          context.latest_imu_snapshot
-              .last_successful_sample_published_at_us;
-      if (observed_publication_gap_us >
-          context.maximum_observed_imu_publication_gap_us) {
-        context.maximum_observed_imu_publication_gap_us =
-            observed_publication_gap_us;
-      }
-    }
+    final_competition_start_switch.update();
+    serviceFinalCompetitionStartSwitch(
+        context, final_competition_start_switch, front_left_motor,
+        front_right_motor, rear_link, now_ms);
+    (void)refreshSharedImuSnapshot(context);
     context.diagnostic_imu_update_us =
         context.latest_imu_snapshot.acquisition_duration_us;
     if (context.imu_heading_reset_pending_sequence != 0U &&
@@ -17475,6 +18373,10 @@ void motionControlTask(void* parameters) {
     refreshRearLineObservation(context, rear_link, now_ms);
     pollSerialCommands(context, line_sensor_reader, front_left_motor,
                        front_right_motor, rear_link, now_ms);
+    final_competition_start_switch.update();
+    serviceFinalCompetitionStartSwitch(
+        context, final_competition_start_switch, front_left_motor,
+        front_right_motor, rear_link, now_ms);
 
     if (context.requested_funnel_command.enabled &&
         context.requested_funnel_command.expires_at_ms != 0U &&
@@ -17601,7 +18503,34 @@ void motionControlTask(void* parameters) {
             robot::ImuHeadingHoldState::Idle) {
       resetImuHeadingHold(context);
     }
-    if (robot::robotTestModeIsSensorOnly(mode)) {
+
+    const bool rear_line_stream_requested =
+        rearLineAcquisitionRequested(context);
+    if (rear_line_stream_requested !=
+        rear_link.rearLineAcquisitionRequested()) {
+      (void)sendStoppedRearCommand(
+          rear_link, context.rear_config, now_ms,
+          robot::kOperationalLaserDistanceProfile,
+          habitatLaserAcquisitionRequested(context),
+          solarIrAcquisitionRequested(context),
+          rear_line_stream_requested);
+    }
+    const bool rear_line_stream_warming =
+        rear_line_stream_requested && rear_link.rearLineStreamWarming() &&
+        elapsedSince(now_ms, rear_link.rearLineRequestStartedAtMs()) <=
+            remoteStatusTimeoutMs(context.rear_config);
+
+    if (rear_line_stream_warming) {
+      context.requested_command = robot::disabledFourWheelCommand();
+      context.last_commanded_wheels = robot::disabledFourWheelCommand();
+      front_left_motor.disable();
+      front_right_motor.disable();
+      (void)sendStoppedRearCommand(
+          rear_link, context.rear_config, now_ms,
+          robot::kOperationalLaserDistanceProfile,
+          habitatLaserAcquisitionRequested(context),
+          solarIrAcquisitionRequested(context), true);
+    } else if (robot::robotTestModeIsSensorOnly(mode)) {
       disableActuators(context, front_left_motor, front_right_motor, rear_link,
                        now_ms);
       if (mode == robot::RobotTestMode::SensorMonitor ||
@@ -17633,7 +18562,7 @@ void motionControlTask(void* parameters) {
                              rear_link, claws, stepper, now_ms);
     } else if (mode == robot::RobotTestMode::PegFinder) {
       runPegFinder(context, front_left_motor, front_right_motor, rear_link,
-                   claws, peg_finder_funnel_limit, now_ms);
+                   claws, peg_finder_funnel_limit, stepper, now_ms);
     } else if (mode == robot::RobotTestMode::TimeTrial) {
       runTimeTrial(context, line_sensor_reader, front_left_motor,
                    front_right_motor, rear_link, claws,

@@ -5,9 +5,11 @@
 #include <unity.h>
 
 #include "common/ChassisMixer.h"
+#include "common/CommandTransmissionPolicy.h"
 #include "common/Esp1Status.h"
 #include "common/EventLog.h"
 #include "common/FinalCompetitionAutonomy.h"
+#include "common/FinalCompetitionStartSwitch.h"
 #include "common/FunnelCommand.h"
 #include "common/HabitatCycleAutonomy.h"
 #include "common/HabitatDistanceStop.h"
@@ -30,7 +32,6 @@
 #include "common/TelemetrySnapshot.h"
 #include "common/TimeTrialAutonomy.h"
 #include "common/TowerPiecesAutonomy.h"
-#include "common/Ultrasonic.h"
 
 namespace {
 
@@ -54,7 +55,8 @@ robot::SolarPanelAutonomyConfig solarConfig() {
 
 robot::SolarPanelContactConfig solarContactConfig() {
   return {100U, 0.25F, 0.2F, 0.22F, 0.25F, 10U, 20U, 30U, 40U,
-          1000U, 0U, 0U, 0.19F, 0.18F, 250U, 0.2F, -0.16F, 400U};
+          1000U, 0U, 0U, 0.19F, 0.18F, 250U, 0.2F, -0.16F, 400U,
+          500U};
 }
 
 robot::TowerPiecesConfig towerPiecesConfig() {
@@ -139,9 +141,11 @@ robot::PegFinderUpdate updatePegFinderForTest(
     const robot::PegFinderConfig& config,
     const robot::Milliseconds now_ms,
     const bool funnel_limit_active = false,
-    const bool clockwise_turn_complete = false) {
+    const bool clockwise_turn_complete = false,
+    const bool tower_handoff_complete = true) {
   const robot::PegFinderInputs inputs{
-      funnel_limit_active, clockwise_turn_complete};
+      funnel_limit_active, clockwise_turn_complete,
+      tower_handoff_complete};
   return robot::updatePegFinderAutonomy(autonomy, inputs, config, now_ms);
 }
 
@@ -604,6 +608,7 @@ void test_valid_rear_command_is_accepted() {
   command.timeout_ms = 250U;
   command.laser_acquisition_enabled = true;
   command.ir_acquisition_enabled = true;
+  command.rear_line_acquisition_enabled = true;
   const robot::UartPacket packet = robot::makeRearDriveCommandPacket(command, 7);
 
   TEST_ASSERT_TRUE(receiver.acceptPacket(packet, 100U));
@@ -619,6 +624,7 @@ void test_valid_rear_command_is_accepted() {
       static_cast<std::uint8_t>(receiver.laserProfile(120U)));
   TEST_ASSERT_TRUE(receiver.laserAcquisitionEnabled(120U));
   TEST_ASSERT_TRUE(receiver.irAcquisitionEnabled(120U));
+  TEST_ASSERT_TRUE(receiver.rearLineAcquisitionEnabled(120U));
 }
 
 void test_rear_command_retains_laser_profile_when_stale() {
@@ -643,6 +649,79 @@ void test_rear_command_retains_laser_profile_when_stale() {
   TEST_ASSERT_TRUE(receiver.irAcquisitionEnabled(150U));
   TEST_ASSERT_FALSE(receiver.laserAcquisitionEnabled(151U));
   TEST_ASSERT_FALSE(receiver.irAcquisitionEnabled(151U));
+  TEST_ASSERT_FALSE(receiver.rearLineAcquisitionEnabled(151U));
+}
+
+void test_command_transmission_policy_repeats_transitions_then_refreshes() {
+  robot::CommandTransmissionState state{};
+  const robot::Milliseconds refresh_period_ms =
+      robot::commandRefreshPeriodMs(250U);
+  TEST_ASSERT_EQUAL_UINT32(125U, refresh_period_ms);
+  TEST_ASSERT_TRUE(robot::commandTransmissionDue(
+      state, true, false, 100U, refresh_period_ms));
+  robot::noteCommandTransmitted(state, true, 100U);
+  TEST_ASSERT_EQUAL_UINT8(1U, state.transition_repeats_remaining);
+
+  TEST_ASSERT_TRUE(robot::commandTransmissionDue(
+      state, false, false, 110U, refresh_period_ms));
+  robot::noteCommandTransmitted(state, false, 110U);
+  TEST_ASSERT_EQUAL_UINT8(0U, state.transition_repeats_remaining);
+  TEST_ASSERT_FALSE(robot::commandTransmissionDue(
+      state, false, false, 224U, refresh_period_ms));
+  TEST_ASSERT_TRUE(robot::commandTransmissionDue(
+      state, false, false, 235U, refresh_period_ms));
+  TEST_ASSERT_TRUE(robot::commandTransmissionDue(
+      state, false, true, 111U, refresh_period_ms));
+}
+
+void test_final_competition_switch_requires_low_then_rising_edge_to_start() {
+  robot::FinalCompetitionStartSwitchState state{};
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::FinalCompetitionStartSwitchAction::None),
+      static_cast<std::uint8_t>(robot::updateFinalCompetitionStartSwitch(
+          state, true, false)));
+  TEST_ASSERT_FALSE(state.start_armed);
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::FinalCompetitionStartSwitchAction::None),
+      static_cast<std::uint8_t>(robot::updateFinalCompetitionStartSwitch(
+          state, false, false)));
+  TEST_ASSERT_TRUE(state.start_armed);
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::FinalCompetitionStartSwitchAction::Start),
+      static_cast<std::uint8_t>(robot::updateFinalCompetitionStartSwitch(
+          state, true, false)));
+  TEST_ASSERT_FALSE(state.start_armed);
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::FinalCompetitionStartSwitchAction::None),
+      static_cast<std::uint8_t>(robot::updateFinalCompetitionStartSwitch(
+          state, true, true)));
+}
+
+void test_final_competition_switch_low_requests_emergency_stop_and_rearms() {
+  robot::FinalCompetitionStartSwitchState state{};
+  (void)robot::updateFinalCompetitionStartSwitch(state, false, false);
+  (void)robot::updateFinalCompetitionStartSwitch(state, true, false);
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::FinalCompetitionStartSwitchAction::EmergencyStop),
+      static_cast<std::uint8_t>(robot::updateFinalCompetitionStartSwitch(
+          state, false, true)));
+  TEST_ASSERT_TRUE(state.start_armed);
+
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::FinalCompetitionStartSwitchAction::Start),
+      static_cast<std::uint8_t>(robot::updateFinalCompetitionStartSwitch(
+          state, true, false)));
 }
 
 void test_corrupt_rear_packet_is_rejected() {
@@ -1492,6 +1571,55 @@ void test_final_competition_runs_all_modes_in_order() {
       static_cast<std::uint8_t>(update.state));
 }
 
+void test_time_trial_hands_off_when_tower_top_search_starts() {
+  const robot::TimeTrialConfig config{0U, 0U, 30U};
+  robot::TimeTrialAutonomy autonomy{};
+  autonomy.state = robot::TimeTrialState::TowerPieces;
+  autonomy.state_entered_at_ms = 100U;
+
+  robot::TimeTrialInputs inputs{};
+  inputs.tower_pieces_ready_for_peg_finder = true;
+  robot::TimeTrialUpdate update = robot::updateTimeTrialAutonomy(
+      autonomy, inputs, config, 110U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::TimeTrialState::PostTowerDelay),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_FALSE(update.should_start_peg_finder);
+
+  inputs = {};
+  update = robot::updateTimeTrialAutonomy(autonomy, inputs, config, 139U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::TimeTrialState::PostTowerDelay),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateTimeTrialAutonomy(autonomy, inputs, config, 140U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::TimeTrialState::PegFinder),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.should_start_peg_finder);
+}
+
+void test_final_competition_hands_off_when_tower_top_search_starts() {
+  robot::FinalCompetitionAutonomy autonomy{};
+  autonomy.state = robot::FinalCompetitionState::TowerPieces;
+  autonomy.state_entered_at_ms = 100U;
+
+  robot::FinalCompetitionInputs inputs{};
+  robot::FinalCompetitionUpdate update =
+      robot::updateFinalCompetitionAutonomy(autonomy, inputs, 110U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::FinalCompetitionState::TowerPieces),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_FALSE(update.should_start_peg_finder);
+
+  inputs.tower_ready_for_peg_finder = true;
+  update = robot::updateFinalCompetitionAutonomy(autonomy, inputs, 111U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::FinalCompetitionState::PegFinder),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.should_start_peg_finder);
+}
+
 void test_time_trial_propagates_included_mode_faults() {
   const robot::TimeTrialConfig config{};
   robot::TimeTrialAutonomy autonomy{};
@@ -1570,6 +1698,51 @@ void test_peg_finder_config_requires_safe_duties_angle_and_timings() {
   TEST_ASSERT_FALSE(robot::pegFinderConfigValid(config, 0.5F, 0.4F));
 }
 
+void test_peg_finder_waits_for_tower_handoff_before_opening_a_claw() {
+  const robot::PegFinderConfig config = pegFinderConfig();
+  robot::PegFinderAutonomy autonomy{};
+  autonomy.state = robot::PegFinderState::PostFunnelLimitDelay;
+  autonomy.state_entered_at_ms = 100U;
+
+  robot::PegFinderUpdate update = updatePegFinderForTest(
+      autonomy, config, 116U, true, false, false);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::PegFinderState::WaitForTowerHandoff),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_FALSE(update.should_open_claw_1);
+  TEST_ASSERT_FALSE(update.should_open_claw_2);
+  TEST_ASSERT_FALSE(update.should_open_claw_3);
+
+  update = updatePegFinderForTest(
+      autonomy, config, 117U, true, false, false);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::PegFinderState::WaitForTowerHandoff),
+      static_cast<std::uint8_t>(update.state));
+
+  update = updatePegFinderForTest(
+      autonomy, config, 118U, true, false, true);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::PegFinderState::OpenClaw1),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.should_open_claw_1);
+}
+
+void test_standalone_peg_finder_skips_tower_handoff_wait() {
+  const robot::PegFinderConfig config = pegFinderConfig();
+  robot::PegFinderAutonomy autonomy{};
+  autonomy.state = robot::PegFinderState::PostFunnelLimitDelay;
+  autonomy.state_entered_at_ms = 100U;
+
+  const robot::PegFinderUpdate update =
+      updatePegFinderForTest(autonomy, config, 116U, true);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::PegFinderState::OpenClaw1),
+      static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.should_open_claw_1);
+}
+
 void test_peg_finder_clockwise_turn_waits_for_imu_completion() {
   const robot::PegFinderConfig config = pegFinderConfig();
   robot::PegFinderAutonomy autonomy{};
@@ -1592,7 +1765,7 @@ void test_peg_finder_clockwise_turn_waits_for_imu_completion() {
   TEST_ASSERT_FALSE(update.should_rotate_clockwise);
 }
 
-void test_peg_finder_opens_claws_in_configured_order_then_reverses_funnel() {
+void test_peg_finder_selects_one_open_claw_in_configured_order_then_reverses_funnel() {
   robot::PegFinderConfig config = pegFinderConfig();
   config.claw_open_order_1 = 3U;
   config.claw_open_order_2 = 1U;
@@ -1652,7 +1825,10 @@ void test_peg_finder_opens_claws_in_configured_order_then_reverses_funnel() {
   TEST_ASSERT_FALSE(update.should_open_claw_1);
   update = updatePegFinderForTest(autonomy, config, 190U, true);
   TEST_ASSERT_TRUE(update.should_open_claw_3);
+  TEST_ASSERT_TRUE(update.should_close_claw_1);
   TEST_ASSERT_FALSE(update.should_open_claw_2);
+  TEST_ASSERT_TRUE(update.should_close_claw_2);
+  TEST_ASSERT_FALSE(update.should_close_claw_3);
 
   update = updatePegFinderForTest(autonomy, config, 191U, true);
   TEST_ASSERT_EQUAL_UINT8(
@@ -1663,7 +1839,10 @@ void test_peg_finder_opens_claws_in_configured_order_then_reverses_funnel() {
   TEST_ASSERT_FALSE(update.should_open_claw_2);
   update = updatePegFinderForTest(autonomy, config, 208U, true);
   TEST_ASSERT_TRUE(update.should_open_claw_1);
+  TEST_ASSERT_FALSE(update.should_close_claw_1);
   TEST_ASSERT_FALSE(update.should_open_claw_2);
+  TEST_ASSERT_TRUE(update.should_close_claw_2);
+  TEST_ASSERT_TRUE(update.should_close_claw_3);
 
   update = updatePegFinderForTest(autonomy, config, 209U, true);
   TEST_ASSERT_EQUAL_UINT8(
@@ -1674,6 +1853,9 @@ void test_peg_finder_opens_claws_in_configured_order_then_reverses_funnel() {
   TEST_ASSERT_FALSE(update.should_open_claw_3);
   update = updatePegFinderForTest(autonomy, config, 226U, true);
   TEST_ASSERT_TRUE(update.should_open_claw_2);
+  TEST_ASSERT_TRUE(update.should_close_claw_1);
+  TEST_ASSERT_FALSE(update.should_close_claw_2);
+  TEST_ASSERT_TRUE(update.should_close_claw_3);
 
   update = updatePegFinderForTest(autonomy, config, 227U, true);
   TEST_ASSERT_EQUAL_UINT8(
@@ -1698,7 +1880,7 @@ void test_peg_finder_opens_claws_in_configured_order_then_reverses_funnel() {
   TEST_ASSERT_FALSE(update.should_run_funnel_reverse);
 }
 
-void test_peg_finder_shakes_left_and_right_between_claw_drops() {
+void test_peg_finder_shakes_left_and_right_after_each_claw_drop() {
   robot::PegFinderConfig config = pegFinderConfig();
   config.claw_open_interval_ms = 10U;
   config.shake_duty = 0.1F;
@@ -1749,6 +1931,39 @@ void test_peg_finder_shakes_left_and_right_between_claw_drops() {
   TEST_ASSERT_FALSE(update.should_open_claw_3);
   update = updatePegFinderForTest(autonomy, config, 167U);
   TEST_ASSERT_TRUE(update.should_open_claw_3);
+
+  update = updatePegFinderForTest(autonomy, config, 168U);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::PegFinderState::PostClawsOpenDelay),
+      static_cast<std::uint8_t>(update.state));
+  update = updatePegFinderForTest(autonomy, config, 185U);
+  TEST_ASSERT_FALSE(update.should_shake_left);
+  update = updatePegFinderForTest(autonomy, config, 186U);
+  TEST_ASSERT_TRUE(update.should_shake_left);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::PegFinderState::ShakeLeftAfterClaw3),
+      static_cast<std::uint8_t>(update.state));
+  update = updatePegFinderForTest(autonomy, config, 191U);
+  TEST_ASSERT_TRUE(update.should_shake_right);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::PegFinderState::ShakeRightAfterClaw3),
+      static_cast<std::uint8_t>(update.state));
+  update = updatePegFinderForTest(autonomy, config, 198U);
+  TEST_ASSERT_FALSE(update.should_shake_right);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::PegFinderState::PostShakeAfterClaw3Delay),
+      static_cast<std::uint8_t>(update.state));
+  update = updatePegFinderForTest(autonomy, config, 208U);
+  TEST_ASSERT_FALSE(update.should_run_funnel_reverse);
+  update = updatePegFinderForTest(autonomy, config, 209U);
+  TEST_ASSERT_TRUE(update.should_run_funnel_reverse);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::PegFinderState::FunnelReverse),
+      static_cast<std::uint8_t>(update.state));
 }
 
 void test_peg_finder_funnel_timeout_faults_without_limit() {
@@ -2723,6 +2938,10 @@ void test_solar_contact_config_validation() {
   TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
 
   config = solarContactConfig();
+  config.line_reacquire_strafe_timeout_ms = 0U;
+  TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
+
+  config = solarContactConfig();
   config.retry_forward_duty = -0.01F;
   TEST_ASSERT_FALSE(robot::solarPanelContactConfigValid(config));
 
@@ -2884,22 +3103,24 @@ void test_solar_post_contact_delays_are_independently_adjustable() {
   TEST_ASSERT_TRUE(update.transitioned);
 }
 
-void test_solar_first_timeout_faults_without_front_only_contact() {
+void test_solar_first_timeout_without_front_contact_continues_forward() {
   const robot::SolarPanelContactConfig config = solarContactConfig();
 
   robot::SolarPanelContactSequenceUpdate update =
       robot::updateSolarPanelContactSequence(
           robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, false,
           false, config.timeout_ms, config);
-  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
-                   update.next_state);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+      update.next_state);
   TEST_ASSERT_TRUE(update.transitioned);
 
   update = robot::updateSolarPanelContactSequence(
       robot::SolarPanelAutonomyState::StrafeRightToSolarPanel, false, true,
       config.timeout_ms, config);
-  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
-                   update.next_state);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+      update.next_state);
   TEST_ASSERT_TRUE(update.transitioned);
 }
 
@@ -2959,7 +3180,7 @@ void test_solar_zero_adjustment_durations_transition_immediately() {
   TEST_ASSERT_TRUE(update.transitioned);
 }
 
-void test_solar_second_strafe_times_out_without_another_adjustment() {
+void test_solar_second_strafe_timeout_continues_forward_without_retry() {
   const robot::SolarPanelContactConfig config = solarContactConfig();
 
   robot::SolarPanelContactSequenceUpdate update =
@@ -2974,14 +3195,16 @@ void test_solar_second_strafe_times_out_without_another_adjustment() {
   update = robot::updateSolarPanelContactSequence(
       robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel, true,
       false, config.retry_strafe_timeout_ms, config);
-  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
-                   update.next_state);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+      update.next_state);
   TEST_ASSERT_TRUE(update.transitioned);
 
   update = robot::updateSolarPanelContactSequence(
-      update.next_state, true, false, config.retry_strafe_timeout_ms, config);
-  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
-                   update.next_state);
+      update.next_state, true, false, 0U, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+      update.next_state);
   TEST_ASSERT_FALSE(update.transitioned);
 }
 
@@ -3001,8 +3224,9 @@ void test_solar_second_strafe_timeout_is_independently_adjustable() {
   update = robot::updateSolarPanelContactSequence(
       robot::SolarPanelAutonomyState::RetryStrafeRightToSolarPanel, true,
       false, 80U, config);
-  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
-                   update.next_state);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact,
+      update.next_state);
   TEST_ASSERT_TRUE(update.transitioned);
 }
 
@@ -3054,12 +3278,13 @@ void test_solar_contact_drives_forward_then_strafes_until_front_line() {
 
   update = robot::updateSolarPanelContactSequence(
       update.next_state, true, true, false, 100000U, config);
-  assertSolarState(robot::SolarPanelAutonomyState::StrafeLeftToFrontLine,
+  assertSolarState(robot::SolarPanelAutonomyState::SolarSearchFault,
                    update.next_state);
-  TEST_ASSERT_FALSE(update.transitioned);
+  TEST_ASSERT_TRUE(update.transitioned);
 
   update = robot::updateSolarPanelContactSequence(
-      update.next_state, true, true, true, 100001U, config);
+      robot::SolarPanelAutonomyState::StrafeLeftToFrontLine, true, true,
+      true, config.line_reacquire_strafe_timeout_ms, config);
   assertSolarState(
       robot::SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection,
                    update.next_state);
@@ -3079,6 +3304,35 @@ void test_solar_contact_drives_forward_then_strafes_until_front_line() {
   assertSolarState(robot::SolarPanelAutonomyState::FrontLineFollowComplete,
                    update.next_state);
   TEST_ASSERT_TRUE(update.transitioned);
+}
+
+void test_solar_hook_opens_only_after_front_line_detection() {
+  const robot::SolarPanelContactConfig config = solarContactConfig();
+
+  robot::SolarPanelContactSequenceUpdate update =
+      robot::updateSolarPanelContactSequence(
+          robot::SolarPanelAutonomyState::MoveForwardAfterSolarContact, true,
+          true, false, config.post_contact_forward_duration_ms, config);
+  assertSolarState(robot::SolarPanelAutonomyState::StrafeLeftToFrontLine,
+                   update.next_state);
+  TEST_ASSERT_FALSE(
+      robot::shouldOpenSolarHookAfterLineDetection(update));
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::StrafeLeftToFrontLine, true, true,
+      false, config.line_reacquire_strafe_timeout_ms - 1U, config);
+  TEST_ASSERT_FALSE(update.transitioned);
+  TEST_ASSERT_FALSE(
+      robot::shouldOpenSolarHookAfterLineDetection(update));
+
+  update = robot::updateSolarPanelContactSequence(
+      robot::SolarPanelAutonomyState::StrafeLeftToFrontLine, true, true,
+      true, config.line_reacquire_strafe_timeout_ms, config);
+  assertSolarState(
+      robot::SolarPanelAutonomyState::ForwardLineFollowAfterFrontDetection,
+      update.next_state);
+  TEST_ASSERT_TRUE(
+      robot::shouldOpenSolarHookAfterLineDetection(update));
 }
 
 void test_solar_non_contact_state_is_unchanged() {
@@ -3412,17 +3666,6 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.ir_acquisition_enabled = true;
   snapshot.esp1.ir_acquisition_enabled = true;
   snapshot.motor_command_magnitude_milli = 300U;
-  snapshot.esp1.ultrasonic_1_configured = true;
-  snapshot.esp1.ultrasonic_1_echo_valid = true;
-  snapshot.esp1.ultrasonic_1_distance_mm = 170U;
-  snapshot.esp1.ultrasonic_1_echo_duration_us = 1000U;
-  snapshot.ultrasonic_1.configured = true;
-  snapshot.ultrasonic_1.data_fresh = true;
-  snapshot.ultrasonic_1.echo_valid = true;
-  snapshot.ultrasonic_1.distance_mm = 170U;
-  snapshot.ultrasonic_1.echo_duration_us = 1000U;
-  snapshot.ultrasonic_1.sample_age_ms = 12U;
-  snapshot.ultrasonic_1_distance_mm = 170;
   snapshot.laser_distance.available = true;
   snapshot.laser_distance.configured = true;
   snapshot.laser_distance.initialized = true;
@@ -3487,6 +3730,7 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
   snapshot.solar_opening_hook_and_funnel = true;
   snapshot.solar_post_contact_forward_start_delay_ms = 125U;
   snapshot.solar_line_reacquire_strafe_start_delay_ms = 250U;
+  snapshot.solar_line_reacquire_strafe_timeout_ms = 1200U;
   snapshot.solar_post_contact_forward_duty = 0.19F;
   snapshot.solar_panel_limit_switches_configured = true;
   snapshot.solar_limit_back_right_high = true;
@@ -3956,13 +4200,7 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       std::strstr(output, "\"ir_acquisition_enabled\":true"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"motor_command_magnitude_milli\":300"));
-  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"ultrasonic_1\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"data_fresh\":true"));
-  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"echo_valid\":true"));
-  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"distance_mm\":170"));
-  TEST_ASSERT_NOT_NULL(
-      std::strstr(output, "\"echo_duration_us\":1000"));
-  TEST_ASSERT_NOT_NULL(std::strstr(output, "\"sample_age_ms\":12"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"autonomous_state\":\"SOLAR_BEACON_ALIGNED\""));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"autonomous\""));
@@ -4000,6 +4238,8 @@ void test_telemetry_json_contains_required_fields_and_booleans() {
       output, "\"post_contact_forward_start_delay_ms\":125"));
   TEST_ASSERT_NOT_NULL(std::strstr(
       output, "\"line_reacquire_strafe_start_delay_ms\":250"));
+  TEST_ASSERT_NOT_NULL(std::strstr(
+      output, "\"line_reacquire_strafe_timeout_ms\":1200"));
   TEST_ASSERT_NOT_NULL(
       std::strstr(output, "\"post_contact_forward_duty\":0.19000"));
   TEST_ASSERT_NOT_NULL(std::strstr(output, "\"solarLimitSwitches\""));
@@ -4369,10 +4609,6 @@ void test_esp1_status_packet_round_trips() {
   report.solar_limit_front_right_high = false;
   report.side_line_sensor_configured = true;
   report.side_line_sensor_high = true;
-  report.ultrasonic_1_configured = true;
-  report.ultrasonic_1_echo_valid = true;
-  report.ultrasonic_1_distance_mm = 170U;
-  report.ultrasonic_1_echo_duration_us = 1000U;
   report.solar_hook_configured = true;
   report.solar_hook_output_enabled = true;
   report.solar_hook_commanded_angle_deg = 137;
@@ -4380,7 +4616,7 @@ void test_esp1_status_packet_round_trips() {
   const robot::UartPacket packet = robot::makeEsp1StatusPacket(report, 42U);
   robot::Esp1StatusReport decoded{};
 
-  TEST_ASSERT_EQUAL_UINT16(47U, packet.header.payload_size);
+  TEST_ASSERT_EQUAL_UINT16(41U, packet.header.payload_size);
   TEST_ASSERT_TRUE(robot::decodeEsp1StatusPacket(packet, decoded));
   TEST_ASSERT_EQUAL_UINT32(report.uptime_ms, decoded.uptime_ms);
   TEST_ASSERT_EQUAL_UINT8(
@@ -4418,10 +4654,6 @@ void test_esp1_status_packet_round_trips() {
   TEST_ASSERT_FALSE(decoded.solar_limit_front_right_high);
   TEST_ASSERT_TRUE(decoded.side_line_sensor_configured);
   TEST_ASSERT_TRUE(decoded.side_line_sensor_high);
-  TEST_ASSERT_TRUE(decoded.ultrasonic_1_configured);
-  TEST_ASSERT_TRUE(decoded.ultrasonic_1_echo_valid);
-  TEST_ASSERT_EQUAL_UINT16(170U, decoded.ultrasonic_1_distance_mm);
-  TEST_ASSERT_EQUAL_UINT32(1000U, decoded.ultrasonic_1_echo_duration_us);
   TEST_ASSERT_TRUE(decoded.solar_hook_configured);
   TEST_ASSERT_TRUE(decoded.solar_hook_output_enabled);
   TEST_ASSERT_EQUAL_INT16(137, decoded.solar_hook_commanded_angle_deg);
@@ -4438,34 +4670,87 @@ void test_esp1_status_packet_round_trips() {
   TEST_ASSERT_TRUE(decoded.side_line_sensor_configured);
   TEST_ASSERT_FALSE(decoded.side_line_sensor_high);
 
-  robot::UartPacket legacy_packet = low_packet;
-  legacy_packet.header.payload_size =
-      robot::kLegacyEsp1StatusPayloadSize;
-  legacy_packet.header.integrity_crc16 =
-      robot::calculatePacketIntegrity(legacy_packet);
-  decoded = {};
-  TEST_ASSERT_TRUE(
-      robot::decodeEsp1StatusPacket(legacy_packet, decoded));
-  TEST_ASSERT_FALSE(decoded.solar_hook_configured);
-  TEST_ASSERT_FALSE(decoded.solar_hook_output_enabled);
-  TEST_ASSERT_EQUAL_INT16(-1, decoded.solar_hook_commanded_angle_deg);
 }
 
-void test_hc_sr04_echo_conversion_and_valid_range() {
-  TEST_ASSERT_EQUAL_UINT32(10U, robot::kHcSr04TriggerPulseUs);
-  TEST_ASSERT_EQUAL_UINT32(23530U, robot::kHcSr04EchoTimeoutUs);
-  TEST_ASSERT_EQUAL_UINT16(
-      170U, robot::hcSr04DistanceMmFromEchoUs(1000U));
-  TEST_ASSERT_EQUAL_UINT16(
-      20U, robot::hcSr04DistanceMmFromEchoUs(118U));
-  TEST_ASSERT_EQUAL_UINT16(
-      4000U,
-      robot::hcSr04DistanceMmFromEchoUs(robot::kHcSr04EchoTimeoutUs));
-  TEST_ASSERT_FALSE(robot::hcSr04DistanceMmIsValid(0U));
-  TEST_ASSERT_FALSE(robot::hcSr04DistanceMmIsValid(19U));
-  TEST_ASSERT_TRUE(robot::hcSr04DistanceMmIsValid(20U));
-  TEST_ASSERT_TRUE(robot::hcSr04DistanceMmIsValid(4000U));
-  TEST_ASSERT_FALSE(robot::hcSr04DistanceMmIsValid(4001U));
+void test_esp1_operational_and_diagnostic_packets_split_fields() {
+  robot::Esp1StatusReport report{};
+  report.uptime_ms = 3210U;
+  report.mode = robot::RobotTestMode::AutonomousSolarPanel;
+  report.fault_active = true;
+  report.fault_code = robot::FaultCode::CommunicationStale;
+  report.back_left_applied_command_milli = 101;
+  report.back_right_applied_command_milli = -202;
+  report.funnel_applied_command_milli = 303;
+  report.funnel_configured = true;
+  report.solar_panel_limit_switches_configured = true;
+  report.solar_limit_back_right_high = true;
+  report.solar_hook_configured = true;
+  report.solar_hook_output_enabled = true;
+  report.solar_hook_commanded_angle_deg = 120;
+  report.ir_acquisition_enabled = true;
+  report.ir_beacon_detected = true;
+  report.ir_selected_frequency_hz = 10000U;
+  report.ir_selected_amplitude = 456U;
+  report.side_line_sensor_configured = true;
+  report.side_line_sensor_high = true;
+  report.ir_switch_raw_high = false;
+  report.ir_switch_debounced_high = false;
+  report.ir_adc_average = 1800U;
+  report.ir_adc_min = 1200U;
+  report.ir_adc_max = 2200U;
+  report.ir_amplitude_pp = 1000U;
+  report.ir_adc_latest_sample = 1700U;
+  report.ir_1khz_amplitude = 25U;
+  report.ir_10khz_amplitude = 456U;
+  report.ir_active_threshold = 120U;
+  report.ir_consecutive_detection_count = 3U;
+  report.ir_adc_sample_rate_hz = 50000U;
+
+  const robot::UartPacket operational =
+      robot::makeEsp1OperationalStatusPacket(report, 10U);
+  TEST_ASSERT_EQUAL_UINT16(robot::kEsp1OperationalStatusPayloadSize,
+                           operational.header.payload_size);
+  robot::Esp1StatusReport decoded{};
+  decoded.ir_adc_average = 77U;
+  TEST_ASSERT_TRUE(robot::decodeEsp1StatusPacket(operational, decoded));
+  TEST_ASSERT_EQUAL_UINT32(3210U, decoded.uptime_ms);
+  TEST_ASSERT_EQUAL_INT16(101, decoded.back_left_applied_command_milli);
+  TEST_ASSERT_EQUAL_INT16(-202, decoded.back_right_applied_command_milli);
+  TEST_ASSERT_EQUAL_INT16(303, decoded.funnel_applied_command_milli);
+  TEST_ASSERT_TRUE(decoded.funnel_configured);
+  TEST_ASSERT_TRUE(decoded.solar_panel_limit_switches_configured);
+  TEST_ASSERT_TRUE(decoded.solar_limit_back_right_high);
+  TEST_ASSERT_FALSE(decoded.solar_limit_front_right_high);
+  TEST_ASSERT_TRUE(decoded.solar_hook_configured);
+  TEST_ASSERT_TRUE(decoded.solar_hook_output_enabled);
+  TEST_ASSERT_EQUAL_INT16(120, decoded.solar_hook_commanded_angle_deg);
+  TEST_ASSERT_TRUE(decoded.ir_acquisition_enabled);
+  TEST_ASSERT_TRUE(decoded.ir_beacon_detected);
+  TEST_ASSERT_EQUAL_UINT16(10000U, decoded.ir_selected_frequency_hz);
+  TEST_ASSERT_EQUAL_UINT16(456U, decoded.ir_selected_amplitude);
+  TEST_ASSERT_TRUE(decoded.side_line_sensor_configured);
+  TEST_ASSERT_TRUE(decoded.side_line_sensor_high);
+  TEST_ASSERT_EQUAL_UINT16(77U, decoded.ir_adc_average);
+
+  const robot::UartPacket diagnostics =
+      robot::makeEsp1DiagnosticsPacket(report, 11U);
+  TEST_ASSERT_EQUAL_UINT16(robot::kEsp1DiagnosticsPayloadSize,
+                           diagnostics.header.payload_size);
+  TEST_ASSERT_TRUE(
+      robot::decodeEsp1DiagnosticsPacket(diagnostics, decoded));
+  TEST_ASSERT_EQUAL_UINT32(3210U, decoded.uptime_ms);
+  TEST_ASSERT_FALSE(decoded.ir_switch_raw_high);
+  TEST_ASSERT_FALSE(decoded.ir_switch_debounced_high);
+  TEST_ASSERT_EQUAL_UINT16(1800U, decoded.ir_adc_average);
+  TEST_ASSERT_EQUAL_UINT16(1200U, decoded.ir_adc_min);
+  TEST_ASSERT_EQUAL_UINT16(2200U, decoded.ir_adc_max);
+  TEST_ASSERT_EQUAL_UINT16(1000U, decoded.ir_amplitude_pp);
+  TEST_ASSERT_EQUAL_UINT16(1700U, decoded.ir_adc_latest_sample);
+  TEST_ASSERT_EQUAL_UINT16(25U, decoded.ir_1khz_amplitude);
+  TEST_ASSERT_EQUAL_UINT16(456U, decoded.ir_10khz_amplitude);
+  TEST_ASSERT_EQUAL_UINT16(120U, decoded.ir_active_threshold);
+  TEST_ASSERT_EQUAL_UINT8(3U, decoded.ir_consecutive_detection_count);
+  TEST_ASSERT_EQUAL_UINT32(50000U, decoded.ir_adc_sample_rate_hz);
 }
 
 void test_rear_line_sensor_packet_round_trips_and_rejects_corruption() {
@@ -4902,11 +5187,24 @@ void test_habitat_pieces_lss2_stops_rotates_clockwise_until_lss3() {
       autonomy, config, false, false, 370U);
   TEST_ASSERT_FALSE(update.should_line_follow);
   TEST_ASSERT_FALSE(update.should_reverse);
-  TEST_ASSERT_FALSE(update.should_stop);
-  TEST_ASSERT_TRUE(update.should_distance_strafe);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_close_pusher);
+  TEST_ASSERT_FALSE(update.should_distance_strafe);
   TEST_ASSERT_FALSE(update.target_reached);
   TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT32(100U, autonomy.reverse_elapsed_ms);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::ClosePusherBeforeDistanceStrafe),
+      static_cast<std::uint8_t>(update.state));
+
+  robot::HabitatPiecesMechanismInputs mechanisms{};
+  mechanisms.pusher_closed_commanded = true;
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 371U, {}, mechanisms);
+  TEST_ASSERT_FALSE(update.should_close_pusher);
+  TEST_ASSERT_TRUE(update.should_distance_strafe);
+  TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
           robot::HabitatPiecesState::DistanceStrafing),
@@ -5224,7 +5522,7 @@ void test_habitat_pieces_distance_count_ignore_requires_a_new_zone_entry() {
   TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
 }
 
-void test_habitat_pieces_distance_strafe_times_out_without_readings() {
+void test_habitat_pieces_distance_strafe_timeout_runs_exit_sequence() {
   robot::HabitatPiecesConfig config{};
   config.distance_strafe_direction =
       robot::HabitatPiecesStrafeDirection::Left;
@@ -5232,16 +5530,22 @@ void test_habitat_pieces_distance_strafe_times_out_without_readings() {
   config.distance_zone_target_count = 1U;
   config.distance_strafe_duty = 0.15F;
   config.distance_strafe_timeout_ms = 50U;
+  config.post_count_stop_delay_ms = 10U;
+  config.exit_strafe_pulse_ms = 10U;
+  config.slide_down_timeout_ms = 1000U;
 
   robot::HabitatPiecesAutonomy autonomy{};
   autonomy.state = robot::HabitatPiecesState::DistanceStrafing;
   autonomy.state_entered_at_ms = 100U;
   autonomy.distance_strafe_started_at_ms = 100U;
+  autonomy.slide_down_started = true;
+  autonomy.slide_down_started_at_ms = 100U;
 
   robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
           autonomy, config, false, false, 149U);
   TEST_ASSERT_TRUE(update.should_distance_strafe);
+  TEST_ASSERT_TRUE(update.should_lower_slide);
   TEST_ASSERT_FALSE(update.distance_measurement_available);
   TEST_ASSERT_FALSE(autonomy.timed_out);
 
@@ -5249,15 +5553,32 @@ void test_habitat_pieces_distance_strafe_times_out_without_readings() {
       autonomy, config, false, false, 150U);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_FALSE(update.should_distance_strafe);
+  TEST_ASSERT_TRUE(update.should_lower_slide);
   TEST_ASSERT_TRUE(update.transitioned);
-  TEST_ASSERT_TRUE(autonomy.timed_out);
+  TEST_ASSERT_FALSE(autonomy.timed_out);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::PostCountStopDelay),
       static_cast<std::uint8_t>(update.state));
+  TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
           robot::HabitatPiecesStopReason::DistanceStrafeTimeout),
       static_cast<std::uint8_t>(update.stop_reason));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 159U);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 160U);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_exit_strafe_pulse);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::ExitStrafePulse),
+      static_cast<std::uint8_t>(update.state));
 }
 
 void test_habitat_pieces_no_target_substitution_is_always_above_threshold() {
@@ -5356,19 +5677,32 @@ void test_habitat_pieces_distance_strafe_ignores_pre_step_sample() {
   robot::HabitatPiecesUpdate update =
       robot::updateHabitatPiecesAutonomy(
           autonomy, config, false, false, 200U, sample);
-  TEST_ASSERT_TRUE(update.should_distance_strafe);
+  TEST_ASSERT_TRUE(update.should_close_pusher);
+  TEST_ASSERT_FALSE(update.should_distance_strafe);
   TEST_ASSERT_TRUE(update.transitioned);
   TEST_ASSERT_EQUAL_UINT16(0U, update.distance_zone_count);
 
+  robot::HabitatPiecesMechanismInputs mechanisms{};
+  mechanisms.pusher_closed_commanded = true;
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 201U, sample);
+      autonomy, config, false, false, 201U, sample, mechanisms);
+  TEST_ASSERT_FALSE(update.should_close_pusher);
+  TEST_ASSERT_TRUE(update.should_distance_strafe);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::DistanceStrafing),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 202U, sample, mechanisms);
   TEST_ASSERT_TRUE(update.should_distance_strafe);
   TEST_ASSERT_FALSE(update.distance_sample_new);
   TEST_ASSERT_EQUAL_UINT16(0U, update.distance_zone_count);
 
   sample.measurement_sequence = 21U;
   update = robot::updateHabitatPiecesAutonomy(
-      autonomy, config, false, false, 400U, sample);
+      autonomy, config, false, false, 400U, sample, mechanisms);
   TEST_ASSERT_FALSE(update.target_reached);
   TEST_ASSERT_TRUE(update.should_wait_after_distance_count);
   TEST_ASSERT_EQUAL_UINT16(1U, update.distance_zone_count);
@@ -5622,9 +5956,13 @@ void test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off() {
       static_cast<std::uint8_t>(update.stop_reason));
 }
 
-void test_habitat_pieces_approach_limit_timeout_faults_stopped() {
+void test_habitat_pieces_approach_limit_timeout_continues_pickup_tail() {
   robot::HabitatPiecesConfig config{};
   config.approach_timeout_ms = 50U;
+  config.pre_lift_reverse_duration_ms = 20U;
+  config.lift_timeout_ms = 500U;
+  config.lift_start_delay_ms = 10U;
+  config.post_pickup_reverse_duration_ms = 30U;
 
   robot::HabitatPiecesAutonomy autonomy{};
   autonomy.state = robot::HabitatPiecesState::ApproachPiece;
@@ -5642,9 +5980,11 @@ void test_habitat_pieces_approach_limit_timeout_faults_stopped() {
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_FALSE(update.should_drive_forward_to_piece);
   TEST_ASSERT_TRUE(update.transitioned);
-  TEST_ASSERT_TRUE(autonomy.timed_out);
+  TEST_ASSERT_FALSE(autonomy.timed_out);
+  TEST_ASSERT_FALSE(update.approach_limit_reached);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::PreLiftReverse),
       static_cast<std::uint8_t>(update.state));
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
@@ -5653,9 +5993,39 @@ void test_habitat_pieces_approach_limit_timeout_faults_stopped() {
   TEST_ASSERT_EQUAL_STRING(
       "APPROACH_LIMIT_TIMEOUT",
       robot::habitatPiecesStopReasonName(update.stop_reason));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 169U, {}, mechanisms);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_drive_back_before_lift);
+  TEST_ASSERT_FALSE(update.should_start_lift);
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 170U, {}, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_start_lift);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::LiftStartDelay),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 180U, {}, mechanisms);
+  TEST_ASSERT_TRUE(update.should_stop);
+  TEST_ASSERT_TRUE(update.transitioned);
+  TEST_ASSERT_EQUAL_UINT8(
+      static_cast<std::uint8_t>(
+          robot::HabitatPiecesState::ReverseAfterPickup),
+      static_cast<std::uint8_t>(update.state));
+
+  update = robot::updateHabitatPiecesAutonomy(
+      autonomy, config, false, false, 181U, {}, mechanisms);
+  TEST_ASSERT_FALSE(update.should_stop);
+  TEST_ASSERT_TRUE(update.should_drive_back_after_pickup);
 }
 
-void test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout() {
+void test_habitat_pieces_exit_timeout_advances_to_slide_wait() {
   robot::HabitatPiecesConfig config{};
   config.distance_strafe_timeout_ms = 200U;
   config.post_count_stop_delay_ms = 50U;
@@ -5673,9 +6043,9 @@ void test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout() {
           autonomy, config, false, false, 300U);
   TEST_ASSERT_TRUE(update.should_stop);
   TEST_ASSERT_TRUE(update.transitioned);
-  TEST_ASSERT_TRUE(autonomy.timed_out);
+  TEST_ASSERT_FALSE(autonomy.timed_out);
   TEST_ASSERT_EQUAL_UINT8(
-      static_cast<std::uint8_t>(robot::HabitatPiecesState::Fault),
+      static_cast<std::uint8_t>(robot::HabitatPiecesState::LowerSlide),
       static_cast<std::uint8_t>(update.state));
   TEST_ASSERT_EQUAL_UINT8(
       static_cast<std::uint8_t>(
@@ -5716,6 +6086,37 @@ robot::HabitatPlacementConfig validHabitatPlacementConfig() {
   config.strafe_right_duty = 0.2F;
   config.strafe_right_timeout_ms = 100U;
   return config;
+}
+
+void test_habitat_imu_phase_classification_covers_turns_and_strafes() {
+  TEST_ASSERT_TRUE(robot::habitatPiecesStateRequiresImuStrafe(
+      robot::HabitatPiecesState::DistanceStrafing));
+  TEST_ASSERT_TRUE(robot::habitatPiecesStateRequiresImuStrafe(
+      robot::HabitatPiecesState::ExitStrafePulse));
+  TEST_ASSERT_TRUE(robot::habitatPiecesStateRequiresImuStrafe(
+      robot::HabitatPiecesState::RearLineReacquire));
+  TEST_ASSERT_FALSE(robot::habitatPiecesStateRequiresImuStrafe(
+      robot::HabitatPiecesState::SideLineAligning));
+
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuTurn(
+      robot::HabitatPlacementState::TurnToInitialHeading));
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuTurn(
+      robot::HabitatPlacementState::TurnCounterClockwise));
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuTurn(
+      robot::HabitatPlacementState::TurnClockwise));
+  TEST_ASSERT_FALSE(robot::habitatPlacementStateRequiresImuTurn(
+      robot::HabitatPlacementState::ReverseRetreat));
+
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuStrafe(
+      robot::HabitatPlacementState::StrafeRightBeforeCounterClockwise));
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuStrafe(
+      robot::HabitatPlacementState::StrafeLeftAfterClockwise));
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuStrafe(
+      robot::HabitatPlacementState::StrafeRightAfterClockwise));
+  TEST_ASSERT_TRUE(robot::habitatPlacementStateRequiresImuStrafe(
+      robot::HabitatPlacementState::StrafeRightToReturnLine));
+  TEST_ASSERT_FALSE(robot::habitatPlacementStateRequiresImuStrafe(
+      robot::HabitatPlacementState::TurnClockwise));
 }
 
 void test_habitat_placement_mode_parses_and_allows_motion() {
@@ -6001,6 +6402,12 @@ int main() {
   RUN_TEST(test_open_loop_clockwise_rotation_uses_mecanum_signs);
   RUN_TEST(test_valid_rear_command_is_accepted);
   RUN_TEST(test_rear_command_retains_laser_profile_when_stale);
+  RUN_TEST(
+      test_command_transmission_policy_repeats_transitions_then_refreshes);
+  RUN_TEST(
+      test_final_competition_switch_requires_low_then_rising_edge_to_start);
+  RUN_TEST(
+      test_final_competition_switch_low_requests_emergency_stop_and_rearms);
   RUN_TEST(test_corrupt_rear_packet_is_rejected);
   RUN_TEST(test_stale_rear_command_stops_motors);
   RUN_TEST(test_explicit_stop_packet_stops_motors);
@@ -6053,15 +6460,21 @@ int main() {
       test_time_trial_config_allows_skipped_or_safe_transition_strafe);
   RUN_TEST(
       test_time_trial_runs_solar_strafe_tower_and_peg_finder_in_order);
+  RUN_TEST(test_time_trial_hands_off_when_tower_top_search_starts);
   RUN_TEST(
       test_time_trial_does_not_handoff_before_solar_is_complete);
   RUN_TEST(test_time_trial_propagates_included_mode_faults);
   RUN_TEST(test_final_competition_runs_all_modes_in_order);
+  RUN_TEST(
+      test_final_competition_hands_off_when_tower_top_search_starts);
   RUN_TEST(test_peg_finder_config_requires_safe_duties_angle_and_timings);
+  RUN_TEST(
+      test_peg_finder_waits_for_tower_handoff_before_opening_a_claw);
+  RUN_TEST(test_standalone_peg_finder_skips_tower_handoff_wait);
   RUN_TEST(test_peg_finder_clockwise_turn_waits_for_imu_completion);
   RUN_TEST(
-      test_peg_finder_opens_claws_in_configured_order_then_reverses_funnel);
-  RUN_TEST(test_peg_finder_shakes_left_and_right_between_claw_drops);
+      test_peg_finder_selects_one_open_claw_in_configured_order_then_reverses_funnel);
+  RUN_TEST(test_peg_finder_shakes_left_and_right_after_each_claw_drop);
   RUN_TEST(test_peg_finder_funnel_timeout_faults_without_limit);
   RUN_TEST(
       test_peg_finder_does_not_start_funnel_when_limit_already_pressed);
@@ -6097,14 +6510,17 @@ int main() {
   RUN_TEST(test_solar_contact_config_validation);
   RUN_TEST(test_solar_retry_state_names_are_exposed);
   RUN_TEST(test_solar_front_only_at_first_timeout_begins_adjustment);
-  RUN_TEST(test_solar_first_timeout_faults_without_front_only_contact);
+  RUN_TEST(
+      test_solar_first_timeout_without_front_contact_continues_forward);
   RUN_TEST(test_solar_adjustment_runs_left_then_forward_then_right);
   RUN_TEST(test_solar_zero_adjustment_durations_transition_immediately);
-  RUN_TEST(test_solar_second_strafe_times_out_without_another_adjustment);
+  RUN_TEST(
+      test_solar_second_strafe_timeout_continues_forward_without_retry);
   RUN_TEST(test_solar_second_strafe_timeout_is_independently_adjustable);
   RUN_TEST(test_solar_all_hit_has_priority_in_every_contact_motion_state);
   RUN_TEST(
       test_solar_contact_drives_forward_then_strafes_until_front_line);
+  RUN_TEST(test_solar_hook_opens_only_after_front_line_detection);
   RUN_TEST(
       test_solar_post_contact_forward_stops_if_front_line_is_already_detected);
   RUN_TEST(test_solar_post_contact_delays_are_independently_adjustable);
@@ -6118,7 +6534,7 @@ int main() {
   RUN_TEST(test_solar_detector_reset_clears_state);
   RUN_TEST(test_telemetry_json_contains_required_fields_and_booleans);
   RUN_TEST(test_esp1_status_packet_round_trips);
-  RUN_TEST(test_hc_sr04_echo_conversion_and_valid_range);
+  RUN_TEST(test_esp1_operational_and_diagnostic_packets_split_fields);
   RUN_TEST(
       test_rear_line_sensor_packet_round_trips_and_rejects_corruption);
   RUN_TEST(
@@ -6148,7 +6564,7 @@ int main() {
   RUN_TEST(
       test_habitat_pieces_distance_count_ignore_requires_a_new_zone_entry);
   RUN_TEST(
-      test_habitat_pieces_distance_strafe_times_out_without_readings);
+      test_habitat_pieces_distance_strafe_timeout_runs_exit_sequence);
   RUN_TEST(
       test_habitat_pieces_no_target_substitution_is_always_above_threshold);
   RUN_TEST(
@@ -6158,10 +6574,12 @@ int main() {
   RUN_TEST(
       test_habitat_pieces_pickup_tail_multitasks_lift_and_hands_off);
   RUN_TEST(
-      test_habitat_pieces_approach_limit_timeout_faults_stopped);
+      test_habitat_pieces_approach_limit_timeout_continues_pickup_tail);
   RUN_TEST(
-      test_habitat_pieces_exit_sequence_uses_overall_strafe_timeout);
+      test_habitat_pieces_exit_timeout_advances_to_slide_wait);
   RUN_TEST(test_habitat_placement_mode_parses_and_allows_motion);
+  RUN_TEST(
+      test_habitat_imu_phase_classification_covers_turns_and_strafes);
   RUN_TEST(test_habitat_placement_config_starts_locked);
   RUN_TEST(test_habitat_placement_runs_requested_sequence);
   RUN_TEST(

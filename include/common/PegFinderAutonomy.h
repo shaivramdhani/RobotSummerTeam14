@@ -30,6 +30,10 @@ enum class PegFinderState : std::uint8_t {
   ShakeRightAfterClaw2 = 20,
   PostShakeAfterClaw1Delay = 21,
   PostShakeAfterClaw2Delay = 22,
+  ShakeLeftAfterClaw3 = 23,
+  ShakeRightAfterClaw3 = 24,
+  PostShakeAfterClaw3Delay = 25,
+  WaitForTowerHandoff = 26,
 };
 
 enum class PegFinderFaultReason : std::uint8_t {
@@ -43,6 +47,10 @@ enum class PegFinderFaultReason : std::uint8_t {
   ImuUnavailable = 7,
   ImuTurnFailed = 8,
   ImuTurnTimeout = 9,
+  StepperCommandFailed = 10,
+  StepperLimitSearchFailed = 11,
+  StepperTopInterlockLost = 12,
+  ConflictingLimitSwitches = 13,
 };
 
 struct PegFinderConfig {
@@ -73,6 +81,8 @@ struct PegFinderConfig {
 struct PegFinderInputs {
   bool funnel_limit_active{false};
   bool clockwise_turn_complete{false};
+  // Standalone PegFinder has no Tower mechanism handoff to await.
+  bool tower_handoff_complete{true};
 };
 
 struct PegFinderAutonomy {
@@ -95,6 +105,9 @@ struct PegFinderUpdate {
   bool should_open_claw_1{false};
   bool should_open_claw_2{false};
   bool should_open_claw_3{false};
+  bool should_close_claw_1{false};
+  bool should_close_claw_2{false};
+  bool should_close_claw_3{false};
 };
 
 const char* pegFinderStateName(PegFinderState state);

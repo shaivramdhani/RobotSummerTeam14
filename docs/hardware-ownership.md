@@ -8,7 +8,6 @@ Every physical peripheral must have exactly one software owner.
 | --- | --- | --- |
 | Mission state machine | n/a | ESP1 mission task |
 | IR beacon inputs | `LeftIRFiltered`, `RightIRFiltered`, `FREQ` GPIO2 | ESP1 sensor acquisition |
-| Ultrasonic sensors | `USTRIG1`, `USECHO1`, `USTRIG2`, `USECHO2` (currently unassigned) | ESP1 sensor acquisition |
 | VL53L0X V2 distance sensor | SDA GPIO10, SCL GPIO9 | ESP1 sensor-acquisition task; communication and mission code consume immutable snapshots only |
 | Rear/side line sensors | `LSS` GPIO4, `LSS2` GPIO11, `LSS3` GPIO12, `LSBL`, `LSBR` | ESP1 sensor acquisition |
 | Back-left motor | `PWMBL0`, `PWMBL1` | ESP1 motor output |
@@ -24,6 +23,7 @@ Every physical peripheral must have exactly one software owner.
 | --- | --- | --- |
 | MPU-6050-compatible IMU | I2C SDA/SCL | ESP2 sensor-acquisition task; motion and web code consume snapshots only |
 | Front line sensors | `LSFL`, `LSFR` | ESP2 sensor acquisition |
+| Final Competition start switch | GPIO10, active HIGH | ESP2 motion-control task |
 | Front-left motor | `PWMFL0`, `PWMFL1` | ESP2 motor output |
 | Front-right motor | `PWMFR0`, `PWMFR1` | ESP2 motor output |
 | Four-wheel motion calculation | logical command only | ESP2 motion controller |

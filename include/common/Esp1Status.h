@@ -9,8 +9,11 @@
 
 namespace robot {
 
-constexpr std::uint16_t kLegacyEsp1StatusPayloadSize = 45U;
-constexpr std::uint16_t kEsp1StatusPayloadSize = 47U;
+constexpr std::uint16_t kEsp1StatusPayloadSize = 41U;
+constexpr std::uint16_t kEsp1OperationalStatusPayloadSize = 19U;
+constexpr std::uint16_t kEsp1DiagnosticsPayloadSize = 22U;
+constexpr Milliseconds kEsp1DiagnosticsPeriodMs =
+    kDefaultCommunicationTimeoutMs;
 constexpr std::uint8_t kEsp1StatusFaultActiveFlag = 0x01U;
 constexpr std::uint8_t kEsp1StatusBackLeftInvertedFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusBackRightInvertedFlag = 0x04U;
@@ -24,11 +27,26 @@ constexpr std::uint8_t kEsp1StatusSolarLimitBackRightHighFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusSolarLimitFrontRightHighFlag = 0x04U;
 constexpr std::uint8_t kEsp1StatusSideLineConfiguredFlag = 0x08U;
 constexpr std::uint8_t kEsp1StatusSideLineHighFlag = 0x10U;
-constexpr std::uint8_t kEsp1StatusUltrasonic1ConfiguredFlag = 0x20U;
-constexpr std::uint8_t kEsp1StatusUltrasonic1EchoValidFlag = 0x40U;
 constexpr std::uint8_t kEsp1StatusSolarHookConfiguredFlag = 0x01U;
 constexpr std::uint8_t kEsp1StatusSolarHookOutputEnabledFlag = 0x02U;
 constexpr std::uint8_t kEsp1StatusSolarHookUnsetAngle = 0xFFU;
+
+constexpr std::uint8_t kEsp1OperationalFaultActiveFlag = 0x01U;
+constexpr std::uint8_t kEsp1OperationalFunnelConfiguredFlag = 0x02U;
+constexpr std::uint8_t kEsp1OperationalSolarLimitConfiguredFlag = 0x04U;
+constexpr std::uint8_t kEsp1OperationalSolarLimitBackRightHighFlag = 0x08U;
+constexpr std::uint8_t kEsp1OperationalSolarLimitFrontRightHighFlag = 0x10U;
+constexpr std::uint8_t kEsp1OperationalSolarHookConfiguredFlag = 0x20U;
+constexpr std::uint8_t kEsp1OperationalSolarHookOutputEnabledFlag = 0x40U;
+constexpr std::uint8_t kEsp1OperationalIrAcquisitionEnabledFlag = 0x80U;
+constexpr std::uint8_t kEsp1OperationalIrBeaconDetectedFlag = 0x01U;
+constexpr std::uint8_t kEsp1OperationalBackLeftInvertedFlag = 0x02U;
+constexpr std::uint8_t kEsp1OperationalBackRightInvertedFlag = 0x04U;
+constexpr std::uint8_t kEsp1OperationalSideLineConfiguredFlag = 0x08U;
+constexpr std::uint8_t kEsp1OperationalSideLineHighFlag = 0x10U;
+
+constexpr std::uint8_t kEsp1DiagnosticsIrSwitchRawHighFlag = 0x01U;
+constexpr std::uint8_t kEsp1DiagnosticsIrSwitchDebouncedHighFlag = 0x02U;
 
 struct Esp1StatusReport {
   Milliseconds uptime_ms{0};
@@ -46,10 +64,6 @@ struct Esp1StatusReport {
   bool solar_limit_front_right_high{false};
   bool side_line_sensor_configured{false};
   bool side_line_sensor_high{false};
-  bool ultrasonic_1_configured{false};
-  bool ultrasonic_1_echo_valid{false};
-  std::uint16_t ultrasonic_1_distance_mm{0};
-  std::uint32_t ultrasonic_1_echo_duration_us{0};
   bool solar_hook_configured{false};
   bool solar_hook_output_enabled{false};
   std::int16_t solar_hook_commanded_angle_deg{-1};
@@ -73,7 +87,13 @@ struct Esp1StatusReport {
 
 UartPacket makeEsp1StatusPacket(const Esp1StatusReport& report,
                                 std::uint16_t sequence);
+UartPacket makeEsp1OperationalStatusPacket(
+    const Esp1StatusReport& report, std::uint16_t sequence);
+UartPacket makeEsp1DiagnosticsPacket(const Esp1StatusReport& report,
+                                     std::uint16_t sequence);
 bool decodeEsp1StatusPacket(const UartPacket& packet,
                             Esp1StatusReport& report);
+bool decodeEsp1DiagnosticsPacket(const UartPacket& packet,
+                                 Esp1StatusReport& report);
 
 }  // namespace robot

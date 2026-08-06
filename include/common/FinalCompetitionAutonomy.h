@@ -22,6 +22,7 @@ struct FinalCompetitionInputs {
   bool habitat_complete{false};
   bool habitat_fault{false};
   bool tower_complete{false};
+  bool tower_ready_for_peg_finder{false};
   bool tower_fault{false};
   bool peg_finder_complete{false};
   bool peg_finder_fault{false};

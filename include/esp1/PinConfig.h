@@ -62,9 +62,6 @@ struct Esp1Pins {
   int right_ir_filtered{7};  // GPIO7, ADC1_CH6, analog 0-3.3 V max
   int freq{2};                // IR frequency-select switch, INPUT_PULLUP
   int servo_solar_hook{3};    // Solar Hook servo PWM output
-  // TODO(team): reassign Ultrasonic 1; GPIO11/GPIO12 now belong to LSS2/LSS3.
-  int ultrasonic_trigger_1{kUnassignedGpio};
-  int ultrasonic_echo_1{kUnassignedGpio};
   int laser_scl{9};            // VL53L0X V2 I2C SCL
   int laser_sda{10};           // VL53L0X V2 I2C SDA
   int line_sensor_side{4};  // Digital comparator, HIGH = black tape

@@ -68,23 +68,10 @@ struct Esp1RemoteStatusTelemetry {
   bool solar_limit_front_right_high{false};
   bool side_line_sensor_configured{false};
   bool side_line_sensor_high{false};
-  bool ultrasonic_1_configured{false};
-  bool ultrasonic_1_echo_valid{false};
-  std::uint16_t ultrasonic_1_distance_mm{0};
-  std::uint32_t ultrasonic_1_echo_duration_us{0};
   bool solar_hook_configured{false};
   bool solar_hook_output_enabled{false};
   int solar_hook_commanded_angle_deg{-1};
   bool ir_acquisition_enabled{false};
-};
-
-struct UltrasonicTelemetry {
-  bool configured{false};
-  bool data_fresh{false};
-  bool echo_valid{false};
-  std::uint16_t distance_mm{0};
-  std::uint32_t echo_duration_us{0};
-  Milliseconds sample_age_ms{0};
 };
 
 struct LaserDistanceTelemetry {
@@ -449,6 +436,7 @@ struct TelemetrySnapshot {
   float solar_line_reacquire_strafe_duty{0.0F};
   Milliseconds solar_post_contact_forward_start_delay_ms{0};
   Milliseconds solar_line_reacquire_strafe_start_delay_ms{0};
+  Milliseconds solar_line_reacquire_strafe_timeout_ms{0};
   float solar_post_contact_forward_duty{0.0F};
   Milliseconds solar_front_line_follow_duration_ms{0U};
   float solar_front_line_follow_duty{0.0F};
@@ -708,7 +696,6 @@ struct TelemetrySnapshot {
   MotorTelemetry funnel{};
   RearCommandTelemetry rear{};
   Esp1RemoteStatusTelemetry esp1{};
-  UltrasonicTelemetry ultrasonic_1{};
   LaserDistanceTelemetry laser_distance{};
   ServoClawBankTelemetry claws{};
   SolarHookServoTelemetry solar_hook{};
@@ -736,8 +723,6 @@ struct TelemetrySnapshot {
   // handlers, but are no longer duplicated in the full telemetry document.
   int ir_left_strength{-1};
   int ir_right_strength{-1};
-  int ultrasonic_1_distance_mm{-1};
-  int ultrasonic_2_distance_mm{-1};
   int stepper_position{-1};
   int servo_claw_1_position{-1};
   int servo_claw_2_position{-1};

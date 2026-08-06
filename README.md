@@ -71,14 +71,17 @@ profile, concurrently with line following, alignment, reverse, and distance
 strafing. An above-threshold check clears the final piece and begins the pickup
 tail immediately if the slide is already down, or waits stopped for the same
 bounded slide search to finish. The robot then drives forward until the active-high ESP2 GPIO48 habitat-piece
-limit switch is pressed, briefly reverses for an adjustable duration using the
-pickup reverse duty, and starts a step-counted
+limit switch is pressed or the bounded approach times out. Either result stops
+the forward command and continues through the adjustable pre-lift reverse and step-counted
 lift during an adjustable stopped delay before continuing concurrently with a
 timed reverse and opposite-direction IMU strafe at its own adjustable duty.
 Either rear line sensor stops the strafe; lift completion then automatically
 starts Habitat Placement. Fresh N/A/no-target laser results are treated as
 65536 mm for the distance-strafe checks. One adjustable timeout bounds the initial
-strafe, stop delay, pulses, and checks. All added strafe settings default to
+counting strafe. If it expires before the target count, lateral motion stops and
+the route continues through the normal post-count delay and exit pulse/check
+sequence with a fresh bound instead of faulting. If that exit sequence exhausts
+the renewed bound, it continues into the pickup-tail slide/approach gate. All added strafe settings default to
 unconfigured. While enabled, the laser uses its high-accuracy profile with a
 200 ms continuous intermeasurement period.
 
@@ -177,13 +180,22 @@ command. Starting also requires a fresh rear-sensor snapshot.
 Solar's initial right approach and final left front-line reacquisition use the
 shared IMU Strafe controller. Retry-left and retry-right use direct open-loop
 mecanum strafing at independently adjustable duties, with no IMU correction.
-All stages retain their existing adjustable times/timeouts. Once either front
-sensor sees tape, Solar follows the front line forward at its own adjustable
-duty and duration. Stage the robot with the slider up, funnel mechanically
-closed, and Solar Hook down/closed. Solar commands the hook's adjustable closed
-angle at route start; after the forward line follow, it commands the adjustable
-open angle and runs the funnel at an adjustable signed duty for an adjustable
-duration before reporting Solar complete. Positive duty uses the existing
+At the initial contact timeout, front-only contact still starts the single
+left/forward/right retry. If the front contact is not hit, the route advances
+directly into its timed post-contact forward drive instead of faulting. An
+expired retry also advances into that forward drive rather than stopping the
+autonomous run.
+All stages retain their adjustable times/timeouts, including a bounded final
+left-strafe timeout. Line detection takes priority over that timeout and starts
+the forward line follow immediately. Stage the robot with the slider up, funnel
+mechanically closed, and Solar Hook down/closed. Solar commands the hook's
+adjustable closed angle at route start. When the final left line-return strafe
+starts, it runs the funnel at an adjustable signed duty for an adjustable
+duration while keeping the hook closed. Detection of either front line sensor
+stops the strafe and only then raises the hook before the forward line follow.
+The funnel may finish while the route continues; Solar completes only after
+both timelines finish. The hook remains powered in its raised/open position
+for the Habitat and Tower stages. Positive duty uses the existing
 funnel-forward convention and negative duty uses reverse.
 
 The ESP2 dashboard also has a `Tower Pieces` panel. Its Start button enters
@@ -229,15 +241,16 @@ configured duration, and then runs the ESP1-owned funnel motor forward until
 the ESP2 GPIO47 limit switch is pressed.
 GPIO47 is LOW while released and HIGH while pressed. If the switch is not
 pressed before the adjustable timeout, PegFinder stops with a fault. After a
-configurable delay, it opens all three claws in a dashboard-selected order with
-a configurable delay between each command, using the live angles from the
-shared `Servo Control` panel. Between claw openings it can run adjustable short
-left/right shake pulses to free pieces in the funnel. All three shake values
+configurable delay, it selects the claws in a dashboard-selected order with a
+configurable delay between each command, using the live angles from the shared
+`Servo Control` panel. Each selection opens one claw and explicitly closes the
+other two. After each claw selection it can run adjustable
+short left/right shake pulses to free pieces in the funnel. All three shake values
 default to zero, which disables shaking until they are calibrated. After each
 enabled left/right shake, the chassis waits stopped for an adjustable delay
-before opening the next claw. It then waits
-for another configurable delay and runs the funnel in reverse at an adjustable
-duty for an adjustable duration. The
+before selecting the next claw or reversing the funnel after the third. The third
+shake starts after the existing post-third-selection delay. The funnel then runs in
+reverse at an adjustable duty for an adjustable duration. The
 PegFinder turn output cap, Kp, Kd, tolerance, settling, timeout, and
 measured yaw polarity all come from the shared IMU Turn panel. Its angle,
 chassis and funnel duties, and timings
@@ -251,18 +264,29 @@ shared servo angles. Its only separate settings are the delay after solar, an
 optional timed right strafe before Tower Pieces, and the delay after Tower
 Pieces. The transition strafe uses the shared IMU Strafe tuning. These
 transition values default to `0`; a `0 ms` strafe skips
-that motion. At the Tower Pieces-to-PegFinder handoff, the claws and winch are
-commanded closed and their PWM outputs remain enabled.
+that motion. Once Tower's claws have been commanded closed and the configured
+settling delay has elapsed, the stepper starts its top-limit search and the
+combined mode may begin PegFinder's turn and funnel alignment concurrently.
+PegFinder waits after alignment if necessary: it cannot open the first claw
+until the live top limit is active and the winch-close command has been
+accepted. The top interlock remains mandatory before the final funnel reverse.
+The optional post-Tower Time Trial delay is still honored while the stepper
+continues upward.
 
 The `Final competition` panel runs Autonomous Solar, all three interleaved
 Habitat pickup/placement profiles, Tower Pieces, and PegFinder as one mode.
 It assumes the slider is initially up, funnel closed, and Solar Hook
-down/closed. Solar opens the hook and funnel before handing Habitat a forward
-front-line follow. Each Habitat pickup profile
+down/closed. Solar starts opening the funnel with its final line return, raises
+the hook only after the front line is found, then keeps the hook raised through
+Habitat and Tower. Each Habitat pickup profile
 uses its adjustable LSS2/LSS3 start-ignore window. Placement profile 3 must be
 configured to reacquire the rear line; after that search completes, Tower
 Pieces begins its backward line follow and applies its own adjustable LSS
-ignore window. The final mode then hands Tower completion to PegFinder.
+ignore window. After Tower closes and settles all three claws, Final
+Competition starts the stepper top search and PegFinder concurrently. A failed
+or prematurely stopped top search, conflicting stepper limits, or loss of the
+top interlock stops the combined mission. Standalone Tower Pieces still waits
+for the top limit and closes the winch before reporting complete.
 
 ## Upload
 
@@ -296,9 +320,9 @@ docs/             Architecture and operational documentation
 ## Processor Roles
 
 ESP1 is the mission controller. It owns mission sequencing, rear motors, funnel
-motor, rear/right-side limit switches, rear line sensors, IR inputs, ultrasonic
-signals, the VL53L0X V2 distance sensor on GPIO10/GPIO9, the GPIO3 Solar Hook
-servo, and its side of the UART link.
+motor, rear/right-side limit switches, rear line sensors, IR inputs, the
+VL53L0X V2 distance sensor on GPIO10/GPIO9, the GPIO3 Solar Hook servo, and its
+side of the UART link.
 
 ESP2 is the motion and mechanism node. It owns front line sensors, front motors,
 logical four-wheel motion calculation, stepper, the remaining servos,

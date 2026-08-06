@@ -15,8 +15,6 @@ H-bridge mode, per-wheel `forward_sign`, and `maximum_safe_test_duty`.
 | `RightIRFiltered` | TODO | TODO |
 | `FREQ` | 2 | IR frequency-select switch, INPUT_PULLUP; HIGH = 1 kHz / LOW = 10 kHz |
 | `SolarHookServo` | 3 | LEDC channel 6, 50 Hz, 12-bit, 1000–2000 µs |
-| `USTRIG1` | TODO | Unassigned after GPIO12 was reassigned to LSS3 |
-| `USECHO1` | TODO | Unassigned after GPIO11 was reassigned to LSS2 |
 | VL53L0X SDA | 10 | Dedicated ESP1 I2C data; verify carrier pull-ups and supply requirements before power-up |
 | VL53L0X SCL | 9 | Dedicated ESP1 I2C clock; configured for 100 kHz |
 | `LSS` | 4 | Digital comparator, HIGH = black tape |
@@ -61,6 +59,7 @@ voltage before applying power.
 | `IMU SCL` | 17 | Current software configuration; verify the physical PCB connection |
 | `LSFL` | 19 | Digital comparator, HIGH = black tape |
 | `LSFR` | 20 | Digital comparator, HIGH = black tape |
+| Final Competition start switch | 10 | Externally driven input; LOW = stop/armed, LOW-to-HIGH transition = start |
 | `PWMFL0` | TODO | TODO |
 | `PWMFL1` | TODO | TODO |
 | `PWMFR0` | TODO | TODO |

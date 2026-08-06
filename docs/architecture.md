@@ -93,7 +93,9 @@ with a timed reverse and IMU-strafes at an independently adjustable duty
 opposite the original direction until either rear sensor detects tape. Once
 the lift is also complete, ESP2 requests the
 existing Habitat Placement route. `distance_strafe_timeout_ms` bounds all of these
-distance-strafe phases even if the stream becomes unavailable.
+distance-strafe phases even if the stream becomes unavailable. Counting-strafe
+expiry stops lateral motion and starts the normal post-count exit sequence with
+a fresh bound; exit-sequence expiry advances to the slide/approach pickup tail.
 `run_timeout_ms` bounds both the first side-line search and the opposite-sensor
 alignment, and must be longer than the detection delay. LSS2/LSS3 configuration
 and snapshot freshness are required until both latch. The reverse remains bounded
